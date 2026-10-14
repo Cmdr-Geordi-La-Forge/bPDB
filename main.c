@@ -52,7 +52,7 @@ static inline int match_key(const char* key, const char* target) {
 }
 
 static const char* JRNL_FIELD_NAMES[] = {
-  "AUTH", "TITL", "EDIT", "REF", "PUBL", "REFN", "PMID", "DOI"
+  "AUTH", "TITL", "EDIT", "REF ", "PUBL", "REFN", "PMID", "DOI "
 };
 
 static inline int get_jrnl_field_id(const char* key) {
@@ -133,9 +133,12 @@ static void write_jrnl_multiline(char* out_data, size_t* out_idx, const char* re
   const char* p = text;
   int len = strlen(text);
   int line_num = 1;
-  while (len > 0) {
-    int chunk = len > 60 ? 60 : len;
-    if (chunk == 60) {
+  int start_idx = (strncmp(sub_record, "REFN", 4) == 0) ? 35 : 19;
+  int max_chunk = 80 - start_idx;
+
+  do {
+    int chunk = len > max_chunk ? max_chunk : len;
+    if (chunk == max_chunk) {
       int c = chunk;
       while(c > 0 && p[c-1] != ' ' && p[c-1] != '-') c--;
       if (c > 0) chunk = c;
@@ -155,7 +158,9 @@ static void write_jrnl_multiline(char* out_data, size_t* out_idx, const char* re
       memcpy(tmp + 16, num, 2);
     }
 
-    memcpy(tmp + 19, p, chunk);
+    if (chunk > 0) {
+      memcpy(tmp + start_idx, p, chunk);
+    }
     memcpy(out_data + (*out_idx * 81), tmp, 81);
 
     p += chunk;
@@ -163,7 +168,7 @@ static void write_jrnl_multiline(char* out_data, size_t* out_idx, const char* re
     while (len > 0 && *p == ' ') { p++; len--; }
     line_num++;
     (*out_idx)++;
-  }
+  } while (len > 0);
 }
 
 uint8_t get_z_num(const char* elem) {
@@ -725,13 +730,14 @@ void encode_bpdb(const char* in_path, const char* out_path) {
       }
 
       if (is_jrnl || is_rem1) {
+        if (strlen(line) < 16) continue; 
+        
         if (is_rem1 && strncmp(line + 11, "REFERENCE", 9) == 0) {
           current_rem1 = atoi(line + 21) - 1;
           if (current_rem1 >= 64) current_rem1 = 63;
         } else {
           char key[5];
           memcpy(key, line + 12, 4); key[4] = '\0';
-          char* k_end = key + 3; while(k_end >= key && *k_end == ' ') { *k_end = '\0'; k_end--; }
           int fid = get_jrnl_field_id(key);
           if (fid >= 0) {
             char** target = is_rem1 ? &rem1_fields[current_rem1][fid] : &jrnl_fields[0][fid];
@@ -1171,6 +1177,14 @@ static void decode_jrnl_dict(const uint8_t* file_data, uint32_t offset, char* ou
     
     const char* rec_name = is_remark ? "REMARK" : "JRNL  ";
     
+    if (is_remark && mhdr->num_molecules > 0) {
+        char buf[81];
+        memset(buf, ' ', 80); buf[80] = '\n';
+        memcpy(buf, "REMARK   1", 10);
+        memcpy(out_data + (*out_idx * 81), buf, 81);
+        (*out_idx)++;
+    }
+    
     for (int i = 0; i < mhdr->num_molecules; i++) {
         if (mol_offs[i] == 0) continue;
         const uint32_t* field_offs = (const uint32_t*)(file_data + mol_offs[i]);
@@ -1328,10 +1342,10 @@ void decode_bpdb(const char* in_path, const char* out_path) {
   decode_text_pool(file_data, dir_table[DIR_MDLTYP], out_data, &out_idx, "MDLTYP");
 
   decode_revdat(file_data, dir_table[DIR_REVDAT], out_data, &out_idx);
+  decode_jrnl_dict(file_data, dir_table[DIR_JRNL], out_data, &out_idx, 0);
+  decode_jrnl_dict(file_data, dir_table[DIR_REMARK_1], out_data, &out_idx, 1);
   decode_remark2(file_data, dir_table[DIR_REMARK_2], out_data, &out_idx);
   decode_remarks_dict(file_data, dir_table[DIR_REMARKS], out_data, &out_idx);
-
-  decode_jrnl_dict(file_data, dir_table[DIR_JRNL], out_data, &out_idx, 0);
 
   if (dir_table[DIR_NUMMDL] != 0) {
     uint32_t n_mdl = *(const uint32_t*)(file_data + dir_table[DIR_NUMMDL]);
@@ -1344,7 +1358,7 @@ void decode_bpdb(const char* in_path, const char* out_path) {
 
   FILE* out = fopen(out_path, "wb");
   if (out) {
-    fwrite(out_data, 1, out_size, out);
+    fwrite(out_data, 1, out_idx * 81, out);
     fclose(out);
   }
 

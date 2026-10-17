@@ -48,7 +48,7 @@ const ResidueDict DICT[37] = {
     {"ASX", 9,  {" N  "," CA "," C  "," O  "," CB "," CG "," OD1"," OD2"," ND2"}, {" N"," C"," C"," O"," C"," C"," O"," O"," N"}},
     {"GLX", 10, {" N  "," CA "," C  "," O  "," CB "," CG "," CD "," OE1"," OE2"," NE2"}, {" N"," C"," C"," O"," C"," C"," C"," O"," O"," N"}},
     {"UNK", 14, {" N  "," CA "," C  "," O  "," CB "," CG "," CD "," CE "," CZ "," CH "," X1 "," X2 "," X3 "," X4 "}, {" N"," C"," C"," O"," C"," C"," C"," C"," C"," C"," X"," X"," X"," X"}},
-    {"  A", 22, {" P  "," OP1"," OP2"," O5'"," C5'"," C4'"," O4'"," C3'"," O3'"," C2'"," O2'"," C1'"," N9 "," C8 "," N7 "," C5 "," C6 "," N6 "," N1 "," C2 "," N3 "," C4 "}, {" P"," O"," O"," O"," C"," C"," O"," C"," O"," C"," O"," C"," N"," C"," N"," C"," C"," N"," N"," C"," N"," C"}},
+    {"  A", 22, {" P  "," OP1"," OP2"," O5'"," C5'"," C4'"," O4'"," C3'"," O3'"," C2'"," O2'"," C1'"," N9 "," C8 "," N7 "," C5 "," C6 "," O6 "," N6 "," N1 "," C2 "," N3 "," C4 "}, {" P"," O"," O"," O"," C"," C"," O"," C"," O"," C"," O"," C"," N"," C"," N"," C"," C"," N"," N"," C"," N"," C"}},
     {"  C", 20, {" P  "," OP1"," OP2"," O5'"," C5'"," C4'"," O4'"," C3'"," O3'"," C2'"," O2'"," C1'"," N1 "," C2 "," O2 "," N3 "," C4 "," N4 "," C5 "," C6 "}, {" P"," O"," O"," O"," C"," C"," O"," C"," O"," C"," O"," C"," N"," C"," O"," N"," C"," N"," C"," C"}},
     {"  G", 23, {" P  "," OP1"," OP2"," O5'"," C5'"," C4'"," O4'"," C3'"," O3'"," C2'"," O2'"," C1'"," N9 "," C8 "," N7 "," C5 "," C6 "," O6 "," N1 "," C2 "," N2 "," N3 "," C4 "}, {" P"," O"," O"," O"," C"," C"," O"," C"," O"," C"," O"," C"," N"," C"," N"," C"," C"," O"," N"," C"," N"," N"," C"}},
     {"  U", 20, {" P  "," OP1"," OP2"," O5'"," C5'"," C4'"," O4'"," C3'"," O3'"," C2'"," O2'"," C1'"," N1 "," C2 "," O2 "," N3 "," C4 "," O4 "," C5 "," C6 "}, {" P"," O"," O"," O"," C"," C"," O"," C"," O"," C"," O"," C"," N"," C"," O"," N"," C"," O"," C"," C"}},
@@ -109,6 +109,17 @@ void stream_free(StreamBuffer* buf) {
     free(buf->data);
 }
 
+void write_padded_string(FILE* f, const char* str) {
+    uint64_t len = strlen(str);
+    fwrite(&len, 1, 8, f);
+    if (len > 0) fwrite(str, 1, len, f);
+    size_t pad = (8 - (len % 8)) % 8;
+    if (pad > 0) {
+        uint64_t zero = 0;
+        fwrite(&zero, 1, pad, f);
+    }
+}
+
 // -----------------------------------------------------------------------------
 // 3. Encoder
 // -----------------------------------------------------------------------------
@@ -129,36 +140,39 @@ typedef struct {
     int8_t oxt_charge;
 } EncoderState;
 
-// State variables for stream chunks
 int chunk_residues = 0;
 size_t chunk_header_offset = 0;
 int chunk_active = 0;
-uint32_t chunk_flags = 0;
+uint8_t chunk_flags = 0;
 
-#define CTRL_NEXT_CHAIN 0x01
-#define CTRL_NEXT_FILE  0x02
 #define CTRL_TER        0x04
 #define CTRL_TER_OXT    0x08
 
 void close_chunk(StreamBuffer* buf) {
     if (!chunk_active) return;
-    uint32_t header[2] = { chunk_residues, chunk_flags };
-    memcpy(buf->data + chunk_header_offset, header, 8);
+    uint16_t count = chunk_residues;
+    memcpy(buf->data + chunk_header_offset, &count, 2);
+    memcpy(buf->data + chunk_header_offset + 2, &chunk_flags, 1);
     chunk_active = 0;
     chunk_residues = 0;
     chunk_flags = 0;
 }
 
-void open_chunk(StreamBuffer* buf, int is_new_file, int is_new_chain) {
+void open_chunk(StreamBuffer* buf, uint8_t frag_id, char c1, char c2, const char* file) {
     close_chunk(buf);
     chunk_header_offset = buf->len;
-    uint64_t dummy = 0;
-    stream_write(buf, &dummy, 8); // Header placeholder
+    
+    uint8_t header[16] = {0};
+    header[3] = frag_id;
+    header[4] = c1;
+    header[5] = c2;
+    size_t flen = strlen(file);
+    memcpy(header + 6, file, flen > 10 ? 10 : flen);
+    
+    stream_write(buf, header, 16);
     chunk_active = 1;
     chunk_residues = 0;
     chunk_flags = 0;
-    if (is_new_file) chunk_flags |= CTRL_NEXT_FILE;
-    if (is_new_chain) chunk_flags |= CTRL_NEXT_CHAIN;
 }
 
 static void write_residue_buffer(StreamBuffer* buf, EncoderState* st) {
@@ -236,45 +250,51 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
     StreamBuffer coords;
     stream_init(&coords);
 
-    char title[4096] = {0};
-    char pdbID[16] = {0};
+    char global_title[4096] = {0};
+    char global_id[128] = {0};
+    char global_class[128] = {0};
     int day=1, month=1, year=1973;
     int id_from_header = 0;
-    
-    char chain_names[4096][4]; memset(chain_names, 0, sizeof(chain_names));
-    uint32_t num_chains = 0;
-    
-    char file_ids[4096][16]; memset(file_ids, 0, sizeof(file_ids));
 
     EncoderState st;
     memset(&st, 0, sizeof(st));
     st.type = -1;
 
-    char current_chain_str[5] = {0};
-    int pending_new_file = 0;
+    char current_c1 = '\0', current_c2 = '\0';
+    int force_new_chunk = 1;
 
     for (int f = 0; f < num_files; f++) {
         FILE* fin = fopen(in_pdbs[f], "r");
         if (!fin) { perror("Input file error"); exit(1); }
 
-        pending_new_file = 1;
         char line[128];
         char local_id[16] = {0};
+        uint8_t local_frag = 0;
+
+        const char* f_ptr = strstr(in_pdbs[f], "-F");
+        if (f_ptr && isdigit(f_ptr[2])) local_frag = atoi(f_ptr + 2);
+
+        force_new_chunk = 1;
 
         while (fgets(line, sizeof(line), fin)) {
             if (f == 0 && strncmp(line, "HEADER", 6) == 0) {
-                if (strlen(line) >= 59) {
+                size_t len = strlen(line);
+                if (len >= 50) {
+                    memcpy(global_class, line + 10, 40);
+                    trim_string(global_class);
+                }
+                if (len >= 59) {
                     char d[3]={0}, m[4]={0}, y[3]={0};
                     memcpy(d, line+50, 2); memcpy(m, line+53, 3); memcpy(y, line+57, 2);
                     day = atoi(d); month = parse_month(m); int parsed_y = atoi(y);
                     year = parsed_y + ((parsed_y < 50) ? 2000 : 1900);
                 }
-                if (strlen(line) >= 66) {
+                if (len >= 66) {
                     char temp_id[5] = {0};
                     memcpy(temp_id, line+62, 4);
                     trim_string(temp_id);
                     if (strlen(temp_id) > 0 && strcmp(temp_id, "XXXX") != 0) {
-                        strcpy(pdbID, temp_id);
+                        strcpy(global_id, temp_id);
                         id_from_header = 1;
                     }
                 }
@@ -287,8 +307,8 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
                     if (c_len > 70) c_len = 70;
                     memcpy(chunk, line+10, c_len);
                     trim_string(chunk);
-                    if (strlen(title) > 0) strcat(title, " ");
-                    strcat(title, chunk);
+                    if (strlen(global_title) > 0) strcat(global_title, " ");
+                    strcat(global_title, chunk);
                 }
                 
                 if (!id_from_header) {
@@ -297,7 +317,7 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
                     if (p1 && p2 && (p2 > p1 + 4)) {
                         size_t len = p2 - p1 - 1;
                         if (len > 15) len = 15;
-                        memcpy(pdbID, p1+1, len); pdbID[len] = '\0';
+                        memcpy(global_id, p1+1, len); global_id[len] = '\0';
                     }
                 }
             }
@@ -308,11 +328,11 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
                     if (sscanf(unp, "%s %s", dummy_str, uid) == 2 && strlen(uid) > 3) {
                         if (f == 0 && !id_from_header) {
                             size_t c = strlen(uid);
-                            memcpy(pdbID, uid, c > 15 ? 15 : c);
-                            pdbID[c > 15 ? 15 : c] = '\0';
+                            memcpy(global_id, uid, c > 15 ? 15 : c);
+                            global_id[c > 15 ? 15 : c] = '\0';
                         }
                         size_t l = strlen(uid);
-                        memcpy(local_id, uid, l > 15 ? 15 : l);
+                        memcpy(local_id, uid, l > 10 ? 10 : l);
                     }
                 }
             }
@@ -322,7 +342,6 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
                 
                 if (st.has_oxt) {
                     chunk_flags |= CTRL_TER_OXT;
-                    
                     int32_t base_b = 0, base_x = 0, base_y = 0, base_z = 0;
                     for (int i = 0; i < DICT[st.type].num_atoms; i++) {
                         if (st.present[i]) {
@@ -364,6 +383,7 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
                 close_chunk(&coords);
                 st.type = -1;
                 st.has_oxt = 0;
+                force_new_chunk = 1;
                 continue;
             }
             
@@ -376,10 +396,8 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
             char iCode = line[26];
             int resSeq = atoi(line + 22);
             
-            char chain_str[5] = {0};
-            if (line[20] != ' ' && line[21] != ' ') { chain_str[0] = line[20]; chain_str[1] = line[21]; }
-            else { chain_str[0] = line[21]; }
-            trim_string(chain_str);
+            char c1 = line[20];
+            char c2 = line[21];
 
             char clean_atom[5] = {0};
             memcpy(clean_atom, line + 12, 4);
@@ -388,20 +406,20 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
             int type = get_res_type(res_name);
             if (type == -1) continue;
 
-            int new_chain = (strcmp(chain_str, current_chain_str) != 0);
+            if (strlen(local_id) == 0) {
+                size_t g_len = strlen(global_id);
+                memcpy(local_id, global_id, g_len > 10 ? 10 : g_len);
+            }
 
-            if (resSeq != st.resSeq || iCode != st.iCode || new_chain || pending_new_file || type != st.type) {
+            int new_chain = (c1 != current_c1 || c2 != current_c2);
+
+            if (resSeq != st.resSeq || iCode != st.iCode || new_chain || force_new_chunk || chunk_residues >= 60000 || type != st.type) {
                 write_residue_buffer(&coords, &st);
                 
-                if (new_chain || pending_new_file || !chunk_active) {
-                    if (new_chain) {
-                        strcpy(current_chain_str, chain_str);
-                        size_t clen = strlen(chain_str);
-                        memcpy(chain_names[num_chains], chain_str, clen > 3 ? 3 : clen);
-                        num_chains++;
-                    }
-                    open_chunk(&coords, pending_new_file, new_chain);
-                    pending_new_file = 0;
+                if (new_chain || force_new_chunk || chunk_residues >= 60000) {
+                    if (new_chain) { current_c1 = c1; current_c2 = c2; }
+                    open_chunk(&coords, local_frag, c1, c2, local_id);
+                    force_new_chunk = 0;
                 }
                 
                 st.resSeq = resSeq;
@@ -448,11 +466,6 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
             st.charge_acc[atom_idx] = charge;
             st.present[atom_idx] = 1;
         }
-        
-        if (strlen(local_id) == 0) strcpy(local_id, pdbID);
-        size_t id_len = strlen(local_id);
-        memcpy(file_ids[f], local_id, id_len > 15 ? 15 : id_len);
-        
         fclose(fin);
     }
     write_residue_buffer(&coords, &st);
@@ -461,49 +474,23 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
     FILE* fout = fopen(out_bpdb, "wb");
     uint64_t zero = 0;
     
-    // 1. Write Fixed Header (32 Bytes)
-    uint8_t header[32] = {0};
-    memcpy(header, "bPDB", 4);
-    header[4] = 1;
-    header[5] = (uint8_t)day;
-    header[6] = (uint8_t)month;
-    header[7] = (year >= 1973 && year <= 2228) ? (uint8_t)(year - 1973) : 0;
-    memcpy(header + 8, pdbID, strlen(pdbID) > 15 ? 15 : strlen(pdbID));
-    
-    uint32_t u32_files = num_files;
-    uint32_t u32_chains = num_chains;
-    memcpy(header + 24, &u32_files, 4);
-    memcpy(header + 28, &u32_chains, 4);
-    fwrite(header, 1, 32, fout);
+    // 1. Write Fixed Header (8 Bytes)
+    uint8_t header[8] = {'b','P','D','B', 1, (uint8_t)day, (uint8_t)month, 
+                         (year >= 1973 && year <= 2228) ? (uint8_t)(year - 1973) : 0};
+    fwrite(header, 1, 8, fout);
 
-    // 2. Write Title
-    uint32_t t_len = strlen(title);
-    fwrite(&t_len, 1, 4, fout);
-    if (t_len > 0) fwrite(title, 1, t_len, fout);
-    uint32_t t_pad = (8 - ((4 + t_len) % 8)) % 8;
-    if (t_pad > 0) fwrite(&zero, 1, t_pad, fout);
+    // 2. Mandatory Blocks (ID, Class, Title)
+    write_padded_string(fout, global_id);
+    write_padded_string(fout, global_class);
+    write_padded_string(fout, global_title);
 
-    // 3. Write Files Array
-    uint32_t f_count = num_files;
-    fwrite(&f_count, 1, 4, fout);
-    for(int i=0; i<num_files; i++) fwrite(file_ids[i], 1, 16, fout);
-    uint32_t f_pad = (8 - ((4 + f_count * 16) % 8)) % 8;
-    if (f_pad > 0) fwrite(&zero, 1, f_pad, fout);
-
-    // 4. Write Chains Array
-    uint32_t c_count = num_chains;
-    fwrite(&c_count, 1, 4, fout);
-    for(uint32_t i=0; i<num_chains; i++) fwrite(chain_names[i], 1, 4, fout);
-    uint32_t c_pad = (8 - ((4 + c_count * 4) % 8)) % 8;
-    if (c_pad > 0) fwrite(&zero, 1, c_pad, fout);
-
-    // 5. Write Metadata Section (TLV) - Empty for now
-    uint16_t m_count = 0;
-    fwrite(&m_count, 1, 2, fout);
+    // 3. Extensible Metadata Section (TLV) - Empty for now
+    uint16_t num_meta = 0;
+    fwrite(&num_meta, 1, 2, fout);
     uint16_t m_pad = (8 - (2 % 8)) % 8;
     if (m_pad > 0) fwrite(&zero, 1, m_pad, fout);
 
-    // 6. Write Coordinate Stream
+    // 4. Coordinate Stream
     fwrite(coords.data, 1, coords.len, fout);
 
     fclose(fout);
@@ -534,111 +521,187 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
     #define GET_SIMD_Z(acc) ((acc).z)
 #endif
 
-#define WRITE_ATOM(a_ptr, idx, name, elem) do { \
-    uint16_t mL0 = (a_ptr)[0] | ((a_ptr)[1] << 8); \
-    uint16_t mL1 = (a_ptr)[2] | ((a_ptr)[3] << 8); \
-    uint16_t mL2 = (a_ptr)[4] | ((a_ptr)[5] << 8); \
-    uint16_t mL3 = (a_ptr)[6] | ((a_ptr)[7] << 8); \
-    uint8_t occ = (mL0 & 0x07) | ((mL1 & 0x07) << 3) | ((mL2 & 0x01) << 6); \
-    if (occ > 0 && out) { \
-        uint8_t alt_charge = ((mL2 >> 1) & 0x03) | ((mL3 & 0x07) << 2); \
-        int8_t charge = alt_charge & 0x0F; \
-        if (charge & 0x08) charge |= 0xF0; \
-        uint8_t alt_idx = (alt_charge >> 4) & 0x07; \
-        char altLoc = alt_idx == 0 ? ' ' : 'A' + alt_idx - 1; \
-        char chg_str[3] = "  "; \
-        if (charge > 0) { chg_str[0] = '0' + charge; chg_str[1] = '+'; } \
-        else if (charge < 0) { chg_str[0] = '0' - charge; chg_str[1] = '-'; } \
-        int32_t b_val = GET_SIMD_B(accum); int32_t x_val = GET_SIMD_X(accum); \
-        int32_t y_val = GET_SIMD_Y(accum); int32_t z_val = GET_SIMD_Z(accum); \
-        fprintf(out, "ATOM  %5d %-4s%c%3s %c%c%4d%c   %8.3f%8.3f%8.3f%6.2f%6.2f          %2s%2s\n", \
-                atom_serial++, (name), altLoc, DICT[res_type].resName, \
-                c1, c2, resSeq, iCode == 0 ? ' ' : iCode, \
-                x_val / 1000.0f, y_val / 1000.0f, z_val / 1000.0f, occ / 100.0f, b_val / 100.0f, (elem), chg_str); \
-    } \
-} while(0)
+// Global sink to prevent dead-code elimination during benchmark timing
+volatile int32_t benchmark_sink = 0;
 
 void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
-    if (size < 32) return;
+    if (size < 8) return;
     
     int day = buffer[5], month = buffer[6];
     int year = 1973 + buffer[7];
-    char pdbID[17] = {0};
-    memcpy(pdbID, buffer + 8, 16);
-    trim_string(pdbID);
 
-    size_t offset = 32;
+    size_t offset = 8;
+    
+    // Read Mandatory Strings
+    uint64_t id_len = *(uint64_t*)(buffer + offset); offset += 8;
+    const char* p_idCode = (const char*)(buffer + offset);
+    offset += id_len; offset += (8 - (id_len % 8)) % 8;
 
-    // Title
-    uint32_t title_len = *(uint32_t*)(buffer + offset); offset += 4;
+    uint64_t class_len = *(uint64_t*)(buffer + offset); offset += 8;
+    const char* p_class = (const char*)(buffer + offset);
+    offset += class_len; offset += (8 - (class_len % 8)) % 8;
+
+    uint64_t title_len = *(uint64_t*)(buffer + offset); offset += 8;
     const char* p_title = (const char*)(buffer + offset);
-    offset += title_len;
-    offset += (8 - (offset % 8)) % 8;
+    offset += title_len; offset += (8 - (title_len % 8)) % 8;
 
-    // Files
-    uint32_t f_count = *(uint32_t*)(buffer + offset); offset += 4;
-    offset += f_count * 16;
-    offset += (8 - (offset % 8)) % 8;
+    // Read TLV Meta
+    uint16_t num_meta = *(uint16_t*)(buffer + offset); offset += 2;
+    offset += (8 - (2 % 8)) % 8;
 
-    // Chains
-    uint32_t c_count = *(uint32_t*)(buffer + offset); offset += 4;
-    const char* chain_names = (const char*)(buffer + offset);
-    offset += c_count * 4;
-    offset += (8 - (offset % 8)) % 8;
-
-    // Meta TLV
-    uint16_t m_count = *(uint16_t*)(buffer + offset); offset += 2;
-    offset += (8 - (offset % 8)) % 8;
-    for (uint16_t i = 0; i < m_count; i++) {
-        offset += 8; // skip code
-        uint64_t m_len = *(uint64_t*)(buffer + offset); offset += 8;
-        offset += m_len;
-        offset += (8 - (offset % 8)) % 8;
+    for (int i = 0; i < num_meta; i++) {
+        offset += 8; // skip type code
+        uint64_t section_len = *(uint64_t*)(buffer + offset); offset += 8;
+        offset += section_len;
+        offset += (8 - (section_len % 8)) % 8;
     }
 
-    if (out) {
-        fprintf(out, "HEADER    %-40s%02d-%3s-%02d   %s\n", " ", day, MONTHS[month], year % 100, pdbID);
+    if (!out) {
+        // Benchmark mode: just run through decoding without disk output
+        while (offset < size) {
+            uint16_t num_residues = *(uint16_t*)(buffer + offset);
+            uint8_t flags         = buffer[offset + 2];
+            offset += 16;
+            
+            int32_t last_a0_b = 0, last_a0_x = 0, last_a0_y = 0, last_a0_z = 0;
+            
+            for (uint32_t r = 0; r < num_residues; r++) {
+                const uint8_t* res_ptr = buffer + offset;
+                int res_type = res_ptr[0];
+                int num_atoms = DICT[res_type].num_atoms;
+                offset += 8;
+
+                const uint8_t* a1_ptr = buffer + offset;
+                accum_t accum;
+                
+                int32_t b_m = (int8_t)res_ptr[1]; int32_t x_m = (int8_t)res_ptr[3];
+                int32_t y_m = (int8_t)res_ptr[5]; int32_t z_m = (int8_t)res_ptr[7];
+                int32_t L0 = a1_ptr[0] | (a1_ptr[1] << 8); int32_t L1 = a1_ptr[2] | (a1_ptr[3] << 8);
+                int32_t L2 = a1_ptr[4] | (a1_ptr[5] << 8); int32_t L3 = a1_ptr[6] | (a1_ptr[7] << 8);
+                int32_t b_l = (L0 >> 3) & 0x1FFF; int32_t x_l = (L1 >> 3) & 0x1FFF;
+                int32_t y_l = (L2 >> 3) & 0x1FFF; int32_t z_l = (L3 >> 3) & 0x1FFF;
+                
+#if defined(__AVX2__) || defined(__SSE4_1__)
+                accum = _mm_set_epi32((z_m << 13) | z_l, (y_m << 13) | y_l, (x_m << 13) | x_l, (b_m << 13) | b_l);
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+                int32x4_t setup = {(b_m << 13) | b_l, (x_m << 13) | x_l, (y_m << 13) | y_l, (z_m << 13) | z_l}; accum = setup;
+#else
+                accum.b = (b_m << 13) | b_l; accum.x = (x_m << 13) | x_l; accum.y = (y_m << 13) | y_l; accum.z = (z_m << 13) | z_l;
+#endif
+
+                last_a0_b = GET_SIMD_B(accum); last_a0_x = GET_SIMD_X(accum);
+                last_a0_y = GET_SIMD_Y(accum); last_a0_z = GET_SIMD_Z(accum);
+
+                offset += 8;
+                for (int i = 1; i < num_atoms; i++) {
+                    const uint8_t* an_ptr = buffer + offset;
+#if defined(__AVX2__) || defined(__SSE4_1__)
+                    __m128i an_vec = _mm_cvtepi16_epi32(_mm_loadl_epi64((const __m128i*)an_ptr));
+                    __m128i delta = _mm_srai_epi32(an_vec, 3);
+                    accum = _mm_add_epi32(accum, delta); 
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+                    int16x4_t an_vec_16 = vreinterpret_s16_u8(vld1_u8(an_ptr));
+                    int32x4_t an_vec_32 = vmovl_s16(an_vec_16);
+                    int32x4_t delta = vshrq_n_s32(an_vec_32, 3);
+                    accum = vaddq_s32(accum, delta);
+#else
+                    int32_t aL0 = an_ptr[0] | (an_ptr[1] << 8); int32_t aL1 = an_ptr[2] | (an_ptr[3] << 8);
+                    int32_t aL2 = an_ptr[4] | (an_ptr[5] << 8); int32_t aL3 = an_ptr[6] | (an_ptr[7] << 8);
+                    accum.b += ((int16_t)aL0) >> 3; accum.x += ((int16_t)aL1) >> 3;
+                    accum.y += ((int16_t)aL2) >> 3; accum.z += ((int16_t)aL3) >> 3;
+#endif
+                    offset += 8;
+                }
+                benchmark_sink += GET_SIMD_X(accum);
+            }
+            if (flags & CTRL_TER_OXT) {
+                // Ensure the variables are "used" to prevent warnings
+                benchmark_sink += last_a0_b + last_a0_x + last_a0_y + last_a0_z;
+                offset += 8;
+            }
+        }
+        return;
+    }
+
+    // Phase 1: Pre-calculate exact number of lines needed for the output
+    size_t out_lines = 0;
+    if (id_len > 0 || class_len > 0 || title_len > 0) {
+        out_lines++; // HEADER
+        if (title_len > 0) out_lines += (title_len + 69) / 70;
+    }
+
+    size_t scan_off = offset;
+    while (scan_off < size) {
+        uint16_t num_residues = *(uint16_t*)(buffer + scan_off);
+        uint8_t flags = buffer[scan_off + 2];
+        scan_off += 16;
+        for (uint32_t r = 0; r < num_residues; r++) {
+            int res_type = buffer[scan_off];
+            int num_atoms = DICT[res_type].num_atoms;
+            scan_off += 8;
+            for (int i = 0; i < num_atoms; i++) {
+                uint8_t occ_byte = buffer[scan_off + 6]; 
+                if ((occ_byte & 0x01) || buffer[scan_off] != 0) out_lines++;
+                scan_off += 8;
+            }
+        }
+        if (flags & CTRL_TER_OXT) { out_lines++; scan_off += 8; }
+        if ((flags & CTRL_TER) || (flags & CTRL_TER_OXT)) out_lines++;
+    }
+
+    // Phase 2: Memory-mapped format
+    size_t out_size = out_lines * 81;
+    char* out_data = (char*)malloc(out_size);
+    memset(out_data, ' ', out_size);
+    for (size_t i = 0; i < out_lines; i++) out_data[i * 81 + 80] = '\n';
+
+    char* w_ptr = out_data;
+    char tbuf[128];
+
+    if (id_len > 0 || class_len > 0 || title_len > 0) {
+        memcpy(w_ptr, "HEADER    ", 10);
+        if (class_len > 0) memcpy(w_ptr + 10, p_class, class_len > 40 ? 40 : class_len);
+        
+        int dlen = snprintf(tbuf, 128, "%02d-%3s-%02d", day, MONTHS[month], year % 100);
+        memcpy(w_ptr + 50, tbuf, dlen);
+        
+        if (id_len > 0) memcpy(w_ptr + 62, p_idCode, id_len > 18 ? 18 : id_len);
+        w_ptr += 81;
+        
         if (title_len > 0) {
-            char t_buf[71] = {0};
-            for (uint32_t i = 0; i < title_len; i += 70) {
+            for (uint64_t i = 0; i < title_len; i += 70) {
+                memcpy(w_ptr, "TITLE   ", 8);
+                if (i > 0) {
+                    int ln = snprintf(tbuf, 128, "%2d", (int)(i/70)+1);
+                    memcpy(w_ptr + 8, tbuf, ln);
+                }
                 size_t copy_len = title_len - i;
                 if (copy_len > 70) copy_len = 70;
-                memcpy(t_buf, p_title + i, copy_len);
-                t_buf[copy_len] = '\0';
-                if (i == 0) fprintf(out, "TITLE     %-70s\n", t_buf);
-                else fprintf(out, "TITLE   %2d %-70s\n", (int)(i/70)+1, t_buf);
+                memcpy(w_ptr + 10, p_title + i, copy_len);
+                w_ptr += 81;
             }
         }
     }
 
     int atom_serial = 1;
-    char c1 = ' ', c2 = 'A';
-    int current_chain_idx = -1;
 
     while (offset < size) {
-        uint32_t num_residues = *(uint32_t*)(buffer + offset);
-        uint32_t chunk_flags  = *(uint32_t*)(buffer + offset + 4);
-        offset += 8;
-
-        if (chunk_flags & CTRL_NEXT_CHAIN) {
-            current_chain_idx++;
-            char raw_chain[5] = {0};
-            memcpy(raw_chain, chain_names + (current_chain_idx * 4), 4);
-            trim_string(raw_chain);
-            size_t l = strlen(raw_chain);
-            if (l == 1) { c1 = ' '; c2 = raw_chain[0]; }
-            else if (l >= 2) { c1 = raw_chain[0]; c2 = raw_chain[1]; }
-        }
+        uint16_t num_residues = *(uint16_t*)(buffer + offset);
+        uint8_t flags         = buffer[offset + 2];
+        char c1               = buffer[offset + 4];
+        char c2               = buffer[offset + 5];
+        offset += 16;
+        
+        if (c1 == 0) c1 = ' ';
+        if (c2 == 0) c2 = ' ';
 
         int32_t last_a0_b = 0, last_a0_x = 0, last_a0_y = 0, last_a0_z = 0;
-        int res_type = 0, resSeq = 0;
-        char iCode = ' ';
 
         for (uint32_t r = 0; r < num_residues; r++) {
             const uint8_t* res_ptr = buffer + offset;
-            res_type = res_ptr[0];
-            resSeq = res_ptr[2] | (res_ptr[4] << 8);
-            iCode = res_ptr[6];
+            int res_type = res_ptr[0];
+            int resSeq = res_ptr[2] | (res_ptr[4] << 8);
+            char iCode = res_ptr[6];
             int num_atoms = DICT[res_type].num_atoms;
             offset += 8;
 
@@ -647,10 +710,8 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
             
             int32_t b_m = (int8_t)res_ptr[1]; int32_t x_m = (int8_t)res_ptr[3];
             int32_t y_m = (int8_t)res_ptr[5]; int32_t z_m = (int8_t)res_ptr[7];
-
             int32_t L0 = a1_ptr[0] | (a1_ptr[1] << 8); int32_t L1 = a1_ptr[2] | (a1_ptr[3] << 8);
             int32_t L2 = a1_ptr[4] | (a1_ptr[5] << 8); int32_t L3 = a1_ptr[6] | (a1_ptr[7] << 8);
-            
             int32_t b_l = (L0 >> 3) & 0x1FFF; int32_t x_l = (L1 >> 3) & 0x1FFF;
             int32_t y_l = (L2 >> 3) & 0x1FFF; int32_t z_l = (L3 >> 3) & 0x1FFF;
             
@@ -661,11 +722,28 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
 #else
             accum.b = (b_m << 13) | b_l; accum.x = (x_m << 13) | x_l; accum.y = (y_m << 13) | y_l; accum.z = (z_m << 13) | z_l;
 #endif
-
             last_a0_b = GET_SIMD_B(accum); last_a0_x = GET_SIMD_X(accum);
             last_a0_y = GET_SIMD_Y(accum); last_a0_z = GET_SIMD_Z(accum);
 
-            WRITE_ATOM(a1_ptr, 0, DICT[res_type].atom_names[0], DICT[res_type].elements[0]);
+            uint8_t occ = (L0 & 0x07) | ((L1 & 0x07) << 3) | ((L2 & 0x01) << 6);
+            if (occ > 0) {
+                uint8_t alt_charge = ((L2 >> 1) & 0x03) | ((L3 & 0x07) << 2);
+                int8_t charge = alt_charge & 0x0F;
+                if (charge & 0x08) charge |= 0xF0;
+                uint8_t alt_idx = (alt_charge >> 4) & 0x07;
+                char altLoc = alt_idx == 0 ? ' ' : 'A' + alt_idx - 1;
+                char chg_str[3] = "  ";
+                if (charge > 0) { chg_str[0] = '0' + charge; chg_str[1] = '+'; } 
+                else if (charge < 0) { chg_str[0] = '0' - charge; chg_str[1] = '-'; }
+                
+                int len = snprintf(tbuf, 128, "ATOM  %5d %-4s%c%3s%c%c%4d%c   %8.3f%8.3f%8.3f%6.2f%6.2f          %2s%2s",
+                        atom_serial++, DICT[res_type].atom_names[0], altLoc, DICT[res_type].resName,
+                        c1, c2, resSeq, iCode == 0 ? ' ' : iCode,
+                        last_a0_x / 1000.0f, last_a0_y / 1000.0f, last_a0_z / 1000.0f, occ / 100.0f, last_a0_b / 100.0f, 
+                        DICT[res_type].elements[0], chg_str);
+                memcpy(w_ptr, tbuf, len); w_ptr[len] = ' '; 
+                w_ptr += 81;
+            }
             offset += 8;
 
             for (int i = 1; i < num_atoms; i++) {
@@ -685,12 +763,37 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
                 accum.b += ((int16_t)aL0) >> 3; accum.x += ((int16_t)aL1) >> 3;
                 accum.y += ((int16_t)aL2) >> 3; accum.z += ((int16_t)aL3) >> 3;
 #endif
-                WRITE_ATOM(an_ptr, i, DICT[res_type].atom_names[i], DICT[res_type].elements[i]);
+                
+                uint16_t aL0 = an_ptr[0] | (an_ptr[1] << 8); uint16_t aL1 = an_ptr[2] | (an_ptr[3] << 8);
+                uint16_t aL2 = an_ptr[4] | (an_ptr[5] << 8); uint16_t aL3 = an_ptr[6] | (an_ptr[7] << 8);
+                occ = (aL0 & 0x07) | ((aL1 & 0x07) << 3) | ((aL2 & 0x01) << 6);
+                
+                if (occ > 0) {
+                    uint8_t alt_charge = ((aL2 >> 1) & 0x03) | ((aL3 & 0x07) << 2);
+                    int8_t charge = alt_charge & 0x0F;
+                    if (charge & 0x08) charge |= 0xF0;
+                    uint8_t alt_idx = (alt_charge >> 4) & 0x07;
+                    char altLoc = alt_idx == 0 ? ' ' : 'A' + alt_idx - 1;
+                    char chg_str[3] = "  ";
+                    if (charge > 0) { chg_str[0] = '0' + charge; chg_str[1] = '+'; } 
+                    else if (charge < 0) { chg_str[0] = '0' - charge; chg_str[1] = '-'; }
+                    
+                    int32_t v_b = GET_SIMD_B(accum); int32_t v_x = GET_SIMD_X(accum);
+                    int32_t v_y = GET_SIMD_Y(accum); int32_t v_z = GET_SIMD_Z(accum);
+                    
+                    int len = snprintf(tbuf, 128, "ATOM  %5d %-4s%c%3s%c%c%4d%c   %8.3f%8.3f%8.3f%6.2f%6.2f          %2s%2s",
+                            atom_serial++, DICT[res_type].atom_names[i], altLoc, DICT[res_type].resName,
+                            c1, c2, resSeq, iCode == 0 ? ' ' : iCode,
+                            v_x / 1000.0f, v_y / 1000.0f, v_z / 1000.0f, occ / 100.0f, v_b / 100.0f, 
+                            DICT[res_type].elements[i], chg_str);
+                    memcpy(w_ptr, tbuf, len); w_ptr[len] = ' '; 
+                    w_ptr += 81;
+                }
                 offset += 8;
             }
         }
 
-        if (chunk_flags & CTRL_TER_OXT) {
+        if (flags & CTRL_TER_OXT) {
             const uint8_t* oxt_ptr = buffer + offset;
             uint16_t mL0 = oxt_ptr[0] | (oxt_ptr[1] << 8);
             uint16_t mL1 = oxt_ptr[2] | (oxt_ptr[3] << 8);
@@ -698,7 +801,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
             uint16_t mL3 = oxt_ptr[6] | (oxt_ptr[7] << 8);
             
             uint8_t occ = (mL0 & 0x07) | ((mL1 & 0x07) << 3) | ((mL2 & 0x01) << 6);
-            if (occ > 0 && out) {
+            if (occ > 0) {
                 int32_t db = ((int16_t)mL0) >> 3; int32_t dx = ((int16_t)mL1) >> 3;
                 int32_t dy = ((int16_t)mL2) >> 3; int32_t dz = ((int16_t)mL3) >> 3;
                 
@@ -714,18 +817,25 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
                 if (charge > 0) { chg_str[0] = '0' + charge; chg_str[1] = '+'; } 
                 else if (charge < 0) { chg_str[0] = '0' - charge; chg_str[1] = '-'; }
                 
-                fprintf(out, "ATOM  %5d %-4s%c%3s %c%c%4d%c   %8.3f%8.3f%8.3f%6.2f%6.2f          %2s%2s\n",
-                        atom_serial++, " OXT", altLoc, DICT[res_type].resName, c1, c2, resSeq, iCode == 0 ? ' ' : iCode,
+                int len = snprintf(tbuf, 128, "ATOM  %5d %-4s%c%3s%c%c%4d%c   %8.3f%8.3f%8.3f%6.2f%6.2f          %2s%2s",
+                        atom_serial++, " OXT", altLoc, DICT[0].resName, c1, c2, 0, ' ',
                         oxt_x / 1000.0f, oxt_y / 1000.0f, oxt_z / 1000.0f, occ / 100.0f, oxt_b / 100.0f, " O", chg_str);
+                memcpy(w_ptr, tbuf, len); w_ptr[len] = ' '; 
+                w_ptr += 81;
             }
             offset += 8;
         }
 
-        if ((chunk_flags & CTRL_TER) || (chunk_flags & CTRL_TER_OXT)) {
-            if (out) fprintf(out, "TER   %5d      %3s %c%c%4d%c                                                    \n", 
-                             atom_serial++, DICT[res_type].resName, c1, c2, resSeq, iCode == 0 ? ' ' : iCode);
+        if ((flags & CTRL_TER) || (flags & CTRL_TER_OXT)) {
+            int len = snprintf(tbuf, 128, "TER   %5d      %3s%c%c%4d%c", 
+                                atom_serial++, DICT[0].resName, c1, c2, 0, ' ');
+            memcpy(w_ptr, tbuf, len); w_ptr[len] = ' '; 
+            w_ptr += 81;
         }
     }
+    
+    fwrite(out_data, 1, out_size, out);
+    free(out_data);
 }
 
 // -----------------------------------------------------------------------------

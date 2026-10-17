@@ -32,18 +32,18 @@ The file strictly begins with this 32-byte block.
 | `+28`  | `uint32`   | Number of Chains (`num_chains`)               |
 
 ### 2.2 Title Block
-| Type | Description |
-| :--- | :--- |
+| Type     | Description                                       |
+|:---------|:--------------------------------------------------|
 | `uint32` | Unpadded length of the Title string (`title_len`) |
-| `char[]` | Title string |
-| padding | Padded with `0x00` to the nearest 8-byte boundary |
+| `char[]` | Title string                                      |
+| padding  | Padded with `0x00` to the nearest 8-byte boundary |
 
 ### 2.3 File ID Array
-| Type | Description |
-| :--- | :--- |
-| `uint32` | Number of concatenated files (`f_count`) |
-| `char[][16]`| Array of `f_count` 16-byte strings identifying split/concatenated files. |
-| padding | Padded with `0x00` to the nearest 8-byte boundary |
+| Type         | Description                                                              |
+|:-------------|:-------------------------------------------------------------------------|
+| `uint32`     | Number of concatenated files (`f_count`)                                 |
+| `char[][16]` | Array of `f_count` 16-byte strings identifying split/concatenated files. |
+| padding      | Padded with `0x00` to the nearest 8-byte boundary                        |
 
 ### 2.4 Chain Name Array
 | Type | Description |

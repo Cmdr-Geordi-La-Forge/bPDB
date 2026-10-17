@@ -1,22 +1,27 @@
 CC = gcc
-CFLAGS = -O3 -march=native -Wall -Wextra
-LDFLAGS = -lm
+CFLAGS = -O3 -Wall -Wextra -march=native
 
-TARGET = bpdb_bench
-SRC = main.c
+.PHONY: all clean
 
-all: $(TARGET)
+all: 4cha_back.pdb
 
-$(TARGET): $(SRC) bpdb.h
-	$(CC) $(CFLAGS) -o $(TARGET) $(SRC) $(LDFLAGS)
-
-test: $(TARGET) 4cha.pdb
-	./$(TARGET) bench
+bpdb: bpdb.c
+	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 4cha.pdb:
-	curl -s https://files.rcsb.org/download/4CHA.pdb -o 4cha.pdb
+	@echo "Fetching 4CHA.pdb (if not present)..."
+	@wget -q -O 4cha.pdb "https://files.rcsb.org/download/4CHA.pdb" || curl -s -o 4cha.pdb "https://files.rcsb.org/download/4CHA.pdb"
+
+4cha.bpdb: bpdb 4cha.pdb
+	@echo "Encoding 4cha.pdb to 4cha.bpdb..."
+	@./bpdb encode 4cha.pdb 4cha.bpdb
+
+4cha_back.pdb: bpdb 4cha.bpdb
+	@echo "Decoding 4cha.bpdb to 4cha_back.pdb and running benchmark..."
+	@./bpdb test 4cha.bpdb 4cha_back.pdb
+	@echo ""
+	@echo "✅ Done! 4cha.bpdb and 4cha_back.pdb are now in the folder."
+	@echo "Note: A direct 'diff 4cha.pdb 4cha_back.pdb' will show differences because hydrogens and HETATMs were intentionally dropped."
 
 clean:
-	rm -f $(TARGET) 4cha.pdb 4cha.bpdb 4cha_back.pdb
-
-.PHONY: all test clean
+	rm -f bpdb 4cha.bpdb 4cha_back.pdb 4cha_canonical.bpdb 4cha_canonical.pdb

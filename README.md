@@ -1,144 +1,129 @@
-# bPDB: Binary Protein Data Bank Format
+# Binary PDB (bPDB) Format Specification
 
-**bPDB** is an ultra-fast, zero-copy, SIMD-accelerated binary format for protein structure data. It is designed to achieve absolute maximum parsing speeds by eliminating branch-heavy ASCII parsing and floating-point string conversions (`atof`), yielding up to **~110x faster parsing** than legacy PDB formats. 
+A SIMD-optimized, heavily compressed binary format for macromolecular coordinate data.
 
-bPDB allows for near-zero overhead `mmap` integration, SIMD coordinate reconstruction, and flawless mathematically verified bidirectional conversion with legacy `.pdb` files.
+## 1. File Architecture Overview
 
-## Core Architecture
+The bPDB format utilizes a strictly 8-byte aligned, sequentially ordered architecture. Mandatory blocks occur in a guaranteed order without type codes, allowing the decoder to stream linearly through the file while optimizing hardware prefetching. Future extensions are handled by a dedicated Metadata TLV block immediately preceding the coordinate stream.
 
-* **Alignment:** Strictly **16-byte aligned**. All variable-length sections pad to 16 bytes to align flawlessly with 128-bit SIMD registers (NEON/SSE).
-* **Endianness:** Little-Endian.
-* **Storage Strategy:** Uses integer projections (milli-Ångströms). Coordinates are split into a 16-bit base value and a 16-bit low-bit differential for branchless 32-bit integer reconstruction.
+1. **Fixed Global Header (32 Bytes)**
+2. **Mandatory Title Block**
+3. **Mandatory File ID Array**
+4. **Mandatory Chain Name Array**
+5. **Extensible Metadata Block (TLV)**
+6. **Coordinate Stream**
 
 ---
 
-## 1. Directory Table (Offset: `0x0000`)
-The file begins with a fixed **256-byte** directory table consisting of 64 `uint32_t` offsets. This allows $O(1)$ access to any metadata section or the coordinate stream. An offset of `0` indicates the section is absent.
+## 2. Sequential Blocks
 
-| Index | Offset | Section | Description |
+### 2.1 Fixed Global Header (32 Bytes)
+The file strictly begins with this 32-byte block.
+
+| Offset | Type       | Description                                   |
+|:-------|:-----------|:----------------------------------------------|
+| `+0`   | `char[4]`  | Magic String: `"bPDB"`                        |
+| `+4`   | `uint8`    | Format Version (e.g., `0x01`)                 |
+| `+5`   | `uint8`    | Deposition Day (1-31)                         |
+| `+6`   | `uint8`    | Deposition Month (1-12)                       |
+| `+7`   | `uint8`    | Deposition Year (`YYYY - 1973`)               |
+| `+8`   | `char[16]` | `pdbID` (PDB ID or AlphaFold ID, null-padded) |
+| `+24`  | `uint32`   | Number of Files (`num_files`)                 |
+| `+28`  | `uint32`   | Number of Chains (`num_chains`)               |
+
+### 2.2 Title Block
+| Type | Description |
+| :--- | :--- |
+| `uint32` | Unpadded length of the Title string (`title_len`) |
+| `char[]` | Title string |
+| padding | Padded with `0x00` to the nearest 8-byte boundary |
+
+### 2.3 File ID Array
+| Type | Description |
+| :--- | :--- |
+| `uint32` | Number of concatenated files (`f_count`) |
+| `char[][16]`| Array of `f_count` 16-byte strings identifying split/concatenated files. |
+| padding | Padded with `0x00` to the nearest 8-byte boundary |
+
+### 2.4 Chain Name Array
+| Type | Description |
+| :--- | :--- |
+| `uint32` | Number of unique chains (`c_count`) |
+| `char[][4]` | Array of `c_count` 4-byte strings identifying unique chains. |
+| padding | Padded with `0x00` to the nearest 8-byte boundary |
+
+### 2.5 Extensible Metadata Block (TLV)
+Allows forward-compatible metadata addition. Older parsers can safely skip unknown codes by advancing the stream by `section_len` + padding.
+
+| Type | Description |
+| :--- | :--- |
+| `uint16` | Number of Metadata Sections (`num_meta`) |
+| `uint16[]`| Array of `num_meta` 2-byte Codes (e.g., `0x0001` Resolution, `0x0002` CONECT) |
+| padding | Padded with `0x00` to the nearest 8-byte boundary |
+
+For each of the `num_meta` sections declared above, the following payload structure strictly applies in order:
+
+| Type | Description |
+| :--- | :--- |
+| `uint64` | Unpadded length of the section payload (`section_len`) |
+| `uint8[]` | The raw payload data |
+| padding | Padded with `0x00` to the nearest 8-byte boundary |
+
+---
+
+## 3. Coordinate Stream (Chunked)
+
+The coordinate stream runs from the end of the Metadata Block until EOF. It operates purely sequentially without dictionary offset lookups. 
+
+The stream is divided into "Chunks" of residues. Each Chunk begins with an 8-byte header that defines the properties of the upcoming sequence.
+
+### 3.1 Chunk Header (8 Bytes)
+| Byte  | Type     | Description                                |
+|:------|:---------|:-------------------------------------------|
+| `0-3` | `uint32` | Number of Residues contained in this chunk |
+| `4-7` | `uint32` | 1-Bit Event Flags (See below)              |
+
+### 3.2 Chunk Flags
+The flags dictate state changes before and after the chunk is processed.
+
+| Bit | Hex    | Description                                                       |
+|:----|:-------|:------------------------------------------------------------------|
+| 0   | `0x01` | Next Chain (Advances internal `chain_names` index *before* chunk) |
+| 1   | `0x02` | Next File (Advances internal `file_ids` index *before* chunk)     |
+| 2   | `0x04` | Has TER (Outputs a TER line *after* parsing residues)             |
+| 3   | `0x08` | Has OXT (Parses an 8-byte OXT terminal block *after* residues)    |
+
+### 3.3 Residue & Atom Blocks
+
+Every residue in a chunk strictly consists of 1 Residue Block followed by a static number of Atom Blocks (dictated by the Superset Dictionary).
+
+#### Residue Block (8 Bytes)
+Establishes the base absolute coordinates and sequence metadata.
+
+| Byte Offset | Type    | Description                                                          |
+|:------------|:--------|:---------------------------------------------------------------------|
+| `+0`        | `uint8` | Residue Type ID (0-36 from dictionary).                              |
+| `+1`        | `uint8` | **B-factor MSB**: Top 8 bits of absolute 21-bit B-factor for Atom 1. |
+| `+2`        | `uint8` | **resSeq LSB**: Bottom 8 bits of 16-bit Residue Sequence Number.     |
+| `+3`        | `uint8` | **X-base MSB**: Top 8 bits of absolute 21-bit X coordinate.          |
+| `+4`        | `uint8` | **resSeq MSB**: Top 8 bits of 16-bit Residue Sequence Number.        |
+| `+5`        | `uint8` | **Y-base MSB**: Top 8 bits of absolute 21-bit Y coordinate.          |
+| `+6`        | `char`  | **iCode**: Insertion code character (space or null if none).         |
+| `+7`        | `uint8` | **Z-base MSB**: Top 8 bits of absolute 21-bit Z coordinate.          |
+
+#### Atom Block (8 Bytes)
+Interpreted as four 16-bit lanes mapped directly to SIMD pipelines.
+
+| 16-bit Lane | Component | Bits 3-15 (13-bit MSB Math) | Bits 0-2 (3-bit LSB Metadata) |
 | :--- | :--- | :--- | :--- |
-| `0` | `0x00` | `HEADER` | Pointer to `HEADER` block |
-| `1` | `0x04` | `OBSLTE` | Pointer to `OBSLTE` block |
-| `2` | `0x08` | `TITLE` | Pointer to `TITLE` text pool |
-| `3` | `0x0C` | `SPLIT` | Pointer to `SPLIT` block |
-| `4` | `0x10` | `COMPND` | Pointer to `COMPND` dictionary pool |
-| `5` | `0x14` | `SOURCE` | Pointer to `SOURCE` dictionary pool |
-| `6` | `0x18` | `KEYWDS` | Pointer to `KEYWDS` text pool |
-| `7` | `0x1C` | `EXPDTA` | Pointer to `EXPDTA` text pool |
-| `8` | `0x20` | `AUTHOR` | Pointer to `AUTHOR` text pool |
-| `9` | `0x24` | `REVDAT` | Pointer to `REVDAT` dictionary block |
-| `10` | `0x28` | `JRNL` | Pointer to `JRNL` dictionary block |
-| ... | ... | ... | ... |
-| `30` | `0x78` | `CONECT` | Pointer to global connectivity graph |
-| `31` | `0x7C` | `COORD` | Pointer to Residue/Atom geometry stream |
+| `0` | B-factor | Delta from Atom N-1 (or absolute LSB for Atom 1) | Occupancy Bits 0-2 |
+| `1` | X Coord | Delta from Atom N-1 (or absolute LSB for Atom 1) | Occupancy Bits 3-5 |
+| `2` | Y Coord | Delta from Atom N-1 (or absolute LSB for Atom 1) | Occupancy Bit 6 \| AltLoc \| Charge Bit 0 |
+| `3` | Z Coord | Delta from Atom N-1 (or absolute LSB for Atom 1) | Charge Bits 1-3 |
 
----
+*   **Math Precision:** The 13-bit deltas provide a signed range of ±4096 (±4.096 Å or Å²).
+*   **Metadata Unpacking:** Occupancy is 7 bits unsigned (0-100). AltLoc is 1 bit (Blank or 'A'). Charge is 4 bits signed (-8 to +7). 
+*   **Missing Atoms:** Any atom missing from the experimental data is injected as a "Dummy Atom" (Occupancy = 0) with a coordinate delta of 0 to maintain static block sizing without branching.
 
-## 2. Core Data Types
-
-### `bpdb_date_t` (4 bytes)
-Compact date representation mapping to `DD-MMM-YY` formats.
-* `+0` `uint8_t` day (1-31)
-* `+1` `uint8_t` month (1-12)
-* `+2` `int16_t` year
-
-### EC Number (32-bit packed integer)
-Losslessly packs standard and incomplete Enzyme Commission numbers (e.g., `3.2.1.14`, `3.2.1.-`, `3.2.1.n2`).
-* **Bits 29-31** (3 bits): Class 
-* **Bits 24-28** (5 bits): Subclass 
-* **Bits 16-23** (8 bits signed): Sub-subclass 
-* **Bits 0-15** (16 bits signed): Serial 
-*(Note: 'n' designations are stored as negative values. '-' is stored as 0).*
-
----
-
-## 3. Fixed Metadata Blocks
-
-### `HEADER` (56 bytes, padded to 64)
-| Offset | Type | Description |
-| :--- | :--- | :--- |
-| `+0` | `char[40]` | Classification (padded with spaces) |
-| `+40` | `bpdb_date_t` | depDate (4 bytes) |
-| `+44` | `char[12]` | idCode (Supports legacy 4-char and newer 12-char AlphaFold/UniProt IDs) |
-
-### `REVDAT` (Variable, 16-byte padded)
-| Offset | Type | Description |
-| :--- | :--- | :--- |
-| `+0` | `bpdb_date_t` | modDate (4 bytes) |
-| `+4` | `char[4]` | modId |
-| `+8` | `uint16_t` | modNum |
-| `+10` | `uint16_t` | modType |
-| `+12` | `char[4]` | Reserved / Padding |
-*(Followed immediately by a string pool or array of modified records).*
-
----
-
-## 4. Text & Dictionary Pools
-
-### List Text Pools (`TITLE`, `KEYWDS`, `EXPDTA`, `AUTHOR`)
-Variable length block containing raw strings separated by `\n`.
-* `+0` Concatenated `char` string.
-* `+n` Null terminator (`0x00`) followed by padding bytes to reach the nearest 16-byte boundary.
-
-### Dictionary Pools (`COMPND`, `SOURCE`, `JRNL`)
-Advanced string-pool architecture for Key-Value data mapping. Padded to 16 bytes.
-
-**Base Header:**
-* `+0` `uint16_t`: Molecule Count ($M$)
-* `+2` `uint16_t`: Total Key-Value Pairs ($K$)
-* `+4` `uint32_t`: Offset to String Pool (relative to block start)
-
-**Molecule Headers ($M \times 8$ bytes):**
-* `+0` `uint16_t`: Molecule ID
-* `+2` `uint16_t`: KV Pair Start Index
-* `+4` `uint16_t`: KV Pair Count
-
-**Key-Value Array ($K \times 8$ bytes):**
-* `+0` `uint8_t`: Token Enum (e.g., `MOL_ID`, `SYNONYM`, `EC`)
-* `+2` `uint16_t`: String Length (or packed EC number)
-* `+4` `uint32_t`: String Offset (relative to String Pool)
-
-**String Pool:** Null-terminated strings padded to 16-bytes.
-
----
-
-## 5. Coordinate Stream (`COORD`)
-
-The core geometry stream abandons standard object-oriented hierarchies in favor of an interleaved, 128-bit aligned vector stream designed specifically for hardware intrinsics.
-
-### `RESIDUE` Record (16 bytes)
-| Lane 0 (32-bit) | Lane 1 (32-bit) | Lane 2 (32-bit) | Lane 3 (32-bit) |
-| :--- | :--- | :--- | :--- |
-| `char[3]` res_name | `uint16_t` res_num | `uint16_t` atom_count | `uint8_t` icode |
-| `char` chain_id | `int16_t` base_x | `int16_t` base_y | `uint8_t` file_flags |
-| | | | `int16_t` base_z |
-
-*Note: `file_flags & 0x03` defines the record type (`0` = ATOM, `1` = HETATM, `2` = TER).*
-
-### `ATOM` Record (16 bytes)
-The `RESIDUE` block is immediately followed by $N$ contiguous `ATOM` blocks (defined by `atom_count`).
-
-| Lane 0 (32-bit) | Lane 1 (32-bit) | Lane 2 (32-bit) | Lane 3 (32-bit) |
-| :--- | :--- | :--- | :--- |
-| `char[4]` name | `uint16_t` dx | `uint16_t` dy | `uint16_t` dz |
-| | `uint16_t` occ * 1000 | `uint16_t` bfactor * 100 | `uint8_t` z_num |
-| | | | `uint8_t` bitfield |
-
-*Note: `bitfield` stores the Alternate Location indicator in the lower 4 bits, and the signed Charge (e.g., `2+`, `1-`) as a 4-bit two's complement integer in the upper 4 bits.*
-
----
-
-## SIMD Reconstruction
-
-By aligning `base` coordinates and `dx/dy/dz` differentials perfectly along the 32-bit vector lanes, complete 3D coordinate reconstruction takes a single SIMD addition:
-
-```c
-// Example: AArch64 NEON Reconstruction
-uint32x4_t r_vec = vld1q_u32((const uint32_t*)res);
-uint32x4_t a_vec = vld1q_u32((const uint32_t*)atom);
-
-int32x4_t base = vreinterpretq_s32_u32(vandq_u32(r_vec, vdupq_n_u32(0xFFFF0000)));
-int32x4_t diff = vreinterpretq_s32_u32(vandq_u32(a_vec, vdupq_n_u32(0x0000FFFF)));
-
-int32x4_t coords = vaddq_s32(base, diff); // Exact Integer mÅ coordinates
-float32x4_t fcoords = vmulq_n_f32(vcvtq_f32_s32(coords), 0.001f); // Hardware floats
+#### OXT Terminal Block (8 Bytes)
+If the `Has OXT` flag is set in the Chunk Header, this block appears immediately after the residue's final Atom Block. It is encoded identically to standard Atom Blocks, but its deltas are calculated relative to the absolute coordinates of Atom 0 of the preceding residue to prevent overflow.

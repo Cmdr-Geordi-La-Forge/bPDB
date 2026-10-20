@@ -43,11 +43,12 @@ typedef struct {
 } PdbResId;
 
 typedef struct {
-  PdbResId res1;
-  PdbResId res2;
-  char sym1[8];
-  char sym2[8];
-  float length;
+    PdbResId res1;
+    PdbResId res2;
+    char sym1[8];
+    char sym2[8];
+    float length;
+    uint32_t pad;
 } MetaSSBond;
 
 typedef struct {

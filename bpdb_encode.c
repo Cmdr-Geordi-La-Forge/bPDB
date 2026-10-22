@@ -4,6 +4,9 @@
 #include <math.h>
 #include <ctype.h>
 
+#define MAGIC_C  0x20204320
+#define MAGIC_O3 0x27334F20
+
 void stream_init(StreamBuffer* buf) {
     buf->cap = 1024 * 1024 * 16; buf->data = (uint8_t*)malloc(buf->cap); buf->len = 0;
 }
@@ -28,13 +31,13 @@ typedef struct {
     int seq_bytes; int atom_bytes; int num_atoms; int num_residues;
     int32_t next_res_x, next_res_y, next_res_z, next_res_b; 
     int anchor_set; int start_resSeq; int last_resSeq; char last_iCode;
-    char c1, c2;
+    char c1, c2; int has_ter;
 } ChainBuilder;
 
 void cb_init(ChainBuilder* cb) {
     cb->seq_track = (uint8_t*)malloc(240000); cb->atom_track = (uint8_t*)malloc(120000 * 8 + 100);
     cb->seq_bytes = 0; cb->atom_bytes = 0; cb->num_atoms = 0; cb->num_residues = 0;
-    cb->anchor_set = 0; cb->start_resSeq = 0;
+    cb->anchor_set = 0; cb->start_resSeq = 0; cb->has_ter = 0;
 }
 void cb_free(ChainBuilder* cb) { free(cb->seq_track); free(cb->atom_track); }
 
@@ -44,39 +47,34 @@ void flush_chain(ChainBuilder* cb, StreamBuffer* buf) {
     uint8_t header[8] = {0};
     *(uint16_t*)(header + 0) = cb->num_residues;
     *(uint16_t*)(header + 2) = cb->num_atoms;
-    header[4] = cb->c1; header[5] = cb->c2;
+    header[4] = cb->c1 | (cb->has_ter ? 0x80 : 0); 
+    header[5] = cb->c2;
     *(uint16_t*)(header + 6) = cb->start_resSeq;
     stream_write(buf, header, 8);
 
     stream_write(buf, cb->seq_track, cb->seq_bytes);
-    uint32_t pad = (8 - (cb->seq_bytes % 8)) % 8;
+    uint32_t pad = (8 - (cb->seq_bytes & 7)) & 7;
     if (pad > 0) { uint64_t zero = 0; stream_write(buf, &zero, pad); }
     
     stream_write(buf, cb->atom_track, cb->atom_bytes);
 
     cb->seq_bytes = 0; cb->atom_bytes = 0; cb->num_atoms = 0; cb->num_residues = 0; 
-    cb->anchor_set = 0;
+    cb->anchor_set = 0; cb->has_ter = 0;
 }
 
 void flush_residue(ChainBuilder* cb, EncoderState* st, UniDict* UDICT) {
-    if (st->type <= 0) return; // 0 is now invalid/gap
+    if (st->type <= 0) return;
 
     if (cb->num_residues == 0) cb->start_resSeq = st->resSeq;
 
     if (cb->num_residues > 0 && !st->is_dup) {
         int diff = st->resSeq - cb->last_resSeq;
         if (diff > 1 && diff <= 100) {
-            for (int g = 1; g < diff; g++) {
-                cb->seq_track[cb->seq_bytes++] = 0x00; // Native GAP opcode
-                cb->num_residues++;
-            }
+            for (int g = 1; g < diff; g++) { cb->seq_track[cb->seq_bytes++] = 0x00; cb->num_residues++; }
         }
     }
 
-    if (st->is_dup) {
-        cb->seq_track[cb->seq_bytes++] = 0x7F; // 127 is DUP/AltLoc
-        cb->num_residues++;
-    }
+    if (st->is_dup) { cb->seq_track[cb->seq_bytes++] = 0x7F; cb->num_residues++; }
 
     uint8_t meta = st->type & 0x7F;
     if (st->iCode != ' ' && st->iCode != 0) meta |= 0x80;
@@ -89,12 +87,14 @@ void flush_residue(ChainBuilder* cb, EncoderState* st, UniDict* UDICT) {
 
     int anchor_idx = -1;
     for (int i = 0; i < UDICT[st->type].num_atoms; i++) {
-        if (strncmp(UDICT[st->type].atom_names[i], " C  ", 4) == 0) anchor_idx = i;
-        if (strncmp(UDICT[st->type].atom_names[i], " O3'", 4) == 0) anchor_idx = i;
+        uint32_t magic = *(uint32_t*)(UDICT[st->type].atom_names[i]);
+        if (magic == MAGIC_C || magic == MAGIC_O3) anchor_idx = i;
     }
     if (anchor_idx == -1) {
         for (int i = UDICT[st->type].num_atoms - 1; i >= 0; i--) if (st->present[i]) { anchor_idx = i; break; }
     }
+
+    int is_hetatm = (st->type >= 38);
 
     for (int i = 0; i < UDICT[st->type].num_atoms; i++) {
         if (!st->present[i]) {
@@ -110,7 +110,8 @@ void flush_residue(ChainBuilder* cb, EncoderState* st, UniDict* UDICT) {
         }
 
         int32_t db = b - current_b, dx = x - current_x, dy = y - current_y, dz = z - current_z;
-        int needs_anchor = (cb->num_atoms == 0) || (db > 4095 || db < -4096 || dx > 4095 || dx < -4096 || dy > 4095 || dy < -4096 || dz > 4095 || dz < -4096);
+        int needs_anchor = (cb->num_atoms == 0) || (is_hetatm && i == 0) || 
+                           (db > 4095 || db < -4096 || dx > 4095 || dx < -4096 || dy > 4095 || dy < -4096 || dz > 4095 || dz < -4096);
 
         uint8_t occ = st->occ_acc[i] & 0x7F; 
         uint8_t charge = (st->charge_acc[i] + 4) & 0x07; 
@@ -126,25 +127,19 @@ void flush_residue(ChainBuilder* cb, EncoderState* st, UniDict* UDICT) {
 
         if (needs_anchor) {
             int32_t b_high = b >> 8, x_high = x >> 16, y_high = y >> 16, z_high = z >> 16;
-            uint16_t L0 = ((b_high & 0x1FFF) << 3) | m0;
-            uint16_t L1 = ((x_high & 0x1FFF) << 3) | m1;
-            uint16_t L2 = ((y_high & 0x1FFF) << 3) | m2;
-            uint16_t L3 = ((z_high & 0x1FFF) << 3) | m3;
+            uint16_t L0 = ((b_high & 0x1FFF) << 3) | m0; uint16_t L1 = ((x_high & 0x1FFF) << 3) | m1;
+            uint16_t L2 = ((y_high & 0x1FFF) << 3) | m2; uint16_t L3 = ((z_high & 0x1FFF) << 3) | m3;
 
             ptr[0] = L0 & 0xFF; ptr[1] = L0 >> 8; ptr[2] = L1 & 0xFF; ptr[3] = L1 >> 8;
             ptr[4] = L2 & 0xFF; ptr[5] = L2 >> 8; ptr[6] = L3 & 0xFF; ptr[7] = L3 >> 8;
 
-            ptr[8] = b & 0xFF; ptr[9] = 0;
-            *(uint16_t*)(ptr + 10) = x & 0xFFFF;
-            *(uint16_t*)(ptr + 12) = y & 0xFFFF;
-            *(uint16_t*)(ptr + 14) = z & 0xFFFF;
+            ptr[8] = b & 0xFF; ptr[9] = 0; *(uint16_t*)(ptr + 10) = x & 0xFFFF;
+            *(uint16_t*)(ptr + 12) = y & 0xFFFF; *(uint16_t*)(ptr + 14) = z & 0xFFFF;
 
             cb->atom_bytes += 16;
         } else {
-            uint16_t L0 = ((db & 0x1FFF) << 3) | m0;
-            uint16_t L1 = ((dx & 0x1FFF) << 3) | m1;
-            uint16_t L2 = ((dy & 0x1FFF) << 3) | m2;
-            uint16_t L3 = ((dz & 0x1FFF) << 3) | m3;
+            uint16_t L0 = ((db & 0x1FFF) << 3) | m0; uint16_t L1 = ((dx & 0x1FFF) << 3) | m1;
+            uint16_t L2 = ((dy & 0x1FFF) << 3) | m2; uint16_t L3 = ((dz & 0x1FFF) << 3) | m3;
 
             ptr[0] = L0 & 0xFF; ptr[1] = L0 >> 8; ptr[2] = L1 & 0xFF; ptr[3] = L1 >> 8;
             ptr[4] = L2 & 0xFF; ptr[5] = L2 >> 8; ptr[6] = L3 & 0xFF; ptr[7] = L3 >> 8;
@@ -155,17 +150,14 @@ void flush_residue(ChainBuilder* cb, EncoderState* st, UniDict* UDICT) {
         current_b = b; current_x = x; current_y = y; current_z = z;
         cb->num_atoms++;
 
-        if (i == anchor_idx) { 
-            cb->next_res_b = current_b; cb->next_res_x = current_x; 
-            cb->next_res_y = current_y; cb->next_res_z = current_z; 
-        }
+        if (i == anchor_idx) { cb->next_res_b = current_b; cb->next_res_x = current_x; cb->next_res_y = current_y; cb->next_res_z = current_z; }
     }
     cb->last_resSeq = st->resSeq; cb->last_iCode = st->iCode;
 }
 
 void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
     UniDict* UDICT = (UniDict*)calloc(256, sizeof(UniDict));
-    int num_udict = 1; // 1-BASED INDEXING
+    int num_udict = 1; 
     for (int i = 0; i < NUM_DICT_RES; i++) {
         strcpy(UDICT[num_udict].resName, DICT[i].resName); 
         UDICT[num_udict].num_atoms = DICT[i].num_atoms;
@@ -278,6 +270,7 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
                     cb.next_res_b = st.oxt_b; cb.next_res_x = st.oxt_x; cb.next_res_y = st.oxt_y; cb.next_res_z = st.oxt_z;
                     cb.num_atoms++;
                 }
+                cb.has_ter = 1; 
                 flush_chain(&cb, &coords);
                 st.type = -1; st.has_oxt = 0; st.is_dup = 0;
                 continue;
@@ -363,7 +356,7 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
         }
         cb.num_atoms++;
     }
-    
+    if (st.type > 0 && st.type < 38) cb.has_ter = 1; 
     flush_chain(&cb, &coords);
     cb_free(&cb);
 
@@ -404,40 +397,96 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
     size_t cpad = (8 - ((2 + num_meta * 2) % 8)) % 8; 
     if (cpad > 0) fwrite(&zero, 1, cpad, fout);
 
-    if (has_title) { fwrite(&title_len, 1, 8, fout); fwrite(global_title, 1, title_len, fout); size_t tpad = (8 - (title_len % 8)) % 8; if (tpad > 0) fwrite(&zero, 1, tpad, fout); }
-    if (has_het) {
-        uint64_t dict_len = 1; for (int i = NUM_DICT_RES + 1; i < num_udict; i++) dict_len += 5 + UDICT[i].num_atoms * 6;
-        fwrite(&dict_len, 1, 8, fout); uint8_t custom_count = num_udict - NUM_DICT_RES - 1; fwrite(&custom_count, 1, 1, fout);
-        for (int i = NUM_DICT_RES + 1; i < num_udict; i++) {
-            char r_name[4] = {0}; memcpy(r_name, UDICT[i].resName, 3); r_name[3] = ' '; fwrite(r_name, 1, 4, fout);
-            uint8_t a_count = UDICT[i].num_atoms; fwrite(&a_count, 1, 1, fout);
-            for (int a = 0; a < a_count; a++) { fwrite(UDICT[i].atom_names[a], 1, 4, fout); fwrite(UDICT[i].elements[a], 1, 2, fout); }
-        }
-        size_t dpad = (8 - (dict_len % 8)) % 8; if (dpad > 0) fwrite(&zero, 1, dpad, fout);
+    if (has_title) { 
+        fwrite(&title_len, 1, 8, fout); 
+        fwrite(global_title, 1, title_len, fout); 
+        size_t tpad = (8 - (title_len % 8)) % 8; 
+        if (tpad > 0) fwrite(&zero, 1, tpad, fout); 
     }
-    if (has_expdta) { fwrite(&expdta_len, 1, 8, fout); fwrite(global_expdta, 1, expdta_len, fout); size_t pad = (8 - (expdta_len % 8)) % 8; if (pad > 0) fwrite(&zero, 1, pad, fout); }
-    if (has_res) { uint64_t r_len = 4; fwrite(&r_len, 1, 8, fout); fwrite(&global_resolution, 1, 4, fout); uint32_t pad = 0; fwrite(&pad, 1, 4, fout); }
-    if (has_prog) { uint64_t p_len = 56; fwrite(&p_len, 1, 8, fout); fwrite(global_program, 1, 56, fout); }
+    if (has_het) {
+        uint64_t dict_len = 1; 
+        for (int i = NUM_DICT_RES + 1; i < num_udict; i++) dict_len += 5 + UDICT[i].num_atoms * 6;
+        fwrite(&dict_len, 1, 8, fout); 
+        uint8_t custom_count = num_udict - NUM_DICT_RES - 1; 
+        fwrite(&custom_count, 1, 1, fout);
+        for (int i = NUM_DICT_RES + 1; i < num_udict; i++) {
+            char r_name[4] = {0}; 
+            memcpy(r_name, UDICT[i].resName, 3); r_name[3] = ' '; 
+            fwrite(r_name, 1, 4, fout);
+            uint8_t a_count = UDICT[i].num_atoms; 
+            fwrite(&a_count, 1, 1, fout);
+            for (int a = 0; a < a_count; a++) { 
+                fwrite(UDICT[i].atom_names[a], 1, 4, fout); 
+                fwrite(UDICT[i].elements[a], 1, 2, fout); 
+            }
+        }
+        size_t dpad = (8 - (dict_len % 8)) % 8; 
+        if (dpad > 0) fwrite(&zero, 1, dpad, fout);
+    }
+    if (has_expdta) { 
+        fwrite(&expdta_len, 1, 8, fout); 
+        fwrite(global_expdta, 1, expdta_len, fout); 
+        size_t pad = (8 - (expdta_len % 8)) % 8; 
+        if (pad > 0) fwrite(&zero, 1, pad, fout); 
+    }
+    if (has_res) { 
+        uint64_t r_len = 4; 
+        fwrite(&r_len, 1, 8, fout); 
+        fwrite(&global_resolution, 1, 4, fout); 
+        uint32_t pad = 0; 
+        fwrite(&pad, 1, 4, fout); 
+    }
+    if (has_prog) { 
+        uint64_t p_len = 56; 
+        fwrite(&p_len, 1, 8, fout); 
+        fwrite(global_program, 1, 56, fout); 
+    }
     
-    if (helices.len > 0) { uint64_t L = helices.len; fwrite(&L, 1, 8, fout); fwrite(helices.data, 1, L, fout); size_t pad = (8 - (L % 8)) % 8; if (pad > 0) fwrite(&zero, 1, pad, fout); }
-    if (sheets.len > 0)  { uint64_t L = sheets.len; fwrite(&L, 1, 8, fout); fwrite(sheets.data, 1, L, fout); size_t pad = (8 - (L % 8)) % 8; if (pad > 0) fwrite(&zero, 1, pad, fout); }
-    if (ssbonds.len > 0) { uint64_t L = ssbonds.len; fwrite(&L, 1, 8, fout); fwrite(ssbonds.data, 1, L, fout); size_t pad = (8 - (L % 8)) % 8; if (pad > 0) fwrite(&zero, 1, pad, fout); }
-    if (cispeps.len > 0) { uint64_t L = cispeps.len; fwrite(&L, 1, 8, fout); fwrite(cispeps.data, 1, L, fout); size_t pad = (8 - (L % 8)) % 8; if (pad > 0) fwrite(&zero, 1, pad, fout); }
-    if (sites.len > 0) { uint64_t L = sites.len; fwrite(&L, 1, 8, fout); fwrite(sites.data, 1, L, fout); size_t pad = (8 - (L % 8)) % 8; if (pad > 0) fwrite(&zero, 1, pad, fout); }
+    if (helices.len > 0) { 
+        uint64_t L = helices.len; 
+        fwrite(&L, 1, 8, fout); 
+        fwrite(helices.data, 1, L, fout); 
+        size_t pad = (8 - (L % 8)) % 8; 
+        if (pad > 0) fwrite(&zero, 1, pad, fout); 
+    }
+    if (sheets.len > 0)  { 
+        uint64_t L = sheets.len; 
+        fwrite(&L, 1, 8, fout); 
+        fwrite(sheets.data, 1, L, fout); 
+        size_t pad = (8 - (L % 8)) % 8; 
+        if (pad > 0) fwrite(&zero, 1, pad, fout); 
+    }
+    if (ssbonds.len > 0) { 
+        uint64_t L = ssbonds.len; 
+        fwrite(&L, 1, 8, fout); 
+        fwrite(ssbonds.data, 1, L, fout); 
+        size_t pad = (8 - (L % 8)) % 8; 
+        if (pad > 0) fwrite(&zero, 1, pad, fout); 
+    }
+    if (cispeps.len > 0) { 
+        uint64_t L = cispeps.len; 
+        fwrite(&L, 1, 8, fout); 
+        fwrite(cispeps.data, 1, L, fout); 
+        size_t pad = (8 - (L % 8)) % 8; 
+        if (pad > 0) fwrite(&zero, 1, pad, fout); 
+    }
+    if (sites.len > 0) { 
+        uint64_t L = sites.len; 
+        fwrite(&L, 1, 8, fout); 
+        fwrite(sites.data, 1, L, fout); 
+        size_t pad = (8 - (L % 8)) % 8; 
+        if (pad > 0) fwrite(&zero, 1, pad, fout); 
+    }
 
-    // 1. Write Coordinates
     fwrite(coords.data, 1, coords.len, fout);
     
-    // 2. Write EOF Marker (num_residues = 0xFFFF)
     uint8_t eof_marker[8] = {0}; 
     eof_marker[0] = 0xFF; 
     eof_marker[1] = 0xFF; 
     fwrite(eof_marker, 1, 8, fout);
     
-    // 3. Write Flat CONECT Stream
     if (conects.len > 0) fwrite(conects.data, 1, conects.len, fout);
     
-    // 4. Pad EOF to 8 bytes
     size_t current_size = ftell(fout);
     size_t eof_pad = (8 - (current_size % 8)) % 8; 
     if (eof_pad > 0) fwrite(&zero, 1, eof_pad, fout);

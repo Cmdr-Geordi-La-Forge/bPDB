@@ -1,89 +1,139 @@
 # Binary PDB (bPDB) Format Specification (V3)
 
-The V3 architecture completely drops the rigid "Chunk" boundaries in favor of an entirely self-regulating, Data-Oriented atom stream. It utilizes coordinate difference accumulation, cross-residue physical anchoring, and inline bit-flags to achieve maximum SIMD parsing speed and file compression. 
+The bPDB V3 architecture utilizes a completely self-regulating, Data-Oriented (SoA) atom stream. It achieves extreme compression and branchless SIMD parsing speeds by employing coordinate difference accumulation, cross-residue geometry anchoring, and in-stream control bits, eliminating the need for rigid structural chunks.
 
-Every structure in the format is strictly **8-byte aligned**.
+Every structure and section in the format is strictly **8-byte aligned**.
+
+---
 
 ## 1. File Architecture Overview
 
-The file consists of a linear progression of four sections:
+A valid bPDB file consists of four sequential sections:
 1. **Fixed Global Header** (64 Bytes)
 2. **Metadata Block (TLV)** (Extensible, 8-byte aligned)
-3. **Chain Clusters** (Sequence bytecode followed by unbroken atom arrays)
+3. **Chain Clusters** (Repeated: Header -> Bytecode Sequence -> Coordinate Stream)
 4. **CONECT Stream** (Flat 32-bit integer array to EOF)
 
 ---
 
-## 2. Chain Clusters
+## 2. Global Header & Metadata
 
-Atoms are clustered in chains. Each cluster begins with a sequence bytecode track, immediately followed by the coordinate stream for that sequence. 
+### 2.1 Fixed Global Header (64 Bytes)
+| Offset | Type       | Description                                                  |
+|:-------|:-----------|:-------------------------------------------------------------|
+| `+0`   | `char[4]`  | Magic String: `"bPDB"`                                       |
+| `+4`   | `uint8`    | Format Version (`0x03`)                                      |
+| `+5`   | `uint8`    | Deposition Day (1-31)                                        |
+| `+6`   | `uint8`    | Deposition Month (1-12)                                      |
+| `+7`   | `uint8`    | Deposition Year (`YYYY - 1973`)                              |
+| `+8`   | `char[16]` | `pdbID` (null-padded)                                        |
+| `+24`  | `char[40]` | `classification` (HEADER classification string, null-padded) |
 
-### 2.1 Chain Header
-The residue array is prepended by an 8-byte header establishing the chain parameters.
-
-| Offset | Type      | Description                                                                                                                        |
-|:-------|:----------|:-----------------------------------------------------------------------------------------------------------------------------------|
-| `+0`   | `uint16`  | **num_residues**: The number of 1-byte links in the sequence array. (`0xFFFF` signals End of Coordinate Stream / Start of CONECT). |
-| `+2`   | `uint16`  | **num_atoms**: Total atoms in this chain (used for OXT detection).                                                                 |
-| `+4`   | `char[2]` | **chain_id**: The chain identifier (e.g., `'A'`, `\0`).                                                                            |
-| `+6`   | `uint16`  | **start_resSeq**: The starting Residue Sequence Number.                                                                            |
-
-### 2.2 Sequence Track (The 1-Byte Chain)
-Following the header is a contiguous array of 1-byte elements, tightly encoding the chain's topology. The array is padded with `0x00` to the nearest 8-byte boundary.
-
-*   **`0x00` (Missing Residue):** Increments `resSeq` by 1 without requesting any atoms (encodes gaps).
-*   **Bits 0-6 (Type ID):** Encodes 127 possible residues:
-    *   `1-37`: Standard Amino and Nucleic Acids.
-    *   `38`: Amidated termination (`NH2` / `HN1`, `HN2`).
-    *   `39`: Water (`HOH`).
-    *   `40+`: Custom molecules defined in the `HET_DICT` metadata block.
-*   **Bit 7 (Insertion Indicator):** If set to `1`, the *immediately following byte* in the array is the ASCII character for the insertion code (e.g., `'A'`).
+### 2.2 Extensible Metadata Block (TLV)
+* `uint16_t num_meta`: Total number of metadata sections present.
+* `uint16_t codes[num_meta]`: Array of section IDs (`0x0001` TITLE, `0x0002` HET_DICT, etc).
+* *[Padded with `0x00` to an 8-byte boundary]*
+* For each section defined above, sequentially: 
+  * `uint64_t section_len` (Unpadded length of the payload).
+  * `uint8_t[] payload` (The raw metadata bytes).
+  * *[Padded with `0x00` to an 8-byte boundary]*
 
 ---
 
-## 3. Coordinate Atom Track (64-bit SIMD Array)
+## 3. The Chain Clusters
 
-Immediately following the padded Sequence Track is the coordinate stream. An atom entry is an 8-byte value interpreted as four 16-bit lanes mapped to the XMM/NEON SIMD pipelines.
+Coordinates are organized into sequential "Chains." Each chain declares its topology and length up front, followed by an unbroken stream of atom blocks.
 
-### 3.1 12-Bit Metadata Packing
-The 3 Least Significant Bits (LSBs) of each 16-bit lane are strictly reserved for inline metadata, leaving exactly 13 bits for mathematical accumulation.
+### 3.1 Chain Header (8 Bytes)
+| Offset | Type     | Description |
+|:-------|:---------|:------------|
+| `+0`   | `uint16` | **num_residues**: Number of 1-byte links in the Sequence Track. (`0xFFFF` signals EOF). |
+| `+2`   | `uint16` | **num_atoms**: Total number of spatial atoms in the stream. |
+| `+4`   | `uint8`  | **chain_id 1 & TER flag**: Bits `0-6` encode the 7-bit ASCII chain char. **Bit 7 (`0x80`) is the `TER` flag** (`1` = Print `TER` at chain end). |
+| `+5`   | `char`   | **chain_id 2**: Second chain character (if any, else space). |
+| `+6`   | `uint16` | **start_resSeq**: The starting Residue Sequence Number. |
 
-| 16-bit Lane | Bits 3-15 (13-bit MSB Math) | Bits 0-2 (3-bit LSB Metadata)                                |
-|:------------|:----------------------------|:-------------------------------------------------------------|
-| `0` (B-fac) | Math Payload                | Occupancy Bits `[0:2]`                                       |
-| `1` (X)     | Math Payload                | Occupancy Bits `[3:5]`                                       |
-| `2` (Y)     | Math Payload                | Occupancy Bit `[6]` \| Charge Bit `[0]` \| Control Bit `[0]` |
-| `3` (Z)     | Math Payload                | Charge Bits `[1:2]` \| AltLoc Bit `[0]`                      |
+### 3.2 Sequence Track (Bytecode Machine)
+A 1-dimensional array of `uint8_t` immediately following the Chain Header. The dictionary operates on a **1-based index**.
 
-*   **Occupancy (7 bits):** Stores absolute values from `0` to `100`.
-*   **Charge (3 bits):** Stores absolute values mapped from `-4` to `+3` (by adding `+4` during encoding).
-*   **AltLoc (1 bit):** If `1`, indicates an alternate conformer.
-*   **Control Bit (1 bit):** If `1`, triggers the In-Stream Absolute Anchor mechanism (see below).
+*   **`0x00` (GAP):** Indicates a missing residue. Increments `resSeq` by 1. Parses no atoms.
+*   **`0x7F` (DUP):** Flags an Alternate Conformer. The *next* sequence byte belongs to the same `resSeq` and advances the `AltLoc` char (e.g., `'A'` to `'B'`).
+*   **Bits 0-6 (Type ID):** Encodes Valid Residues (1 to 126):
+    *   `1-37`: Standard Amino/Nucleic Acids.
+    *   `38+`: Special termini (`NH2`) and Custom `HET_DICT` molecules.
+*   **Bit 7 (`0x80` - iCode Flag):** If set, the *immediately following byte* in the array is an ASCII Insertion Code character (e.g., `'A'`).
 
-### 3.2 Standard Difference Accumulation (`Control == 0`)
-For standard atoms, the 13 MSBs contain a signed $\Delta$ representing the physical distance from an anchor atom. 
-Because the 13-bit Math MSBs support a strict signed range of $\pm 4096$, they natively support a maximum coordinate jump of **$\pm 4.096$ Å**. 
-*   **Intra-Residue:** The $\Delta$ is evaluated relative to the *previous atom of the same residue*.
-*   **Inter-Residue (AA):** The first atom of a new Amino Acid residue is anchored by the 3rd atom (`C`) of the previous residue.
-*   **Inter-Residue (NA):** The first atom of a new Nucleic Acid residue is anchored by the 9th atom (`O3'`) of the previous residue.
+*(The Sequence Track is padded with `0x00` to the nearest 8-byte boundary).*
 
-### 3.3 In-Stream Absolute Anchor (`Control == 1`)
-When the physical distance between two atoms exceeds $\pm 4.096$ Å (e.g., the very first atom of a chain, or isolated `HOH` molecules), the stream anchors itself natively without breaking into chunk headers. 
+---
 
-If an Atom block has its **Control Bit set to `1`**, the standard tracking is paused, and the next two 8-byte blocks establish a new absolute coordinate base:
+## 4. Coordinate Atom Track (64-bit SIMD Array)
 
-**1. The Base Block (8 Bytes)**
-The immediate next 8 bytes contain the low bits of the 29-bit coordinate integers and 21-bit B-factor.
-*   `Byte 0`: Lower 1 byte of the 21-bit B-factor.
-*   `Byte 1`: Reserved / Pad.
-*   `Bytes 2-3`: Lower 2 bytes (16 bits) of the 29-bit X coordinate.
-*   `Bytes 4-5`: Lower 2 bytes (16 bits) of the 29-bit Y coordinate.
-*   `Bytes 6-7`: Lower 2 bytes (16 bits) of the 29-bit Z coordinate.
+Immediately following the sequence padding is the coordinate stream. An atom entry is an 8-byte (`uint64_t`) block. The CPU evaluates it as four 16-bit lanes mapped directly to SIMD pipelines.
 
-**2. The Anchor Atom Block (8 Bytes)**
-The following 8-byte block represents the actual atom. Its metadata LSBs are read normally, but its 13-bit "differences" are treated as the high bits. They are concatenated with the Base Block to form the exact absolute integers:
-*   `Absolute_X = (Atom_X_13bit << 16) | Base_X_16bit`
-*   `Absolute_B = (Atom_B_13bit << 8) | Base_B_8bit`
+*   **Missing Atoms:** Fully unresolved atoms are encoded as exactly `0x0000000000000000`. They execute as a 1-cycle bypass, contributing a mathematically safe $0$ $\Delta$ to the accumulator.
 
-### 3.4 Terminal OXT Inference
-The OXT termination is implied purely by counting. The decoder counts down the atoms requested by the sequence array. If `num_atoms` (declared in the Chain Header) is exactly 1 greater than the expected dictionary sum, the final 8-byte block of the chain is implicitly parsed as the `OXT` atom. No explicit sequence bytecode or EOF terminator is required within the chain.
+### 4.1 Metadata LSB Packing
+The 3 Least Significant Bits (LSBs) of each 16-bit lane (12 bits total) are reserved for inline metadata.
+
+| Lane (16-bit) | Bits 3-15 (13-bit MSB Math Payload) | Bits 0-2 (3-bit LSB Metadata) |
+|:--------------|:------------------------------------|:------------------------------|
+| `0` (B-fac)   | Spatial Math payload                | Occupancy Bits `[0:2]`        |
+| `1` (X Coord) | Spatial Math payload                | Occupancy Bits `[3:5]`        |
+| `2` (Y Coord) | Spatial Math payload                | Occupancy Bit `[6]` \| Charge Bit `[0]` \| **Control Bit** |
+| `3` (Z Coord) | Spatial Math payload                | Charge Bits `[1:2]` \| AltLoc Present Bit |
+
+*   **Occupancy (7 bits):** Absolute value `0` to `100`.
+*   **Charge (3 bits):** Absolute mapping (`Actual_Charge + 4`), storing values `0` to `7`.
+*   **AltLoc (1 bit):** Indicates presence of an alternate conformer.
+*   **Control (1 bit):** Triggers absolute spatial anchoring.
+
+### 4.2 Relative Difference Accumulation (`Control == 0`)
+The standard 8-byte atom block contains a signed 13-bit $\Delta$ relative to a cached anchor. Because 13 bits natively support a range of $\pm 4.096$ Å, the stream traces physical covalent bonds rather than generic array indices:Intra-Residue (Backbone): $\Delta$ is evaluated relative to the previously parsed atom (e.g., `N` $\rightarrow$ `CA` $\rightarrow$ `C` $\rightarrow$ `O`).Intra-Residue (Sidechain): The $\Delta$ for the `CB` atom is evaluated strictly against a cached `CA` accumulator. Subsequent sidechain atoms accumulate linearly off `CB`.Inter-Residue (Polymer Bond): The first atom of a new residue (`N` or `P`) is anchored by a cached accumulator from the previous residue's active linkage (`C` or `O3'`).
+
+### 4.2 Relative Difference Accumulation (`Control == 0`)
+The standard 8-byte atom block contains a signed 13-bit $\Delta$ (scaled by $1000$ for coords, $100$ for B-factor).
+Because 13 bits provide a signed range of $\pm 4096$, the stream natively bridges spatial gaps up to **$\pm 4.096$ Å**.
+*   **Intra-Residue:** $\Delta$ from the previously parsed atom.
+*   **Inter-Residue:** When crossing a residue boundary, the $\Delta$ is evaluated against a cached anchor to bridge the physical polymer bond:
+    *   *Amino Acids:* Anchored to the 3rd atom (`C`).
+    *   *Nucleic Acids:* Anchored to the 9th atom (`O3'`).
+
+### 4.3 In-Stream Absolute Anchor (`Control == 1`)
+If a distance exceeds $\pm 4.096$ Å (e.g., chain starts or isolated `HOH` molecules), the encoder explicitly sets the Control Bit to `1` on the atom. The CPU reconstructs absolute coordinates using exactly **16 bytes**:
+
+**1. The High/Metadata Block (8 Bytes)**
+This block carries the atom's valid LSB metadata. However, its 13-bit Math Payload MSBs act as the **High Bits** of the absolute coordinates.
+
+**2. The Low/Base Block (8 Bytes)**
+The immediate next 8 bytes contain the low bits of the absolute coordinates.
+*   `Byte 0`: Low 8 bits of the B-factor.
+*   `Byte 1`: Reserved / Empty.
+*   `Bytes 2-3`: Low 16 bits of the X coordinate.
+*   `Bytes 4-5`: Low 16 bits of the Y coordinate.
+*   `Bytes 6-7`: Low 16 bits of the Z coordinate.
+
+**Execution:** The absolute spatial anchor is seamlessly reconstructed via bitwise concatenation:
+*   `Abs_X = (High_Block_X_13bit << 16) | Low_Block_X_16bit` (Result: 29-bit coordinate)
+*   `Abs_B = (High_Block_B_13bit << 8) | Low_Block_B_8bit` (Result: 21-bit B-factor)
+
+*(Note: The first atom of any `HETATM` implicitly forces `Control = 1` to cleanly severe it from polymer backbone geometry).*
+
+### 4.4 Terminal OXT Inference
+There is no `OXT` instruction in the sequence bytecode. Instead, the decoder dynamically tallies the total atoms expected from the sequence dictionary. 
+If the Chain Header's `num_atoms` is exactly **`expected_atoms + 1`**, the decoder automatically processes the final spatial atom block as the terminal `OXT` atom, anchoring it to the 3rd atom (`C`) of the final residue.
+
+---
+
+## 5. End of File & Connectivity
+
+### 5.1 EOF Marker
+The coordinate stream ends when a Chain Header presents a `num_residues` value of `0xFFFF`.
+
+### 5.2 CONECT Stream
+Following the EOF marker is a flat array of 32-bit integers representing atomic linkages.
+1. `int32_t N` (Number of target atoms)
+2. `int32_t source_atom_id`
+3. $N$ sequential `int32_t target_atom_ids`
+
+*(Padded with `0x00` to an 8-byte boundary at the physical End of File).*

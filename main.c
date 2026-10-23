@@ -96,11 +96,12 @@ int main(int argc, char** argv) {
 
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
-        for (int i = 0; i < 1000; i++) decode_bpdb(buffer, size, NULL); 
+        int n = 1000;
+        for (int i = 0; i < n*1000; i++) decode_bpdb(buffer, size, NULL); 
         clock_gettime(CLOCK_MONOTONIC, &end);
         
         double t_taken = (end.tv_sec - start.tv_sec) * 1e3 + (end.tv_nsec - start.tv_nsec) / 1e6;
-        printf("[+] Parsing took %.2f ms total (%.3f us/run)\n", t_taken, t_taken * 1000.0 / 1000);
+        printf("[+] Parsing took %.2f s total (%.3f us/run)\n", t_taken/n, t_taken/n);
         free(buffer);
     } else if (strcmp(argv[1], "stat") == 0) {
         stat_bpdb(argv[2]);

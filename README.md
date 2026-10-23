@@ -1,6 +1,6 @@
-# Binary PDB (bPDB) Format Specification (V3)
+# Binary PDB (bPDB) Format Specification (V5)
 
-The bPDB V3 architecture utilizes a completely self-regulating, Data-Oriented (SoA) atom stream. It achieves extreme compression and branchless SIMD parsing speeds by employing coordinate difference accumulation, cross-residue geometry anchoring, and in-stream control bits, eliminating the need for rigid structural chunks.
+The bPDB V5 architecture utilizes a Data-Oriented (SoA), completely unmasked coordinate atom stream. It achieves extreme compression and zero-shift SIMD parsing speeds by employing native 16-bit signed integer deltas, perfectly interleaved 16-byte absolute Base Jump anchors, and an unbroken geometric running sum across the entire chain.
 
 Every structure and section in the format is strictly **8-byte aligned**.
 
@@ -10,7 +10,7 @@ Every structure and section in the format is strictly **8-byte aligned**.
 
 A valid bPDB file consists of four sequential sections:
 1. **Fixed Global Header** (64 Bytes)
-2. **Metadata Block (TLV)** (Extensible, 8-byte aligned)
+2. **Metadata Bitmask & Payload** (Extensible, 8-byte aligned)
 3. **Chain Clusters** (Repeated: Header -> Bytecode Sequence -> Coordinate Stream)
 4. **CONECT Stream** (Flat 32-bit integer array to EOF)
 
@@ -22,21 +22,27 @@ A valid bPDB file consists of four sequential sections:
 | Offset | Type       | Description                                                  |
 |:-------|:-----------|:-------------------------------------------------------------|
 | `+0`   | `char[4]`  | Magic String: `"bPDB"`                                       |
-| `+4`   | `uint8`    | Format Version (`0x03`)                                      |
+| `+4`   | `uint8`    | Format Version (`0x05`)                                      |
 | `+5`   | `uint8`    | Deposition Day (1-31)                                        |
 | `+6`   | `uint8`    | Deposition Month (1-12)                                      |
 | `+7`   | `uint8`    | Deposition Year (`YYYY - 1973`)                              |
 | `+8`   | `char[16]` | `pdbID` (null-padded)                                        |
 | `+24`  | `char[40]` | `classification` (HEADER classification string, null-padded) |
 
-### 2.2 Extensible Metadata Block (TLV)
-* `uint16_t num_meta`: Total number of metadata sections present.
-* `uint16_t codes[num_meta]`: Array of section IDs (`0x0001` TITLE, `0x0002` HET_DICT, etc).
-* *[Padded with `0x00` to an 8-byte boundary]*
-* For each section defined above, sequentially: 
-  * `uint64_t section_len` (Unpadded length of the payload).
-  * `uint8_t[] payload` (The raw metadata bytes).
-  * *[Padded with `0x00` to an 8-byte boundary]*
+### 2.2 Global 64-bit Metadata Bitmask
+Immediately following the 64-byte fixed header is a single 8-byte (`uint64_t`) metadata header.
+*   **Bits 0-7:** File version duplicate (`0x05`).
+*   **Bits 16-63:** The 48-bit Metadata Presence Mask.
+
+The decoder reads this mask to determine exactly which metadata payloads follow. Payloads are written in bit-sequential order, heavily padded to 8-byte boundaries:
+
+*   **Bit 0 (`META_AF_MODE`):** If `1`, indicates an AlphaFold/Predicted model. Occupancy is statically assumed to be `1.00` and Charge `0`, bypassing all related metadata evaluation. (No payload bytes).
+*   **Bit 1 (`RESOLUTION`):** `float` (4 bytes) + `0x00` pad (4 bytes).
+*   **Bit 2 (`TITLE`):** `uint64_t` length + payload string + 8-byte alignment padding.
+*   **Bit 3 (`EXPDTA`):** `uint64_t` length + payload string + 8-byte alignment padding.
+*   **Bit 4 (`PROGRAM`):** `uint64_t` length + payload string + 8-byte alignment padding.
+*   **Bit 5 (`HET_DICT`):** `uint64_t` dict_length + `uint8_t` custom_count + inline dictionary definitions + padding.
+*   **Bits 6-10:** Binary arrays for `HELIX`, `SHEET`, `SSBOND`, `CISPEP`, and `SITE`. Each starts with an 8-byte `length` followed by raw `struct` dumps, aligned to 8 bytes.
 
 ---
 
@@ -57,7 +63,7 @@ Coordinates are organized into sequential "Chains." Each chain declares its topo
 A 1-dimensional array of `uint8_t` immediately following the Chain Header. The dictionary operates on a **1-based index**.
 
 *   **`0x00` (GAP):** Indicates a missing residue. Increments `resSeq` by 1. Parses no atoms.
-*   **`0x7F` (DUP):** Flags an Alternate Conformer. The *next* sequence byte belongs to the same `resSeq` and advances the `AltLoc` char (e.g., `'A'` to `'B'`).
+*   **`0x7F` (DUP):** Flags an Alternate Conformer. Automatically steps the implicit AltLoc character (`'A'` $\rightarrow$ `'B'` $\rightarrow$ `'C'`, etc).
 *   **Bits 0-6 (Type ID):** Encodes Valid Residues (1 to 126):
     *   `1-37`: Standard Amino/Nucleic Acids.
     *   `38+`: Special termini (`NH2`) and Custom `HET_DICT` molecules.
@@ -67,61 +73,45 @@ A 1-dimensional array of `uint8_t` immediately following the Chain Header. The d
 
 ---
 
-## 4. Coordinate Atom Track (64-bit SIMD Array)
+## 4. Coordinate Atom Track (Zero-Shift SIMD Array)
 
-Immediately following the sequence padding is the coordinate stream. An atom entry is an 8-byte (`uint64_t`) block. The CPU evaluates it as four 16-bit lanes mapped directly to SIMD pipelines.
+To achieve native SIMD load speeds, standard atom coordinates no longer use per-lane bit-packing. Math operations execute natively on perfectly aligned signed 16-bit integers. Properties like Occupancy, Charge, and Alternate Locations are maintained via implicit state-tracking and only written into the stream when they change via an interleaved 16-byte Jump Entry.
 
-*   **Missing Atoms:** Fully unresolved atoms are encoded as exactly `0x0000000000000000`. They execute as a 1-cycle bypass, contributing a mathematically safe $0$ $\Delta$ to the accumulator.
+### 4.1 Unbroken Difference Accumulation (`Control == 0`)
+A standard 8-byte block handles native intra-chain coordinate deltas up to **$\pm 32.767$ Å** (scaled by 1000). The accumulator is a pure unbroken running sum, ignoring residue boundaries entirely.
 
-### 4.1 Metadata LSB Packing
-The 3 Least Significant Bits (LSBs) of each 16-bit lane (12 bits total) are reserved for inline metadata.
+| Bytes | Type          | Description |
+|:------|:--------------|:------------|
+| `0-1` | `uint16_t`    | Bits 2-15: Absolute B-factor (0.00 to 163.83). Bit 1: AltLoc Presence Flag. **Bit 0: Control Flag (`0`)**. |
+| `2-3` | `int16_t`     | $\Delta X$ relative to previous atom. |
+| `4-5` | `int16_t`     | $\Delta Y$ relative to previous atom. |
+| `6-7` | `int16_t`     | $\Delta Z$ relative to previous atom. |
 
-| Lane (16-bit) | Bits 3-15 (13-bit MSB Math Payload) | Bits 0-2 (3-bit LSB Metadata) |
-|:--------------|:------------------------------------|:------------------------------|
-| `0` (B-fac)   | Spatial Math payload                | Occupancy Bits `[0:2]`        |
-| `1` (X Coord) | Spatial Math payload                | Occupancy Bits `[3:5]`        |
-| `2` (Y Coord) | Spatial Math payload                | Occupancy Bit `[6]` \| Charge Bit `[0]` \| **Control Bit** |
-| `3` (Z Coord) | Spatial Math payload                | Charge Bits `[1:2]` \| AltLoc Present Bit |
+### 4.2 Absolute State-Jump Anchors (`Control == 1`)
+If a spatial jump exceeds $\pm 32.767$ Å (chain gaps, isolated HETATMs, waters), OR if the implicit atom states (Occupancy or Charge) change, the stream emits a 16-byte absolute jump anchor.
 
-*   **Occupancy (7 bits):** Absolute value `0` to `100`.
-*   **Charge (3 bits):** Absolute mapping (`Actual_Charge + 4`), storing values `0` to `7`.
-*   **AltLoc (1 bit):** Indicates presence of an alternate conformer.
-*   **Control (1 bit):** Triggers absolute spatial anchoring.
+This leverages 24-bit native geometry via direct memory concatenation: The Base block MSBs combine with the 16-bit LSBs from the immediate next Atom block to stably construct absolute coordinates up to **$\pm 8,388.6$ Å**.
 
-### 4.2 Relative Difference Accumulation (`Control == 0`)
-The standard 8-byte atom block contains a signed 13-bit $\Delta$ relative to a cached anchor. Because 13 bits natively support a range of $\pm 4.096$ Å, the stream traces physical covalent bonds rather than generic array indices:Intra-Residue (Backbone): $\Delta$ is evaluated relative to the previously parsed atom (e.g., `N` $\rightarrow$ `CA` $\rightarrow$ `C` $\rightarrow$ `O`).Intra-Residue (Sidechain): The $\Delta$ for the `CB` atom is evaluated strictly against a cached `CA` accumulator. Subsequent sidechain atoms accumulate linearly off `CB`.Inter-Residue (Polymer Bond): The first atom of a new residue (`N` or `P`) is anchored by a cached accumulator from the previous residue's active linkage (`C` or `O3'`).
+**1. The Base Jump Block (8 Bytes, `Control == 1`)**
+Appears first. Contains interleaved MSBs and state changes.
+*   `+0`: Charge mapped to `(val + 8) << 1` | **Control Flag (`1`)**.
+*   `+1`: Absolute B-factor MSB.
+*   `+2`: Occupancy Byte 2 (MSB).
+*   `+3`: Absolute X-coordinate MSB.
+*   `+4`: Occupancy Byte 1.
+*   `+5`: Absolute Y-coordinate MSB.
+*   `+6`: Occupancy Byte 0 (LSB).
+*   `+7`: Absolute Z-coordinate MSB.
 
-### 4.2 Relative Difference Accumulation (`Control == 0`)
-The standard 8-byte atom block contains a signed 13-bit $\Delta$ (scaled by $1000$ for coords, $100$ for B-factor).
-Because 13 bits provide a signed range of $\pm 4096$, the stream natively bridges spatial gaps up to **$\pm 4.096$ Å**.
-*   **Intra-Residue:** $\Delta$ from the previously parsed atom.
-*   **Inter-Residue:** When crossing a residue boundary, the $\Delta$ is evaluated against a cached anchor to bridge the physical polymer bond:
-    *   *Amino Acids:* Anchored to the 3rd atom (`C`).
-    *   *Nucleic Acids:* Anchored to the 9th atom (`O3'`).
+**2. The Concatenated Atom Block (8 Bytes)**
+Immediately follows the Base Block. Contains 16-bit LSBs.
+*   `+0-1`: Absolute B-factor LSBs (14 bits) `<< 2` | AltLoc Presence Flag `<< 1` | Control Flag (`0`).
+*   `+2-3`: X-coordinate LSBs (16 bits).
+*   `+4-5`: Y-coordinate LSBs (16 bits).
+*   `+6-7`: Z-coordinate LSBs (16 bits).
 
-### 4.3 In-Stream Absolute Anchor (`Control == 1`)
-If a distance exceeds $\pm 4.096$ Å (e.g., chain starts or isolated `HOH` molecules), the encoder explicitly sets the Control Bit to `1` on the atom. The CPU reconstructs absolute coordinates using exactly **16 bytes**:
-
-**1. The High/Metadata Block (8 Bytes)**
-This block carries the atom's valid LSB metadata. However, its 13-bit Math Payload MSBs act as the **High Bits** of the absolute coordinates.
-
-**2. The Low/Base Block (8 Bytes)**
-The immediate next 8 bytes contain the low bits of the absolute coordinates.
-*   `Byte 0`: Low 8 bits of the B-factor.
-*   `Byte 1`: Reserved / Empty.
-*   `Bytes 2-3`: Low 16 bits of the X coordinate.
-*   `Bytes 4-5`: Low 16 bits of the Y coordinate.
-*   `Bytes 6-7`: Low 16 bits of the Z coordinate.
-
-**Execution:** The absolute spatial anchor is seamlessly reconstructed via bitwise concatenation:
-*   `Abs_X = (High_Block_X_13bit << 16) | Low_Block_X_16bit` (Result: 29-bit coordinate)
-*   `Abs_B = (High_Block_B_13bit << 8) | Low_Block_B_8bit` (Result: 21-bit B-factor)
-
-*(Note: The first atom of any `HETATM` implicitly forces `Control = 1` to cleanly severe it from polymer backbone geometry).*
-
-### 4.4 Terminal OXT Inference
-There is no `OXT` instruction in the sequence bytecode. Instead, the decoder dynamically tallies the total atoms expected from the sequence dictionary. 
-If the Chain Header's `num_atoms` is exactly **`expected_atoms + 1`**, the decoder automatically processes the final spatial atom block as the terminal `OXT` atom, anchoring it to the 3rd atom (`C`) of the final residue.
+### 4.3 Terminal OXT Inference
+There is no `OXT` instruction in the sequence bytecode. If the Chain Header's `num_atoms` is exactly **`expected_atoms + 1`**, the decoder automatically processes the final spatial atom block as the terminal `OXT` atom.
 
 ---
 

@@ -23,8 +23,8 @@
 typedef struct {
   char resName[4];
   int num_atoms;
-  char atom_names[24][5];
-  char elements[24][3];
+  char atom_names[32][5];
+  char elements[32][3];
 } ResidueDict;
 
 typedef struct {

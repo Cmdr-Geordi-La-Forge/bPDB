@@ -1,6 +1,6 @@
 # Binary PDB (bPDB) Format Specification (V5)
 
-The bPDB V5 architecture utilizes a Data-Oriented (SoA), completely unmasked coordinate atom stream. It achieves extreme compression and zero-shift SIMD parsing speeds by employing native 16-bit signed integer deltas, perfectly interleaved 16-byte absolute Base Jump anchors, and an unbroken geometric running sum across the entire chain.
+The bPDB V5 architecture utilizes a Data-Oriented (SoA), completely unmasked coordinate atom stream. It achieves extreme compression and zero-shift SIMD parsing speeds by employing native 16-bit signed integer deltas, perfectly interleaved 16-byte New Anchor blocks, and an unbroken geometric running sum across the entire chain.
 
 Every structure and section in the format is strictly **8-byte aligned**.
 
@@ -63,7 +63,6 @@ Coordinates are organized into sequential "Chains." Each chain declares its topo
 A 1-dimensional array of `uint8_t` immediately following the Chain Header. The dictionary operates on a **1-based index**.
 
 *   **`0x00` (GAP):** Indicates a missing residue. Increments `resSeq` by 1. Parses no atoms.
-*   **`0x7F` (DUP):** Flags an Alternate Conformer. Automatically steps the implicit AltLoc character (`'A'` $\rightarrow$ `'B'` $\rightarrow$ `'C'`, etc).
 *   **Bits 0-6 (Type ID):** Encodes Valid Residues (1 to 126):
     *   `1-37`: Standard Amino/Nucleic Acids.
     *   `38+`: Special termini (`NH2`) and Custom `HET_DICT` molecules.
@@ -75,10 +74,10 @@ A 1-dimensional array of `uint8_t` immediately following the Chain Header. The d
 
 ## 4. Coordinate Atom Track (Zero-Shift SIMD Array)
 
-To achieve native SIMD load speeds, standard atom coordinates no longer use per-lane bit-packing. Math operations execute natively on perfectly aligned signed 16-bit integers. Properties like Occupancy, Charge, and Alternate Locations are maintained via implicit state-tracking and only written into the stream when they change via an interleaved 16-byte Jump Entry.
+To achieve native SIMD load speeds, standard atom coordinates no longer use per-lane bit-packing. Math operations execute natively on perfectly aligned signed 16-bit integers. Properties like Occupancy, Charge, and Alternate Locations are evaluated natively, and explicitly written into the stream via an interleaved 16-byte New Anchor Block only when necessary.
 
 ### 4.1 Unbroken Difference Accumulation (`Control == 0`)
-A standard 8-byte block handles native intra-chain coordinate deltas up to **$\pm 32.767$ Å** (scaled by 1000). The accumulator is a pure unbroken running sum, ignoring residue boundaries entirely.
+A standard 8-byte block handles native intra-chain coordinate deltas up to **$\pm 32.767$ Å** (scaled by 1000). The accumulator is a pure unbroken running sum, ignoring residue boundaries entirely. Standard blocks natively imply a sparse charge of `0`.
 
 | Bytes | Type          | Description |
 |:------|:--------------|:------------|
@@ -87,21 +86,20 @@ A standard 8-byte block handles native intra-chain coordinate deltas up to **$\p
 | `4-5` | `int16_t`     | $\Delta Y$ relative to previous atom. |
 | `6-7` | `int16_t`     | $\Delta Z$ relative to previous atom. |
 
-### 4.2 Absolute State-Jump Anchors (`Control == 1`)
-If a spatial jump exceeds $\pm 32.767$ Å (chain gaps, isolated HETATMs, waters), OR if the implicit atom states (Occupancy or Charge) change, the stream emits a 16-byte absolute jump anchor.
+### 4.2 Absolute New Anchors & Sparse Charge (`Control == 1`)
+If a spatial jump exceeds $\pm 32.767$ Å (chain gaps, isolated HETATMs, waters), OR if the implicit atom states (Occupancy or physical Charge) change, the stream emits a 16-byte absolute New Anchor. 
 
-This leverages 24-bit native geometry via direct memory concatenation: The Base block MSBs combine with the 16-bit LSBs from the immediate next Atom block to stably construct absolute coordinates up to **$\pm 8,388.6$ Å**.
+Because ~99% of biological atoms are uncharged, charge is not a persistent state variable. If an atom has a non-zero charge, it is forced to use a New Anchor. The immediate next standard block intrinsically drops the charge back to 0 without requiring another jump.
+
+This leverages 31-bit native geometry via direct memory concatenation: The Base block MSBs combine perfectly with the 16-bit LSBs from the immediate next Atom block to stably construct absolute coordinates up to **$\pm 8,388.6$ Å** using native pointer loading. A 3-bit charge (-3 to +4) is compressed into the lowest bit of each coordinate MSB byte.
 
 **1. The Base Jump Block (8 Bytes, `Control == 1`)**
-Appears first. Contains interleaved MSBs and state changes.
-*   `+0`: Charge mapped to `(val + 8) << 1` | **Control Flag (`1`)**.
+Appears first. Contains perfectly interleaved 15-bit MSBs and sparse charge encoding.
+*   `+0`: Absolute Occupancy (0-100) `<< 1` | **Control Flag (`1`)**.
 *   `+1`: Absolute B-factor MSB.
-*   `+2`: Occupancy Byte 2 (MSB).
-*   `+3`: Absolute X-coordinate MSB.
-*   `+4`: Occupancy Byte 1.
-*   `+5`: Absolute Y-coordinate MSB.
-*   `+6`: Occupancy Byte 0 (LSB).
-*   `+7`: Absolute Z-coordinate MSB.
+*   `+2-3`: 15-bit Absolute X-coordinate MSB `<< 1` | Charge Bit 0.
+*   `+4-5`: 15-bit Absolute Y-coordinate MSB `<< 1` | Charge Bit 1.
+*   `+6-7`: 15-bit Absolute Z-coordinate MSB `<< 1` | Charge Bit 2.
 
 **2. The Concatenated Atom Block (8 Bytes)**
 Immediately follows the Base Block. Contains 16-bit LSBs.
@@ -110,8 +108,11 @@ Immediately follows the Base Block. Contains 16-bit LSBs.
 *   `+4-5`: Y-coordinate LSBs (16 bits).
 *   `+6-7`: Z-coordinate LSBs (16 bits).
 
-### 4.3 Terminal OXT Inference
-There is no `OXT` instruction in the sequence bytecode. If the Chain Header's `num_atoms` is exactly **`expected_atoms + 1`**, the decoder automatically processes the final spatial atom block as the terminal `OXT` atom.
+### 4.3 Implicit Alternate Location Engine
+Explicit alternate location characters (`0x7F DUP` flags) are completely removed from the format. The decoder relies strictly on topological grouping natively stored in the stream. The `AltLoc Presence Flag` (`bit 1` of the Atom Block) temporarily pauses the decoder's sequence dictionary iterator while natively driving an implicit alphabetical state machine (`A -> B -> C`) for infinite overlapping conformers without overhead.
+
+### 4.4 Terminal OXT Inference
+There is no `OXT` instruction in the sequence bytecode. Upon sequence track exhaustion, the decoder processes the final remaining atoms in the chain dynamically as the terminal `OXT` atoms.
 
 ---
 

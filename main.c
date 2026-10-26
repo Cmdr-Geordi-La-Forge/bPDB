@@ -82,26 +82,47 @@ int main(int argc, char** argv) {
         int num_files = argc - 3;
         const char** in_pdbs = (const char**)&argv[2];
         encode_bpdb(num_files, in_pdbs, out_bpdb);
-        printf("[+] Encoded %d files to %s\n", num_files, out_bpdb);
+        if (strcmp(out_bpdb, "-") != 0) {
+            printf("[+] Encoded %d files to %s\n", num_files, out_bpdb);
+        }
     } else if (strcmp(argv[1], "test") == 0) {
-        FILE* fb = fopen(argv[2], "rb");
-        if (!fb) { perror("Failed to open bpdb"); return 1; }
-        
-        fseek(fb, 0, SEEK_END); size_t size = ftell(fb); fseek(fb, 0, SEEK_SET);
-        uint8_t* buffer = (uint8_t*)malloc(size); fread(buffer, 1, size, fb); fclose(fb);
+        FILE* fb = NULL;
+        size_t size = 0;
+        uint8_t* buffer = NULL;
 
-        FILE* fout = fopen(argv[3], "w");
-        decode_bpdb(buffer, size, fout); fclose(fout);
-        printf("[+] Decoded to %s for diffing.\n", argv[3]);
+        if (strcmp(argv[2], "-") == 0) {
+            fb = stdin;
+            size_t cap = 1024 * 1024;
+            buffer = (uint8_t*)malloc(cap);
+            size_t bytes;
+            while ((bytes = fread(buffer + size, 1, cap - size, fb)) > 0) {
+                size += bytes;
+                if (size == cap) { cap *= 2; buffer = (uint8_t*)realloc(buffer, cap); }
+            }
+        } else {
+            fb = fopen(argv[2], "rb");
+            if (!fb) { perror("Failed to open bpdb"); return 1; }
+            fseek(fb, 0, SEEK_END); size = ftell(fb); fseek(fb, 0, SEEK_SET);
+            buffer = (uint8_t*)malloc(size); fread(buffer, 1, size, fb); fclose(fb);
+        }
 
-        struct timespec start, end;
-        clock_gettime(CLOCK_MONOTONIC, &start);
-        int n = 1000;
-        for (int i = 0; i < n*1000; i++) decode_bpdb(buffer, size, NULL); 
-        clock_gettime(CLOCK_MONOTONIC, &end);
-        
-        double t_taken = (end.tv_sec - start.tv_sec) * 1e3 + (end.tv_nsec - start.tv_nsec) / 1e6;
-        printf("[+] Parsing took %.2f s total (%.3f us/run)\n", t_taken/n, t_taken/n);
+        FILE* fout = (strcmp(argv[3], "-") == 0) ? stdout : fopen(argv[3], "w");
+        if (!fout) { perror("Failed to open output"); free(buffer); return 1; }
+
+        decode_bpdb(buffer, size, fout); 
+
+        if (fout != stdout) {
+            fclose(fout);
+            printf("[+] Decoded to %s for diffing.\n", argv[3]);
+            struct timespec start, end;
+            clock_gettime(CLOCK_MONOTONIC, &start);
+            int n = 100;
+            for (int i = 0; i < n*1000; i++) decode_bpdb(buffer, size, NULL); 
+            clock_gettime(CLOCK_MONOTONIC, &end);
+            
+            double t_taken = (end.tv_sec - start.tv_sec) * 1e3 + (end.tv_nsec - start.tv_nsec) / 1e6;
+            printf("[+] Parsing took %.2f s total (%i,000 files, %.3f us/run)\n", t_taken/1000, n, t_taken/n);
+        }
         free(buffer);
     } else if (strcmp(argv[1], "stat") == 0) {
         stat_bpdb(argv[2]);

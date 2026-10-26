@@ -17,17 +17,48 @@ int parse_month(const char* m) { for (int i = 1; i <= 12; i++) if (strncmp(m, MO
 void trim_string(char* str) { int i = strlen(str) - 1; while(i >= 0 && isspace(str[i])) { str[i] = '\0'; i--; } }
 
 typedef struct {
-    int resSeq; char iCode; int type; int is_dup;
-    int32_t b_acc[256], x_acc[256], y_acc[256], z_acc[256];
-    int32_t occ_acc[256]; char alt_acc[256]; int8_t charge_acc[256]; int present[256];
-    int has_oxt; int32_t oxt_b, oxt_x, oxt_y, oxt_z; int32_t oxt_occ; char oxt_alt; int8_t oxt_charge;
+    int32_t *b, *x, *y, *z, *occ;
+    int8_t *charge; char *alt;
+    int count, cap;
+} AltArray;
+
+void alt_init(AltArray* a) {
+    a->cap = 2; a->count = 0;
+    a->b = (int32_t*)malloc(2 * sizeof(int32_t)); a->x = (int32_t*)malloc(2 * sizeof(int32_t));
+    a->y = (int32_t*)malloc(2 * sizeof(int32_t)); a->z = (int32_t*)malloc(2 * sizeof(int32_t));
+    a->occ = (int32_t*)malloc(2 * sizeof(int32_t));
+    a->charge = (int8_t*)malloc(2 * sizeof(int8_t)); a->alt = (char*)malloc(2 * sizeof(char));
+}
+
+void alt_push(AltArray* a, int32_t b, int32_t x, int32_t y, int32_t z, int32_t occ, int8_t charge, char alt) {
+    if (a->count == a->cap) {
+        a->cap *= 2;
+        a->b = (int32_t*)realloc(a->b, a->cap * sizeof(int32_t)); a->x = (int32_t*)realloc(a->x, a->cap * sizeof(int32_t));
+        a->y = (int32_t*)realloc(a->y, a->cap * sizeof(int32_t)); a->z = (int32_t*)realloc(a->z, a->cap * sizeof(int32_t));
+        a->occ = (int32_t*)realloc(a->occ, a->cap * sizeof(int32_t));
+        a->charge = (int8_t*)realloc(a->charge, a->cap * sizeof(int8_t)); a->alt = (char*)realloc(a->alt, a->cap * sizeof(char));
+    }
+    int i = a->count++;
+    a->b[i] = b; a->x[i] = x; a->y[i] = y; a->z[i] = z; a->occ[i] = occ; a->charge[i] = charge; a->alt[i] = alt;
+}
+
+void alt_free(AltArray* a) {
+    free(a->b); free(a->x); free(a->y); free(a->z); free(a->occ); free(a->charge); free(a->alt);
+    a->cap = 0; a->count = 0;
+}
+
+typedef struct {
+    int resSeq; char iCode; int type;
+    AltArray atoms[256]; int present[256];
+    int has_oxt; AltArray oxt;
+    int has_op3; AltArray op3;
 } EncoderState;
 
 typedef struct {
     uint8_t* seq_track; uint8_t* atom_track;
     int seq_bytes; int atom_bytes; int num_atoms; int num_residues;
     int32_t current_x, current_y, current_z; 
-    int32_t current_occ; uint8_t current_charge;
+    int32_t current_occ; 
     int start_resSeq; int last_resSeq; char last_iCode;
     char c1, c2; int has_ter;
 } ChainBuilder;
@@ -36,29 +67,59 @@ void cb_init(ChainBuilder* cb) {
     cb->seq_track = (uint8_t*)malloc(240000); cb->atom_track = (uint8_t*)malloc(120000 * 8 + 100);
     cb->seq_bytes = 0; cb->atom_bytes = 0; cb->num_atoms = 0; cb->num_residues = 0;
     cb->start_resSeq = 0; cb->has_ter = 0;
-    cb->current_occ = 100; cb->current_charge = 8; // Offset by +8 
+    cb->current_occ = 100;
 }
 void cb_free(ChainBuilder* cb) { free(cb->seq_track); free(cb->atom_track); }
 
 void flush_chain(ChainBuilder* cb, StreamBuffer* buf) {
     if (cb->num_atoms == 0) return;
-    
     uint8_t header[8] = {0};
     *(uint16_t*)(header + 0) = cb->num_residues;
     *(uint16_t*)(header + 2) = cb->num_atoms;
-    header[4] = cb->c1 | (cb->has_ter ? 0x80 : 0); 
-    header[5] = cb->c2;
+    header[4] = cb->c1 | (cb->has_ter ? 0x80 : 0); header[5] = cb->c2;
     *(uint16_t*)(header + 6) = cb->start_resSeq;
     stream_write(buf, header, 8);
-
     stream_write(buf, cb->seq_track, cb->seq_bytes);
     uint32_t pad = (8 - (cb->seq_bytes & 7)) & 7;
     if (pad > 0) { uint64_t zero = 0; stream_write(buf, &zero, pad); }
-    
     stream_write(buf, cb->atom_track, cb->atom_bytes);
-
     cb->seq_bytes = 0; cb->atom_bytes = 0; cb->num_atoms = 0; cb->num_residues = 0; 
-    cb->has_ter = 0; cb->current_occ = 100; cb->current_charge = 8;
+    cb->has_ter = 0; cb->current_occ = 100;
+}
+
+static inline void encode_alt_array(ChainBuilder* cb, AltArray* arr, int force_jump) {
+    for (int a = 0; a < arr->count; a++) {
+        int32_t x = arr->x[a], y = arr->y[a], z = arr->z[a];
+        if (cb->num_atoms == 0) { cb->current_x = x; cb->current_y = y; cb->current_z = z; }
+        int32_t dx = x - cb->current_x, dy = y - cb->current_y, dz = z - cb->current_z;
+        int32_t b_int = arr->b[a]; if (b_int > 4194303) b_int = 4194303; if (b_int < 0) b_int = 0;
+        int alt_flag = (a < arr->count - 1) ? 1 : 0;
+        int32_t occ_int = arr->occ[a]; if (occ_int > 100) occ_int = 100;
+        int8_t raw_charge = arr->charge[a];
+        uint8_t charge_u = (raw_charge + 3) & 0x07;
+
+        int needs_jump = (cb->num_atoms == 0) || (cb->atom_bytes == cb->num_atoms * 8) || (force_jump && a == 0) || 
+                         (dx > 32767 || dx < -32768 || dy > 32767 || dy < -32768 || dz > 32767 || dz < -32768) ||
+                         (occ_int != cb->current_occ) || (raw_charge != 0) || 
+                         (b_int > 16383);
+
+        uint8_t* ptr = &cb->atom_track[cb->atom_bytes];
+        uint16_t b_ctrl = ((b_int & 0x3FFF) << 2) | (alt_flag << 1) | 0; 
+        if (needs_jump) {
+            uint16_t x_anchor = (((x >> 16) & 0x7FFF) << 1) | (charge_u & 1);
+            uint16_t y_anchor = (((y >> 16) & 0x7FFF) << 1) | ((charge_u >> 1) & 1);
+            uint16_t z_anchor = (((z >> 16) & 0x7FFF) << 1) | ((charge_u >> 2) & 1);
+            ptr[0] = (occ_int << 1) | 1; ptr[1] = (b_int >> 14) & 0xFF;
+            *(uint16_t*)(ptr + 2) = x_anchor; *(uint16_t*)(ptr + 4) = y_anchor; *(uint16_t*)(ptr + 6) = z_anchor;
+            *(uint16_t*)(ptr + 8) = b_ctrl;
+            *(uint16_t*)(ptr + 10) = x & 0xFFFF; *(uint16_t*)(ptr + 12) = y & 0xFFFF; *(uint16_t*)(ptr + 14) = z & 0xFFFF;
+            cb->current_occ = occ_int; cb->atom_bytes += 16;
+        } else {
+            *(uint16_t*)ptr = b_ctrl; *(int16_t*)(ptr + 2) = dx; *(int16_t*)(ptr + 4) = dy; *(int16_t*)(ptr + 6) = dz;
+            cb->atom_bytes += 8;
+        }
+        cb->current_x = x; cb->current_y = y; cb->current_z = z; cb->num_atoms++;
+    }
 }
 
 void flush_residue(ChainBuilder* cb, EncoderState* st, UniDict* UDICT) {
@@ -66,14 +127,17 @@ void flush_residue(ChainBuilder* cb, EncoderState* st, UniDict* UDICT) {
 
     if (cb->num_residues == 0) cb->start_resSeq = st->resSeq;
 
-    if (cb->num_residues > 0 && !st->is_dup) {
+    if (cb->num_residues > 0) {
         int diff = st->resSeq - cb->last_resSeq;
-        if (diff > 1 && diff <= 100) {
+        if (diff == 0) {
+            cb->seq_track[cb->seq_bytes++] = 0x7F; cb->num_residues++;
+        } else if (diff > 1 && diff <= 100) {
             for (int g = 1; g < diff; g++) { cb->seq_track[cb->seq_bytes++] = 0x00; cb->num_residues++; }
         }
     }
 
-    if (st->is_dup) { cb->seq_track[cb->seq_bytes++] = 0x7F; cb->num_residues++; }
+    if (st->has_op3) { cb->seq_track[cb->seq_bytes++] = 0x7E; cb->num_residues++; }
+    if (st->has_oxt) { cb->seq_track[cb->seq_bytes++] = 0x7D; cb->num_residues++; }
 
     uint8_t meta = st->type & 0x7F;
     if (st->iCode != ' ' && st->iCode != 0) meta |= 0x80;
@@ -81,60 +145,21 @@ void flush_residue(ChainBuilder* cb, EncoderState* st, UniDict* UDICT) {
     if (meta & 0x80) cb->seq_track[cb->seq_bytes++] = st->iCode;
     cb->num_residues++;
 
+    int is_hetatm = (st->type >= 38);
+
+    if (st->has_op3) encode_alt_array(cb, &st->op3, 0);
+
     for (int i = 0; i < UDICT[st->type].num_atoms; i++) {
-        if (!st->present[i]) {
+        if (!st->present[i] || st->atoms[i].count == 0) {
             memset(&cb->atom_track[cb->atom_bytes], 0, 8);
             cb->atom_bytes += 8; cb->num_atoms++;
             continue;
         }
-
-        int32_t x = st->x_acc[i], y = st->y_acc[i], z = st->z_acc[i];
-        if (cb->num_atoms == 0) { cb->current_x = x; cb->current_y = y; cb->current_z = z; }
-
-        int32_t dx = x - cb->current_x, dy = y - cb->current_y, dz = z - cb->current_z;
-        int32_t b_int = st->b_acc[i]; if (b_int > 4194303) b_int = 4194303; if (b_int < 0) b_int = 0;
-
-        char altLoc = st->alt_acc[i];
-        int alt_flag = (altLoc != ' ' && altLoc != 0) ? 1 : 0;
-        int32_t occ_int = st->occ_acc[i];
-        uint8_t charge_u = (st->charge_acc[i] + 8) & 0x0F;
-
-        // Treat HETATMs identical to normal atoms: Only jump if bounds or state change
-        int needs_jump = (cb->num_atoms == 0) || 
-                         (dx > 32767 || dx < -32768 || dy > 32767 || dy < -32768 || dz > 32767 || dz < -32768) ||
-                         (occ_int != cb->current_occ) || (charge_u != cb->current_charge) || 
-                         (b_int > 16383);
-
-        uint8_t* ptr = &cb->atom_track[cb->atom_bytes];
-        uint16_t b_ctrl = ((b_int & 0x3FFF) << 2) | (alt_flag << 1) | 0; 
-
-        if (needs_jump) {
-            ptr[0] = (charge_u << 1) | 1;           // +0 charge + control bit (1)
-            ptr[1] = (b_int >> 14) & 0xFF;          // +1 B-anchor MSB
-            ptr[2] = (occ_int >> 16) & 0xFF;        // +2 Occ byte 2 (MSB)
-            ptr[3] = (x >> 16) & 0xFF;              // +3 X-anchor MSB
-            ptr[4] = (occ_int >> 8) & 0xFF;         // +4 Occ byte 1
-            ptr[5] = (y >> 16) & 0xFF;              // +5 Y-anchor MSB
-            ptr[6] = occ_int & 0xFF;                // +6 Occ byte 0 (LSB)
-            ptr[7] = (z >> 16) & 0xFF;              // +7 Z-anchor MSB
-
-            *(uint16_t*)(ptr + 8) = b_ctrl;
-            *(uint16_t*)(ptr + 10) = x & 0xFFFF;
-            *(uint16_t*)(ptr + 12) = y & 0xFFFF;
-            *(uint16_t*)(ptr + 14) = z & 0xFFFF;
-
-            cb->current_occ = occ_int; cb->current_charge = charge_u;
-            cb->atom_bytes += 16;
-        } else {
-            *(uint16_t*)ptr = b_ctrl;
-            *(int16_t*)(ptr + 2) = dx;
-            *(int16_t*)(ptr + 4) = dy;
-            *(int16_t*)(ptr + 6) = dz;
-            cb->atom_bytes += 8;
-        }
-
-        cb->current_x = x; cb->current_y = y; cb->current_z = z; cb->num_atoms++;
+        encode_alt_array(cb, &st->atoms[i], (is_hetatm && i == 0));
     }
+    
+    if (st->has_oxt) encode_alt_array(cb, &st->oxt, 0);
+    
     cb->last_resSeq = st->resSeq; cb->last_iCode = st->iCode;
 }
 
@@ -153,8 +178,7 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
 
     char global_title[4096] = {0}; char global_id[128] = {0}; char global_class[128] = {0};
     char global_expdta[128] = {0}; char global_program[56] = {0};
-    float global_resolution = -1.0f;
-    int day=1, month=1, year=1973, id_from_header = 0;
+    float global_resolution = -1.0f; int day=1, month=1, year=1973, id_from_header = 0;
 
     int af_mode = 0;
     if (strstr(in_pdbs[0], "AF-") != NULL) af_mode = 1;
@@ -178,7 +202,12 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
                 }
                 if (strlen(line) >= 66) { char temp_id[5] = {0}; memcpy(temp_id, line+62, 4); trim_string(temp_id); if (strlen(temp_id) > 0 && strcmp(temp_id, "XXXX") != 0) { strcpy(global_id, temp_id); id_from_header = 1; } }
             } else if (f == 0 && strncmp(line, "TITLE ", 6) == 0) {
-                if (strlen(line) > 10) { char chunk[71] = {0}; size_t c_len = strlen(line) - 10; memcpy(chunk, line+10, c_len > 70 ? 70 : c_len); trim_string(chunk); if (strlen(global_title) > 0) strcat(global_title, " "); strcat(global_title, chunk); }
+                char chunk[71]; memset(chunk, ' ', 70); chunk[70] = '\0';
+                int copy_len = strlen(line) - 10;
+                while(copy_len > 0 && (line[10+copy_len-1] == '\n' || line[10+copy_len-1] == '\r')) copy_len--;
+                if (copy_len > 70) copy_len = 70;
+                if (copy_len > 0) memcpy(chunk, line+10, copy_len);
+                strcat(global_title, chunk);
                 if (!id_from_header) { char *p1 = strchr(line, '('), *p2 = strchr(p1 ? p1 : line, ')'); if (p1 && p2 && (p2 > p1 + 4)) { size_t len = p2 - p1 - 1; memcpy(global_id, p1+1, len > 14 ? 14 : len); global_id[len > 14 ? 14 : len] = '\0'; } }
                 if (strstr(global_title, "ALPHAFOLD") || strstr(global_title, "AlphaFold")) af_mode = 1;
             } else if (f == 0 && strncmp(line, "EXPDTA", 6) == 0) { char chunk[71] = {0}; size_t c_len = strlen(line) - 10; memcpy(chunk, line+10, c_len > 70 ? 70 : c_len); trim_string(chunk); if (strlen(global_expdta) > 0) strcat(global_expdta, " "); strncat(global_expdta, chunk, 127 - strlen(global_expdta));
@@ -191,20 +220,44 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
             } else if (strncmp(line, "CISPEP", 6) == 0) { MetaCispep c; memset(&c, 0, sizeof(c)); memcpy(c.res1.resName, line+11, 3); c.res1.chain = line[15]; memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+17, 4); c.res1.resSeq = atoi(tbuf); c.res1.iCode = line[21]; memcpy(c.res2.resName, line+25, 3); c.res2.chain = line[29]; memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+31, 4); c.res2.resSeq = atoi(tbuf); c.res2.iCode = line[35]; if (strlen(line) >= 46) { memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+43, 3); c.modNum = atoi(tbuf); } if (strlen(line) >= 59) { memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+53, 6); c.angle = atof(tbuf); } stream_write(&cispeps, &c, sizeof(MetaCispep));
             } else if (strncmp(line, "HELIX ", 6) == 0) { MetaHelix h; memset(&h, 0, sizeof(h)); memcpy(h.helixID, line+11, 3); trim_string(h.helixID); memcpy(h.start.resName, line+15, 3); h.start.chain = line[19]; memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+21, 4); h.start.resSeq = atoi(tbuf); h.start.iCode = line[25]; memcpy(h.end.resName, line+27, 3); h.end.chain = line[31]; memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+33, 4); h.end.resSeq = atoi(tbuf); h.end.iCode = line[37]; if (strlen(line) >= 40) { memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+38, 2); h.helix_class = atoi(tbuf); } if (strlen(line) >= 70) { memcpy(h.comment, line+40, 30); trim_string(h.comment); } if (strlen(line) >= 76) { memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+71, 5); h.length = atoi(tbuf); } stream_write(&helices, &h, sizeof(MetaHelix));
             } else if (strncmp(line, "SHEET ", 6) == 0) { MetaSheet s; memset(&s, 0, sizeof(s)); memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+7, 3); s.strand_num = atoi(tbuf); memcpy(s.sheetID, line+11, 3); trim_string(s.sheetID); if (strlen(line) >= 16) { memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+14, 2); s.num_strands = atoi(tbuf); } memcpy(s.start.resName, line+17, 3); s.start.chain = line[21]; memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+22, 4); s.start.resSeq = atoi(tbuf); s.start.iCode = line[26]; memcpy(s.end.resName, line+28, 3); s.end.chain = line[32]; memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+33, 4); s.end.resSeq = atoi(tbuf); s.end.iCode = line[37]; if (strlen(line) >= 40) { memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+38, 2); s.sense = atoi(tbuf); } stream_write(&sheets, &s, sizeof(MetaSheet));
-            } else if (strncmp(line, "SITE  ", 6) == 0) { MetaSiteHeader sh; memset(&sh, 0, sizeof(sh)); memcpy(sh.siteID, line+11, 3); trim_string(sh.siteID); memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+15, 2); sh.num_res = atoi(tbuf); stream_write(&sites, &sh, sizeof(MetaSiteHeader)); for (uint32_t i=0; i<sh.num_res; i++) { PdbResId r; memset(&r, 0, sizeof(r)); int off = 18 + i*11; if (off + 9 < (int)strlen(line)) { memcpy(r.resName, line+off, 3); r.chain = line[off+4]; memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+off+5, 4); r.resSeq = atoi(tbuf); r.iCode = line[off+9]; stream_write(&sites, &r, sizeof(PdbResId)); } }
+            } else if (strncmp(line, "SITE  ", 6) == 0) {
+                memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+7, 3); int seqNum = atoi(tbuf);
+                if (seqNum == 1) {
+                    MetaSiteHeader sh; memset(&sh, 0, sizeof(sh)); 
+                    memcpy(sh.siteID, line+11, 3); trim_string(sh.siteID); 
+                    memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+15, 2); sh.num_res = atoi(tbuf); 
+                    stream_write(&sites, &sh, sizeof(MetaSiteHeader)); 
+                }
+                for (uint32_t i=0; i<4; i++) { 
+                    int off = 18 + i*11; 
+                    if (off + 9 < (int)strlen(line)) { 
+                        char check[4] = {0}; memcpy(check, line+off, 3); trim_string(check);
+                        if (strlen(check) == 0) continue;
+                        PdbResId r; memset(&r, 0, sizeof(r)); 
+                        memcpy(r.resName, line+off, 3); r.chain = line[off+4]; 
+                        memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+off+5, 4); r.resSeq = atoi(tbuf); 
+                        r.iCode = line[off+9]; 
+                        stream_write(&sites, &r, sizeof(PdbResId)); 
+                    } 
+                } 
             } else if (strncmp(line, "DBREF ", 6) == 0) { char* unp = strstr(line, "UNP"); if (unp) { char dummy[16], uid[64]; if (sscanf(unp, "%s %s", dummy, uid) == 2 && strlen(uid) > 3 && f == 0 && !id_from_header) { size_t c = strlen(uid); memcpy(global_id, uid, c > 14 ? 14 : c); global_id[c > 14 ? 14 : c] = '\0'; } }
             } else if (strncmp(line, "ATOM  ", 6) == 0 || strncmp(line, "HETATM", 6) == 0) {
                 char res_name[4] = {0}; memcpy(res_name, line + 17, 3);
                 char atom_name[5] = {0}; memcpy(atom_name, line + 12, 4);
                 char clean_atom[5] = {0}; memcpy(clean_atom, line + 12, 4);
-                if (clean_atom[1] == 'H' || clean_atom[0] == 'H' || strncmp(clean_atom, " OXT", 4) == 0) continue;
                 
                 int type = -1;
                 for (int i = 1; i < num_udict; i++) { if (strncmp(UDICT[i].resName, res_name, 3) == 0) { type = i; break; } }
-                if (type == -1 && num_udict < 127) { type = num_udict++; memcpy(UDICT[type].resName, res_name, 3); UDICT[type].num_atoms = 0; }
+                
+                if (clean_atom[1] == 'H' || clean_atom[0] == 'H' || (line[76] == ' ' && line[77] == 'D') || 
+                    ((strncmp(clean_atom, " OXT", 4) == 0 || strncmp(clean_atom, " OP3", 4) == 0) && type != -1 && type <= 37)) continue;
+                
                 if (type != -1) { 
                     int a_idx = -1; for (int a = 0; a < UDICT[type].num_atoms; a++) { if (strncmp(UDICT[type].atom_names[a], atom_name, 4) == 0) { a_idx = a; break; } }
-                    if (a_idx == -1 && UDICT[type].num_atoms < 255) { a_idx = UDICT[type].num_atoms++; memcpy(UDICT[type].atom_names[a_idx], atom_name, 4); UDICT[type].elements[a_idx][0] = line[76]; UDICT[type].elements[a_idx][1] = line[77]; } 
+                    if (a_idx == -1 && type > NUM_DICT_RES && UDICT[type].num_atoms < 255) { a_idx = UDICT[type].num_atoms++; memcpy(UDICT[type].atom_names[a_idx], atom_name, 4); UDICT[type].elements[a_idx][0] = line[76]; UDICT[type].elements[a_idx][1] = line[77]; } 
+                } else if (num_udict < 127) { 
+                    type = num_udict++; memcpy(UDICT[type].resName, res_name, 3); UDICT[type].num_atoms = 1; 
+                    memcpy(UDICT[type].atom_names[0], atom_name, 4); UDICT[type].elements[0][0] = line[76]; UDICT[type].elements[0][1] = line[77]; 
                 }
             }
         }
@@ -213,6 +266,12 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
 
     StreamBuffer coords; stream_init(&coords); StreamBuffer conects; stream_init(&conects);
     EncoderState st; memset(&st, 0, sizeof(st)); st.type = -1;
+    for(int i=0; i<256; i++) {
+        alt_init(&st.atoms[i]);
+    }
+    alt_init(&st.oxt);
+    alt_init(&st.op3);
+
     ChainBuilder cb; cb_init(&cb); char current_c1 = '\0', current_c2 = '\0';
 
     for (int f = 0; f < num_files; f++) {
@@ -228,50 +287,10 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
 
             if (strncmp(line, "TER   ", 6) == 0) {
                 if (st.type > 0) flush_residue(&cb, &st, UDICT);
-                if (st.has_oxt) {
-                    int32_t dx = st.oxt_x - cb.current_x, dy = st.oxt_y - cb.current_y, dz = st.oxt_z - cb.current_z;
-                    int32_t b_int = st.oxt_b; if (b_int > 4194303) b_int = 4194303; if (b_int < 0) b_int = 0;
-                    
-                    char altLoc = st.oxt_alt;
-                    int alt_flag = (altLoc != ' ' && altLoc != 0) ? 1 : 0;
-                    int32_t occ_int = st.oxt_occ;
-                    uint8_t charge_u = (st.oxt_charge + 8) & 0x0F;
-
-                    int needs_jump = (cb.num_atoms == 0) || 
-                                     (dx > 32767 || dx < -32768 || dy > 32767 || dy < -32768 || dz > 32767 || dz < -32768) ||
-                                     (occ_int != cb.current_occ) || (charge_u != cb.current_charge) || 
-                                     (b_int > 16383);
-
-                    uint8_t* ptr = &cb.atom_track[cb.atom_bytes];
-                    uint16_t b_ctrl = ((b_int & 0x3FFF) << 2) | (alt_flag << 1) | 0;
-
-                    if (needs_jump) {
-                        ptr[0] = (charge_u << 1) | 1;
-                        ptr[1] = (b_int >> 14) & 0xFF;
-                        ptr[2] = (occ_int >> 16) & 0xFF;
-                        ptr[3] = (st.oxt_x >> 16) & 0xFF;
-                        ptr[4] = (occ_int >> 8) & 0xFF;
-                        ptr[5] = (st.oxt_y >> 16) & 0xFF;
-                        ptr[6] = occ_int & 0xFF;
-                        ptr[7] = (st.oxt_z >> 16) & 0xFF;
-                        
-                        *(uint16_t*)(ptr + 8) = b_ctrl;
-                        *(uint16_t*)(ptr + 10) = st.oxt_x & 0xFFFF;
-                        *(uint16_t*)(ptr + 12) = st.oxt_y & 0xFFFF;
-                        *(uint16_t*)(ptr + 14) = st.oxt_z & 0xFFFF;
-
-                        cb.current_occ = occ_int; cb.current_charge = charge_u;
-                        cb.atom_bytes += 16;
-                    } else {
-                        *(uint16_t*)ptr = b_ctrl;
-                        *(int16_t*)(ptr + 2) = dx; *(int16_t*)(ptr + 4) = dy; *(int16_t*)(ptr + 6) = dz;
-                        cb.atom_bytes += 8;
-                    }
-                    cb.current_x = st.oxt_x; cb.current_y = st.oxt_y; cb.current_z = st.oxt_z; cb.num_atoms++;
-                }
                 cb.has_ter = 1; 
                 flush_chain(&cb, &coords);
-                st.type = -1; st.has_oxt = 0; st.is_dup = 0;
+                st.type = -1; st.has_oxt = 0; st.oxt.count = 0; st.has_op3 = 0; st.op3.count = 0;
+                for (int k = 0; k < 256; k++) st.atoms[k].count = 0;
                 continue;
             }
             
@@ -302,12 +321,12 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
             if (!af_mode) {
                 memset(tbuf2, 0, sizeof(tbuf2)); memcpy(tbuf2, line + 54, 6); occ = atof(tbuf2) * 100.0f;
                 if (line[78] >= '0' && line[78] <= '9') { charge = line[78] - '0'; if (line[79] == '-') charge = -charge; }
-                if (charge < -8) charge = -8; else if (charge > 7) charge = 7;
+                if (charge < -3) charge = -3; else if (charge > 4) charge = 4;
             }
 
             int atom_idx = -1;
             for (int i = 0; i < UDICT[type].num_atoms; i++) { if (strncmp(clean_atom, UDICT[type].atom_names[i], 4) == 0) { atom_idx = i; break; } }
-            if (atom_idx == -1 && strncmp(clean_atom, " OXT", 4) != 0) continue;
+            if (atom_idx == -1 && strncmp(clean_atom, " OXT", 4) != 0 && strncmp(clean_atom, " OP3", 4) != 0) continue;
 
             if (resSeq != st.resSeq || iCode != st.iCode || new_chain || cb.atom_bytes >= 580000 || type != st.type) {
                 if (st.type > 0) flush_residue(&cb, &st, UDICT);
@@ -317,71 +336,44 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
                     cb.c1 = c1; cb.c2 = c2; 
                 }
                 st.resSeq = resSeq; st.iCode = iCode; st.type = type;
-                memset(st.present, 0, sizeof(st.present)); st.has_oxt = 0; st.is_dup = 0;
+                memset(st.present, 0, sizeof(st.present)); st.has_oxt = 0; st.oxt.count = 0; st.has_op3 = 0; st.op3.count = 0;
+                for (int k = 0; k < 256; k++) st.atoms[k].count = 0;
             } else if (atom_idx != -1 && st.present[atom_idx]) {
-                flush_residue(&cb, &st, UDICT);
-                st.is_dup = 1; memset(st.present, 0, sizeof(st.present)); st.has_oxt = 0;
+                int is_dup_atom = 0;
+                for (int c = 0; c < st.atoms[atom_idx].count; c++) {
+                    if (st.atoms[atom_idx].alt[c] == altLoc) { is_dup_atom = 1; break; }
+                }
+                if (is_dup_atom) {
+                    flush_residue(&cb, &st, UDICT);
+                    memset(st.present, 0, sizeof(st.present)); st.has_oxt = 0; st.oxt.count = 0; st.has_op3 = 0; st.op3.count = 0;
+                    for (int k = 0; k < 256; k++) st.atoms[k].count = 0;
+                }
             }
 
-            if (strncmp(clean_atom, " OXT", 4) == 0) {
-                st.has_oxt = 1; st.oxt_b = (int32_t)round(temp * 100.0f); st.oxt_x = x_int; st.oxt_y = y_int; st.oxt_z = z_int;
-                st.oxt_occ = (int32_t)round(occ); st.oxt_alt = altLoc; st.oxt_charge = charge;
+            if (strncmp(clean_atom, " OXT", 4) == 0 && type <= 37) {
+                st.has_oxt = 1;
+                alt_push(&st.oxt, (int32_t)round(temp * 100.0f), x_int, y_int, z_int, (int32_t)round(occ), charge, altLoc);
+                continue;
+            }
+            if (strncmp(clean_atom, " OP3", 4) == 0 && type <= 37) {
+                st.has_op3 = 1;
+                alt_push(&st.op3, (int32_t)round(temp * 100.0f), x_int, y_int, z_int, (int32_t)round(occ), charge, altLoc);
                 continue;
             }
 
-            st.b_acc[atom_idx] = (int32_t)round(temp * 100.0f); st.x_acc[atom_idx] = x_int; st.y_acc[atom_idx] = y_int; st.z_acc[atom_idx] = z_int;
-            st.occ_acc[atom_idx] = (int32_t)round(occ); st.alt_acc[atom_idx] = altLoc; st.charge_acc[atom_idx] = charge; st.present[atom_idx] = 1;
+            alt_push(&st.atoms[atom_idx], (int32_t)round(temp * 100.0f), x_int, y_int, z_int, (int32_t)round(occ), charge, altLoc);
+            st.present[atom_idx] = 1;
         }
         fclose(fin);
     }
     
     if (st.type > 0) flush_residue(&cb, &st, UDICT);
-    if (st.has_oxt) {
-        int32_t dx = st.oxt_x - cb.current_x, dy = st.oxt_y - cb.current_y, dz = st.oxt_z - cb.current_z;
-        int32_t b_int = st.oxt_b; if (b_int > 4194303) b_int = 4194303; if (b_int < 0) b_int = 0;
-        
-        char altLoc = st.oxt_alt;
-        int alt_flag = (altLoc != ' ' && altLoc != 0) ? 1 : 0;
-        int32_t occ_int = st.oxt_occ;
-        uint8_t charge_u = (st.oxt_charge + 8) & 0x0F;
-
-        int needs_jump = (cb.num_atoms == 0) || 
-                         (dx > 32767 || dx < -32768 || dy > 32767 || dy < -32768 || dz > 32767 || dz < -32768) ||
-                         (occ_int != cb.current_occ) || (charge_u != cb.current_charge) || 
-                         (b_int > 16383);
-
-        uint8_t* ptr = &cb.atom_track[cb.atom_bytes];
-        uint16_t b_ctrl = ((b_int & 0x3FFF) << 2) | (alt_flag << 1) | 0;
-
-        if (needs_jump) {
-            ptr[0] = (charge_u << 1) | 1;
-            ptr[1] = (b_int >> 14) & 0xFF;
-            ptr[2] = (occ_int >> 16) & 0xFF;
-            ptr[3] = (st.oxt_x >> 16) & 0xFF;
-            ptr[4] = (occ_int >> 8) & 0xFF;
-            ptr[5] = (st.oxt_y >> 16) & 0xFF;
-            ptr[6] = occ_int & 0xFF;
-            ptr[7] = (st.oxt_z >> 16) & 0xFF;
-            
-            *(uint16_t*)(ptr + 8) = b_ctrl;
-            *(uint16_t*)(ptr + 10) = st.oxt_x & 0xFFFF;
-            *(uint16_t*)(ptr + 12) = st.oxt_y & 0xFFFF;
-            *(uint16_t*)(ptr + 14) = st.oxt_z & 0xFFFF;
-
-            cb.current_occ = occ_int; cb.current_charge = charge_u;
-            cb.atom_bytes += 16;
-        } else {
-            *(uint16_t*)ptr = b_ctrl;
-            *(int16_t*)(ptr + 2) = dx; *(int16_t*)(ptr + 4) = dy; *(int16_t*)(ptr + 6) = dz;
-            cb.atom_bytes += 8;
-        }
-        cb.num_atoms++;
-    }
     if (st.type > 0 && st.type < 38) cb.has_ter = 1; 
     flush_chain(&cb, &coords);
     cb_free(&cb);
 
-    FILE* fout = fopen(out_bpdb, "wb");
+    FILE* fout = (strcmp(out_bpdb, "-") == 0) ? stdout : fopen(out_bpdb, "wb");
+    if (!fout) { perror("Failed to open output"); exit(1); }
     uint64_t zero = 0;
     
     uint8_t header[64] = {0};
@@ -443,12 +435,20 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
     
     if (conects.len > 0) fwrite(conects.data, 1, conects.len, fout);
     
-    size_t current_size = ftell(fout);
-    size_t eof_pad = (8 - (current_size % 8)) % 8; 
-    if (eof_pad > 0) fwrite(&zero, 1, eof_pad, fout);
+    if (fout != stdout) {
+        size_t current_size = ftell(fout);
+        size_t eof_pad = (8 - (current_size % 8)) % 8; 
+        if (eof_pad > 0) fwrite(&zero, 1, eof_pad, fout);
+        fclose(fout);
+    }
 
-    fclose(fout); 
     stream_free(&coords); stream_free(&conects); stream_free(&ssbonds); 
     stream_free(&cispeps); stream_free(&helices); stream_free(&sheets); stream_free(&sites);
+    
+    for(int i=0; i<256; i++) {
+        alt_free(&st.atoms[i]);
+    }
+    alt_free(&st.oxt);
+    alt_free(&st.op3);
     free(UDICT);
 }

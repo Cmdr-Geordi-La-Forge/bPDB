@@ -94,7 +94,7 @@ static inline void encode_alt_array(ChainBuilder* cb, AltArray* arr, int force_j
         int32_t dx = x - cb->current_x, dy = y - cb->current_y, dz = z - cb->current_z;
         int32_t b_int = arr->b[a]; if (b_int > 4194303) b_int = 4194303; if (b_int < 0) b_int = 0;
         int alt_flag = (a < arr->count - 1) ? 1 : 0;
-        int32_t occ_int = arr->occ[a]; if (occ_int > 100) occ_int = 100;
+        int32_t occ_int = arr->occ[a]; if (occ_int > 100) occ_int = 100; else if (occ_int < 0) occ_int = 0;
         int8_t raw_charge = arr->charge[a];
         uint8_t charge_u = (raw_charge + 3) & 0x07;
 
@@ -250,7 +250,7 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
                 for (int i = 1; i < num_udict; i++) { if (strncmp(UDICT[i].resName, res_name, 3) == 0) { type = i; break; } }
                 
                 if (clean_atom[1] == 'H' || clean_atom[0] == 'H' || (line[76] == ' ' && line[77] == 'D') || 
-                    ((strncmp(clean_atom, " OXT", 4) == 0 || strncmp(clean_atom, " OP3", 4) == 0) && type != -1 && type <= 37)) continue;
+                   ((strncmp(clean_atom, " OXT", 4) == 0 || strncmp(clean_atom, " OP3", 4) == 0) && type != -1 && type <= 37)) continue;
                 
                 if (type != -1) { 
                     int a_idx = -1; for (int a = 0; a < UDICT[type].num_atoms; a++) { if (strncmp(UDICT[type].atom_names[a], atom_name, 4) == 0) { a_idx = a; break; } }
@@ -302,7 +302,7 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
             int resSeq = atoi(line + 22);
 
             char clean_atom[5] = {0}; memcpy(clean_atom, line + 12, 4);
-            if (clean_atom[1] == 'H' || clean_atom[0] == 'H') continue;
+            if (clean_atom[1] == 'H' || clean_atom[0] == 'H' || (line[76] == ' ' && line[77] == 'D')) continue;
 
             int type = -1;
             for (int i = 1; i < num_udict; i++) { if (strncmp(UDICT[i].resName, res_name, 3) == 0) { type = i; break; } }

@@ -51,18 +51,20 @@ The decoder reads this mask to determine exactly which metadata payloads follow.
 Coordinates are organized into sequential "Chains." Each chain declares its topology and length up front, followed by an unbroken stream of atom blocks.
 
 ### 3.1 Chain Header (8 Bytes)
-| Offset | Type     | Description |
-|:-------|:---------|:------------|
-| `+0`   | `uint16` | **num_residues**: Number of 1-byte links in the Sequence Track. (`0xFFFF` signals EOF). |
-| `+2`   | `uint16` | **num_atoms**: Total number of spatial atoms in the stream. |
+| Offset | Type     | Description                                                                                                                                     |
+|:-------|:---------|:------------------------------------------------------------------------------------------------------------------------------------------------|
+| `+0`   | `uint16` | **num_residues**: Number of 1-byte links in the Sequence Track. (`0xFFFF` signals EOF).                                                         |
+| `+2`   | `uint16` | **num_atoms**: Total number of spatial atoms in the stream.                                                                                     |
 | `+4`   | `uint8`  | **chain_id 1 & TER flag**: Bits `0-6` encode the 7-bit ASCII chain char. **Bit 7 (`0x80`) is the `TER` flag** (`1` = Print `TER` at chain end). |
-| `+5`   | `char`   | **chain_id 2**: Second chain character (if any, else space). |
-| `+6`   | `uint16` | **start_resSeq**: The starting Residue Sequence Number. |
+| `+5`   | `char`   | **chain_id 2**: Second chain character (if any, else space).                                                                                    |
+| `+6`   | `uint16` | **start_resSeq**: The starting Residue Sequence Number.                                                                                         |
 
 ### 3.2 Sequence Track (Bytecode Machine)
 A 1-dimensional array of `uint8_t` immediately following the Chain Header. The dictionary operates on a **1-based index**.
 
 *   **`0x00` (GAP):** Indicates a missing residue. Increments `resSeq` by 1. Parses no atoms.
+*   **`0x7D` (OXT):** Modifies the next residue to explicitly inject a 3' terminal `OXT` atom from the dictionary.
+*   **`0x7E` (OP3):** Modifies the next residue to explicitly inject a 5' terminal `OP3` atom from the dictionary.
 *   **Bits 0-6 (Type ID):** Encodes Valid Residues (1 to 126):
     *   `1-37`: Standard Amino/Nucleic Acids.
     *   `38+`: Special termini (`NH2`) and Custom `HET_DICT` molecules.
@@ -79,12 +81,12 @@ To achieve native SIMD load speeds, standard atom coordinates no longer use per-
 ### 4.1 Unbroken Difference Accumulation (`Control == 0`)
 A standard 8-byte block handles native intra-chain coordinate deltas up to **$\pm 32.767$ Å** (scaled by 1000). The accumulator is a pure unbroken running sum, ignoring residue boundaries entirely. Standard blocks natively imply a sparse charge of `0`.
 
-| Bytes | Type          | Description |
-|:------|:--------------|:------------|
-| `0-1` | `uint16_t`    | Bits 2-15: Absolute B-factor (0.00 to 163.83). Bit 1: AltLoc Presence Flag. **Bit 0: Control Flag (`0`)**. |
-| `2-3` | `int16_t`     | $\Delta X$ relative to previous atom. |
-| `4-5` | `int16_t`     | $\Delta Y$ relative to previous atom. |
-| `6-7` | `int16_t`     | $\Delta Z$ relative to previous atom. |
+| Bytes | Type       | Description                                                                                                |
+|:------|:-----------|:-----------------------------------------------------------------------------------------------------------|
+| `0-1` | `uint16_t` | Bits 2-15: Absolute B-factor (0.00 to 163.83). Bit 1: AltLoc Presence Flag. **Bit 0: Control Flag (`0`)**. |
+| `2-3` | `int16_t`  | $\Delta X$ relative to previous atom.                                                                      |
+| `4-5` | `int16_t`  | $\Delta Y$ relative to previous atom.                                                                      |
+| `6-7` | `int16_t`  | $\Delta Z$ relative to previous atom.                                                                      |
 
 ### 4.2 Absolute New Anchors & Sparse Charge (`Control == 1`)
 If a spatial jump exceeds $\pm 32.767$ Å (chain gaps, isolated HETATMs, waters), OR if the implicit atom states (Occupancy or physical Charge) change, the stream emits a 16-byte absolute New Anchor. 

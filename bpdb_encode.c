@@ -60,13 +60,13 @@ typedef struct {
     int32_t current_x, current_y, current_z; 
     int32_t current_occ; 
     int start_resSeq; int last_resSeq; char last_iCode;
-    char c1, c2; int has_ter;
+    char c1, c2; int has_ter, flags;
 } ChainBuilder;
 
 void cb_init(ChainBuilder* cb) {
     cb->seq_track = (uint8_t*)malloc(240000); cb->atom_track = (uint8_t*)malloc(120000 * 8 + 100);
     cb->seq_bytes = 0; cb->atom_bytes = 0; cb->num_atoms = 0; cb->num_residues = 0;
-    cb->start_resSeq = 0; cb->has_ter = 0;
+    cb->start_resSeq = 0; cb->has_ter = 0; cb->flags = 0;
     cb->current_occ = 100;
 }
 void cb_free(ChainBuilder* cb) { free(cb->seq_track); free(cb->atom_track); }
@@ -76,7 +76,8 @@ void flush_chain(ChainBuilder* cb, StreamBuffer* buf) {
     uint8_t header[8] = {0};
     *(uint16_t*)(header + 0) = cb->num_residues;
     *(uint16_t*)(header + 2) = cb->num_atoms;
-    header[4] = cb->c1 | (cb->has_ter ? 0x80 : 0); header[5] = cb->c2;
+    header[4] = cb->c1 | (cb->has_ter ? 0x80 : 0); 
+    header[5] = cb->c2 | cb->flags;
     *(uint16_t*)(header + 6) = cb->start_resSeq;
     stream_write(buf, header, 8);
     stream_write(buf, cb->seq_track, cb->seq_bytes);
@@ -84,7 +85,7 @@ void flush_chain(ChainBuilder* cb, StreamBuffer* buf) {
     if (pad > 0) { uint64_t zero = 0; stream_write(buf, &zero, pad); }
     stream_write(buf, cb->atom_track, cb->atom_bytes);
     cb->seq_bytes = 0; cb->atom_bytes = 0; cb->num_atoms = 0; cb->num_residues = 0; 
-    cb->has_ter = 0; cb->current_occ = 100;
+    cb->has_ter = 0; cb->flags = 0; cb->current_occ = 100;
 }
 
 static inline void encode_alt_array(ChainBuilder* cb, AltArray* arr, int force_jump) {
@@ -136,16 +137,19 @@ void flush_residue(ChainBuilder* cb, EncoderState* st, UniDict* UDICT) {
         }
     }
 
-    if (st->has_op3) { cb->seq_track[cb->seq_bytes++] = 0x7E; cb->num_residues++; }
-    if (st->has_oxt) { cb->seq_track[cb->seq_bytes++] = 0x7D; cb->num_residues++; }
+    if (st->has_op3) { cb->flags |= 0x80; }
+    if (st->has_oxt) { cb->flags |= 0x40; }
 
-    uint8_t meta = st->type & 0x7F;
-    if (st->iCode != ' ' && st->iCode != 0) meta |= 0x80;
-    cb->seq_track[cb->seq_bytes++] = meta;
-    if (meta & 0x80) cb->seq_track[cb->seq_bytes++] = st->iCode;
+    if (st->iCode != ' ' && st->iCode != 0) {
+        cb->seq_track[cb->seq_bytes++] = 0x7C;
+        cb->seq_track[cb->seq_bytes++] = st->iCode;
+        cb->num_residues++;
+    }
+
+    cb->seq_track[cb->seq_bytes++] = st->type;
     cb->num_residues++;
 
-    int is_hetatm = (st->type >= 38);
+    int is_hetatm = (st->type >= 0x80);
 
     if (st->has_op3) encode_alt_array(cb, &st->op3, 0);
 
@@ -158,6 +162,15 @@ void flush_residue(ChainBuilder* cb, EncoderState* st, UniDict* UDICT) {
         encode_alt_array(cb, &st->atoms[i], (is_hetatm && i == 0));
     }
     
+    if (st->type < 0x80) {
+        int anchor_idx = (st->type < 0x40) ? 2 : 8;
+        if (st->present[anchor_idx] && st->atoms[anchor_idx].count > 0) {
+            cb->current_x = st->atoms[anchor_idx].x[0];
+            cb->current_y = st->atoms[anchor_idx].y[0];
+            cb->current_z = st->atoms[anchor_idx].z[0];
+        }
+    }
+
     if (st->has_oxt) encode_alt_array(cb, &st->oxt, 0);
     
     cb->last_resSeq = st->resSeq; cb->last_iCode = st->iCode;
@@ -165,20 +178,21 @@ void flush_residue(ChainBuilder* cb, EncoderState* st, UniDict* UDICT) {
 
 void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
     UniDict* UDICT = (UniDict*)calloc(256, sizeof(UniDict));
-    int num_udict = 1; 
+    int custom_het_idx = 0x81; 
     for (int i = 0; i < NUM_DICT_RES; i++) {
-        strcpy(UDICT[num_udict].resName, DICT[i].resName); 
-        UDICT[num_udict].num_atoms = DICT[i].num_atoms;
+        uint8_t tid = DICT[i].type_id;
+        strcpy(UDICT[tid].resName, DICT[i].resName); 
+        UDICT[tid].num_atoms = DICT[i].num_atoms;
         for (int a = 0; a < DICT[i].num_atoms; a++) { 
-            strcpy(UDICT[num_udict].atom_names[a], DICT[i].atom_names[a]); 
-            strcpy(UDICT[num_udict].elements[a], DICT[i].elements[a]); 
+            strcpy(UDICT[tid].atom_names[a], DICT[i].atom_names[a]); 
+            strcpy(UDICT[tid].elements[a], DICT[i].elements[a]); 
         }
-        num_udict++;
     }
 
     char global_title[4096] = {0}; char global_id[128] = {0}; char global_class[128] = {0};
     char global_expdta[128] = {0}; char global_program[56] = {0};
     float global_resolution = -1.0f; int day=1, month=1, year=1973, id_from_header = 0;
+    int first_model_only = 1; 
 
     int af_mode = 0;
     if (strstr(in_pdbs[0], "AF-") != NULL) af_mode = 1;
@@ -241,22 +255,23 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
                     } 
                 } 
             } else if (strncmp(line, "DBREF ", 6) == 0) { char* unp = strstr(line, "UNP"); if (unp) { char dummy[16], uid[64]; if (sscanf(unp, "%s %s", dummy, uid) == 2 && strlen(uid) > 3 && f == 0 && !id_from_header) { size_t c = strlen(uid); memcpy(global_id, uid, c > 14 ? 14 : c); global_id[c > 14 ? 14 : c] = '\0'; } }
+            } else if (strncmp(line, "ENDMDL", 6) == 0) { if (first_model_only) break; 
             } else if (strncmp(line, "ATOM  ", 6) == 0 || strncmp(line, "HETATM", 6) == 0) {
                 char res_name[4] = {0}; memcpy(res_name, line + 17, 3);
                 char atom_name[5] = {0}; memcpy(atom_name, line + 12, 4);
                 char clean_atom[5] = {0}; memcpy(clean_atom, line + 12, 4);
                 
                 int type = -1;
-                for (int i = 1; i < num_udict; i++) { if (strncmp(UDICT[i].resName, res_name, 3) == 0) { type = i; break; } }
+                for (int i = 1; i < 256; i++) { if (UDICT[i].num_atoms > 0 && strncmp(UDICT[i].resName, res_name, 3) == 0) { type = i; break; } }
                 
                 if (clean_atom[1] == 'H' || clean_atom[0] == 'H' || (line[76] == ' ' && line[77] == 'D') || 
-                   ((strncmp(clean_atom, " OXT", 4) == 0 || strncmp(clean_atom, " OP3", 4) == 0) && type != -1 && type <= 37)) continue;
+                   ((strncmp(clean_atom, " OXT", 4) == 0 || strncmp(clean_atom, " OP3", 4) == 0) && type != -1 && type < 0x80)) continue;
                 
                 if (type != -1) { 
                     int a_idx = -1; for (int a = 0; a < UDICT[type].num_atoms; a++) { if (strncmp(UDICT[type].atom_names[a], atom_name, 4) == 0) { a_idx = a; break; } }
-                    if (a_idx == -1 && type > NUM_DICT_RES && UDICT[type].num_atoms < 255) { a_idx = UDICT[type].num_atoms++; memcpy(UDICT[type].atom_names[a_idx], atom_name, 4); UDICT[type].elements[a_idx][0] = line[76]; UDICT[type].elements[a_idx][1] = line[77]; } 
-                } else if (num_udict < 127) { 
-                    type = num_udict++; memcpy(UDICT[type].resName, res_name, 3); UDICT[type].num_atoms = 1; 
+                    if (a_idx == -1 && type >= 0x80 && UDICT[type].num_atoms < 255) { a_idx = UDICT[type].num_atoms++; memcpy(UDICT[type].atom_names[a_idx], atom_name, 4); UDICT[type].elements[a_idx][0] = line[76]; UDICT[type].elements[a_idx][1] = line[77]; } 
+                } else if (custom_het_idx < 192) { 
+                    type = custom_het_idx++; memcpy(UDICT[type].resName, res_name, 3); UDICT[type].num_atoms = 1; 
                     memcpy(UDICT[type].atom_names[0], atom_name, 4); UDICT[type].elements[0][0] = line[76]; UDICT[type].elements[0][1] = line[77]; 
                 }
             }
@@ -293,6 +308,13 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
                 for (int k = 0; k < 256; k++) st.atoms[k].count = 0;
                 continue;
             }
+            if (strncmp(line, "ENDMDL", 6) == 0) { 
+                if (st.type > 0) flush_residue(&cb, &st, UDICT);
+                if (cb.num_atoms > 0) flush_chain(&cb, &coords);
+                uint16_t term = 0xFFFE; stream_write(&coords, &term, 2);
+                if (first_model_only) break; 
+                continue; 
+            }
             
             if (strncmp(line, "ATOM  ", 6) != 0 && strncmp(line, "HETATM", 6) != 0) continue;
 
@@ -305,7 +327,7 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
             if (clean_atom[1] == 'H' || clean_atom[0] == 'H' || (line[76] == ' ' && line[77] == 'D')) continue;
 
             int type = -1;
-            for (int i = 1; i < num_udict; i++) { if (strncmp(UDICT[i].resName, res_name, 3) == 0) { type = i; break; } }
+            for (int i = 1; i < 256; i++) { if (UDICT[i].num_atoms > 0 && strncmp(UDICT[i].resName, res_name, 3) == 0) { type = i; break; } }
             if (type == -1) continue; 
 
             int new_chain = (c1 != current_c1 || c2 != current_c2);
@@ -350,12 +372,12 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
                 }
             }
 
-            if (strncmp(clean_atom, " OXT", 4) == 0 && type <= 37) {
+            if (strncmp(clean_atom, " OXT", 4) == 0 && type < 0x80) {
                 st.has_oxt = 1;
                 alt_push(&st.oxt, (int32_t)round(temp * 100.0f), x_int, y_int, z_int, (int32_t)round(occ), charge, altLoc);
                 continue;
             }
-            if (strncmp(clean_atom, " OP3", 4) == 0 && type <= 37) {
+            if (strncmp(clean_atom, " OP3", 4) == 0 && type < 0x80) {
                 st.has_op3 = 1;
                 alt_push(&st.op3, (int32_t)round(temp * 100.0f), x_int, y_int, z_int, (int32_t)round(occ), charge, altLoc);
                 continue;
@@ -368,7 +390,7 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
     }
     
     if (st.type > 0) flush_residue(&cb, &st, UDICT);
-    if (st.type > 0 && st.type < 38) cb.has_ter = 1; 
+    if (st.type > 0 && st.type < 0xC0) cb.has_ter = 1; 
     flush_chain(&cb, &coords);
     cb_free(&cb);
 
@@ -377,14 +399,14 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
     uint64_t zero = 0;
     
     uint8_t header[64] = {0};
-    memcpy(header, "bPDB", 4); header[4] = 5; header[5] = (uint8_t)day; header[6] = (uint8_t)month;
+    memcpy(header, "bPDB", 4); header[4] = 6; header[5] = (uint8_t)day; header[6] = (uint8_t)month;
     header[7] = (year >= 1973 && year <= 2228) ? (uint8_t)(year - 1973) : 0;
     memcpy(header + 8, global_id, strlen(global_id) > 15 ? 15 : strlen(global_id));
     memcpy(header + 24, global_class, strlen(global_class) > 40 ? 40 : strlen(global_class));
     fwrite(header, 1, 64, fout);
 
     uint64_t title_len = strlen(global_title), expdta_len = strlen(global_expdta);
-    int has_title = (title_len > 0), has_het = (num_udict > 1 + NUM_DICT_RES), has_expdta = (expdta_len > 0);
+    int has_title = (title_len > 0), has_het = (custom_het_idx > 0x81), has_expdta = (expdta_len > 0);
     int has_res = (global_resolution > 0.0f), has_prog = (strlen(global_program) > 0);
     
     uint64_t meta_mask = 0;
@@ -400,7 +422,7 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
     if (cispeps.len > 0) meta_mask |= (1ULL << 9);
     if (sites.len > 0) meta_mask |= (1ULL << 10);
 
-    uint64_t meta_header = 5 | (meta_mask << 16);
+    uint64_t meta_header = 6 | (meta_mask << 16);
     fwrite(&meta_header, 1, 8, fout);
 
     if (meta_mask & (1ULL << 1)) { uint32_t pad=0; fwrite(&global_resolution, 1, 4, fout); fwrite(&pad, 1, 4, fout); }
@@ -409,11 +431,11 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
     if (meta_mask & (1ULL << 4)) { uint64_t p_len = 56; fwrite(&p_len, 1, 8, fout); fwrite(global_program, 1, 56, fout); }
     if (meta_mask & (1ULL << 5)) {
         uint64_t dict_len = 1; 
-        for (int i = NUM_DICT_RES + 1; i < num_udict; i++) dict_len += 5 + UDICT[i].num_atoms * 6;
+        for (int i = 0x81; i < custom_het_idx; i++) dict_len += 5 + UDICT[i].num_atoms * 6;
         fwrite(&dict_len, 1, 8, fout); 
-        uint8_t custom_count = num_udict - NUM_DICT_RES - 1; 
+        uint8_t custom_count = custom_het_idx - 0x81; 
         fwrite(&custom_count, 1, 1, fout);
-        for (int i = NUM_DICT_RES + 1; i < num_udict; i++) {
+        for (int i = 0x81; i < custom_het_idx; i++) {
             char r_name[4] = {0}; memcpy(r_name, UDICT[i].resName, 3); r_name[3] = ' '; fwrite(r_name, 1, 4, fout);
             uint8_t a_count = UDICT[i].num_atoms; fwrite(&a_count, 1, 1, fout);
             for (int a = 0; a < a_count; a++) { fwrite(UDICT[i].atom_names[a], 1, 4, fout); fwrite(UDICT[i].elements[a], 1, 2, fout); }

@@ -21,7 +21,6 @@
     #define GET_SIMD_Z(acc) ((acc).z)
 #endif
 
-// Zero-Shift Math: Natively casts 15-bit jump MSBs.
 #if defined(__AVX2__) || defined(__SSE4_1__)
     #define SIMD_DECODE_PHASE1(ptr, out_accum) do { \
         if ((ptr)[0] & 0x01) { \
@@ -163,7 +162,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
     static uint8_t base_natoms[256] = {0};
     static int dict_init = 0;
     if (!dict_init) {
-        for (int i = 0; i < NUM_DICT_RES; i++) base_natoms[i+1] = DICT[i].num_atoms;
+        for (int i = 0; i < NUM_DICT_RES; i++) base_natoms[DICT[i].type_id] = DICT[i].num_atoms;
         dict_init = 1;
     }
 
@@ -181,7 +180,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
         uint8_t custom_count = p_het_dict[0];
         size_t ptr = 1;
         for (int c = 0; c < custom_count; c++) {
-            int u = NUM_DICT_RES + 1 + c; ptr += 4;
+            int u = 0x81 + c; ptr += 4;
             r_natoms[u] = p_het_dict[ptr++]; ptr += r_natoms[u] * 6;
         }
         dict_scan_off += dict_len + ((8 - (dict_len % 8)) % 8);
@@ -198,6 +197,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
         int32_t local_sink = 0;
         while (offset < size) {
             uint16_t num_residues = *(uint16_t*)(buffer + offset);
+            if (num_residues == 0xFFFE) { offset += 2; continue; }
             if (num_residues == 0xFFFF) break;
             
             uint16_t num_atoms = *(uint16_t*)(buffer + offset + 2);
@@ -205,7 +205,9 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
             
             const uint8_t* seq_ptr = buffer + offset;
             int seq_bytes = 0; 
-            for (uint32_t r = 0; r < num_residues; r++) if (seq_ptr[seq_bytes++] & 0x80) seq_bytes++;
+            for (uint32_t r = 0; r < num_residues; r++) {
+                if (seq_ptr[seq_bytes++] == 0x7C) seq_bytes++;
+            }
             
             offset += seq_bytes + ((8 - (seq_bytes & 7)) & 7);
             const uint8_t* atom_ptr = buffer + offset;
@@ -250,8 +252,9 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
 
     UniDict* UDICT = (UniDict*)malloc(256 * sizeof(UniDict));
     for (int i = 0; i < NUM_DICT_RES; i++) {
-        strcpy(UDICT[i+1].resName, DICT[i].resName); UDICT[i+1].num_atoms = DICT[i].num_atoms;
-        for (int a = 0; a < DICT[i].num_atoms; a++) { strcpy(UDICT[i+1].atom_names[a], DICT[i].atom_names[a]); strcpy(UDICT[i+1].elements[a], DICT[i].elements[a]); }
+        uint8_t tid = DICT[i].type_id;
+        strcpy(UDICT[tid].resName, DICT[i].resName); UDICT[tid].num_atoms = DICT[i].num_atoms;
+        for (int a = 0; a < DICT[i].num_atoms; a++) { strcpy(UDICT[tid].atom_names[a], DICT[i].atom_names[a]); strcpy(UDICT[tid].elements[a], DICT[i].elements[a]); }
     }
 
     if (mask & (1ULL << 1)) { resolution = *(float*)(buffer + offset); offset += 8; }
@@ -263,7 +266,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
         const uint8_t* p_het_dict = buffer + offset;
         uint8_t custom_count = p_het_dict[0]; size_t ptr = 1;
         for (int c = 0; c < custom_count; c++) {
-            int u_idx = NUM_DICT_RES + 1 + c; memcpy(UDICT[u_idx].resName, p_het_dict + ptr, 3); UDICT[u_idx].resName[3] = '\0'; ptr += 4;
+            int u_idx = 0x81 + c; memcpy(UDICT[u_idx].resName, p_het_dict + ptr, 3); UDICT[u_idx].resName[3] = '\0'; ptr += 4;
             UDICT[u_idx].num_atoms = p_het_dict[ptr]; ptr++;
             for (int a = 0; a < UDICT[u_idx].num_atoms; a++) {
                 memcpy(UDICT[u_idx].atom_names[a], p_het_dict + ptr, 4); UDICT[u_idx].atom_names[a][4] = '\0'; ptr += 4;
@@ -295,6 +298,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
 
     while (scan_off < size) {
         uint16_t num_residues = *(uint16_t*)(buffer + scan_off);
+        if (num_residues == 0xFFFE) { scan_off += 2; out_lines++; continue; }
         if (num_residues == 0xFFFF) { scan_off += 8; conect_offset = scan_off; break; }
         uint16_t num_atoms = *(uint16_t*)(buffer + scan_off + 2);
         char c1_raw = buffer[scan_off + 4]; int has_ter = (c1_raw & 0x80) != 0;
@@ -302,7 +306,9 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
         
         int scan_seq_bytes = 0;
         const uint8_t* scan_seq_ptr = buffer + scan_off;
-        for (uint32_t r = 0; r < num_residues; r++) if (scan_seq_ptr[scan_seq_bytes++] & 0x80) scan_seq_bytes++; 
+        for (uint32_t r = 0; r < num_residues; r++) {
+            if (scan_seq_ptr[scan_seq_bytes++] == 0x7C) scan_seq_bytes++; 
+        }
         scan_off += scan_seq_bytes + ((8 - (scan_seq_bytes & 7)) & 7);
 
         const uint8_t* atom_ptr = buffer + scan_off;
@@ -383,16 +389,25 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
         }
     }
 
-    int atom_serial = 1;
+    int atom_serial = 1; int model_count = 1;
+    int has_anchor = 0;
     while (offset < size) {
         uint16_t num_residues = *(uint16_t*)(buffer + offset);
+        if (num_residues == 0xFFFE) { 
+            memcpy(w_ptr, "ENDMDL                                                                          ", 80); w_ptr += 81;
+            offset += 2; atom_serial = 1; model_count++; 
+            continue; 
+        }
         if (num_residues == 0xFFFF) { break; }
         
         uint16_t num_atoms = *(uint16_t*)(buffer + offset + 2);
         char c1_raw = buffer[offset + 4];
-        char c2 = buffer[offset + 5]; 
+        char c2_raw = buffer[offset + 5]; 
         char c1 = c1_raw & 0x7F;
+        char c2 = c2_raw & 0x3F;
         int has_ter = (c1_raw & 0x80) != 0;
+        int has_op3 = (c2_raw & 0x80) != 0;
+        int has_oxt = (c2_raw & 0x40) != 0;
         if (c1 == 0) c1 = ' '; 
         if (c2 == 0) c2 = ' ';
         int16_t start_resSeq = *(int16_t*)(buffer + offset + 6);
@@ -400,14 +415,17 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
         
         const uint8_t* seq_ptr = buffer + offset;
         int seq_bytes = 0; uint32_t expected_atoms = 0;
+        
+        if (has_op3) expected_atoms++;
+        if (has_oxt) expected_atoms++;
+        
         for (uint32_t r = 0; r < num_residues; r++) { 
             uint8_t type = seq_ptr[seq_bytes++];
-            if (type == 0x7E || type == 0x7D) {
-                expected_atoms++;
-            } else if (type != 0x00 && type != 0x7F) {
-                expected_atoms += r_natoms[type & 0x7F];
+            if (type == 0x7C) {
+                seq_bytes++;
+            } else if (type != 0x00 && type != 0x7F && type != 0x7E && type != 0x7D) {
+                expected_atoms += r_natoms[type & 0xFF];
             }
-            if (type & 0x80) seq_bytes++; 
         }
         offset += seq_bytes + ((8 - (seq_bytes & 7)) & 7);
         const uint8_t* atom_ptr = buffer + offset;
@@ -420,12 +438,17 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
         char active_alt_char = 'A';
 
         accum_t accum;
+        accum_t anchor_accum;
+        has_anchor = 0;
 #if defined(__AVX2__) || defined(__SSE4_1__)
         accum = _mm_setzero_si128();  
+        anchor_accum = _mm_setzero_si128();
 #elif defined(__aarch64__) || defined(__ARM_NEON)
         accum = vdupq_n_s32(0);  
+        anchor_accum = vdupq_n_s32(0);
 #else
         accum.x = 0; accum.y = 0; accum.z = 0;  
+        anchor_accum.x = 0; anchor_accum.y = 0; anchor_accum.z = 0;
 #endif
 
         int atoms_left = 0;
@@ -433,34 +456,42 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
         uint32_t parsed_base_atoms = 0;
         int s_idx = 0;
         int no_inc = 0;
+        
+        if (has_op3) { atoms_left = 1; atom_dict_idx = -1; last_valid_type = seq_ptr[0] & 0xFF; }
 
         for (uint32_t block_idx = 0; block_idx < num_atoms; block_idx++) {
+            if (atom_serial > 99999) atom_serial = 0;
+            
             if (atoms_left == 0) {
-                if (parsed_base_atoms < expected_atoms) {
-                    uint8_t meta;
-                    int has_5p = 0, has_3p = 0;
+                if (has_anchor) {
+                    accum = anchor_accum;
+                    has_anchor = 0;
+                }
+                if (parsed_base_atoms < expected_atoms - (has_oxt ? 1 : 0) - (has_op3 ? 1 : 0)) {
+                    uint8_t meta; int current_has_5p = 0, current_has_3p = 0;
                     do {
                         if (s_idx >= seq_bytes) break;
                         meta = seq_ptr[s_idx++];
                         if (meta == 0x00) { current_resSeq++; first_res = 0; no_inc = 0; }
                         else if (meta == 0x7F) { no_inc = 1; }
-                        else if (meta == 0x7E) { has_5p = 1; }
-                        else if (meta == 0x7D) { has_3p = 1; }
-                        else {
-                            if (meta & 0x80) iCode = seq_ptr[s_idx++]; else iCode = ' ';
-                        }
-                    } while (meta == 0x00 || meta == 0x7F || meta == 0x7E || meta == 0x7D);
+                        else if (meta == 0x7E) { current_has_5p = 1; }
+                        else if (meta == 0x7D) { current_has_3p = 1; }
+                        else if (meta == 0x7C) { iCode = seq_ptr[s_idx++]; }
+                    } while (meta == 0x00 || meta == 0x7F || meta == 0x7E || meta == 0x7D || meta == 0x7C);
                     
                     if (s_idx <= seq_bytes) {
-                        last_valid_type = meta & 0x7F;
+                        last_valid_type = meta & 0xFF;
                         if (!first_res && !no_inc) current_resSeq++;
                         first_res = 0;
                         no_inc = 0;
-                        atoms_left = r_natoms[last_valid_type] + has_5p + has_3p;
-                        atom_dict_idx = has_5p ? -1 : 0;
+                        atoms_left = r_natoms[last_valid_type] + current_has_5p + current_has_3p;
+                        atom_dict_idx = current_has_5p ? -1 : 0;
                     } else {
                         atoms_left = 1; 
                     }
+                } else if (has_oxt && parsed_base_atoms == expected_atoms - 1) {
+                    atoms_left = 1;
+                    atom_dict_idx = -2;
                 } else {
                     atoms_left = 1;
                 }
@@ -474,6 +505,13 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
                 int32_t v_b;
                 SIMD_DECODE_MACRO(atom_ptr, accum, current_occ, current_charge, v_b, alt_flag);
                 
+                if ((last_valid_type < 0x40 && i == 2) || (last_valid_type >= 0x40 && last_valid_type < 0x80 && i == 8)) {
+                    if (active_alt_char == 'A') {
+                        anchor_accum = accum;
+                        has_anchor = 1;
+                    }
+                }
+                
                 char altLoc = ' ';
                 if (alt_flag || active_alt_char > 'A') {
                     altLoc = active_alt_char++;
@@ -484,7 +522,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
                 
                 if (i == -1) {
                     a_name = " OP3"; e_name = " O";
-                } else if (i == r_natoms[last_valid_type]) {
+                } else if (i == -2) {
                     a_name = " OXT"; e_name = " O";
                 } else if (i >= 0 && i < r_natoms[last_valid_type]) {
                     a_name = UDICT[last_valid_type].atom_names[i];
@@ -493,7 +531,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
                     a_name = " UNK"; e_name = " X"; 
                 }
 
-                const char* prefix = (last_valid_type <= 37 || i == -1 || i == r_natoms[last_valid_type]) ? "ATOM  " : "HETATM";
+                const char* prefix = (last_valid_type < 0x80 || i == -1 || i == -2) ? "ATOM  " : "HETATM";
                 
                 if (af_mode) {
                     int len = snprintf(tbuf, 128, "%s%5d %-4s%c%3s%c%c%4d%c   %8.3f%8.3f%8.3f  1.00%6.2f          %2s  ",
@@ -516,7 +554,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
 
             if (alt_flag == 0) {
                 atoms_left--;
-                atom_dict_idx++;
+                if (i >= 0) atom_dict_idx++;
                 parsed_base_atoms++;
                 active_alt_char = 'A';
             }

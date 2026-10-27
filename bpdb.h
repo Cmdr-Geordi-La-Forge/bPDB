@@ -17,10 +17,12 @@
 #define META_HELIX      0x0008
 #define META_SHEET      0x0009
 #define META_SITE       0x000A
+#define META_HYDROGENS  0x000B
 
 #define NUM_DICT_RES    38
 
 typedef struct {
+  uint8_t type_id;
   char resName[4];
   int num_atoms;
   char atom_names[32][5];
@@ -34,7 +36,6 @@ typedef struct {
   char elements[256][3];
 } UniDict;
 
-// 8-byte structural anchor
 typedef struct {
   char resName[4];
   char chain;

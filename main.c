@@ -73,6 +73,7 @@ void stat_bpdb(const char* filepath) {
     if (mask & (1ULL << 8)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
     if (mask & (1ULL << 9)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
     if (mask & (1ULL << 10)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+    if (mask & (1ULL << 11)) { dict_scan_off += 8; }
 
     printf("Metadata Block (TLV) : %zu bytes (Sections: %d)\n", dict_scan_off - offset + 8, num_meta);
     offset = dict_scan_off;
@@ -97,21 +98,18 @@ void stat_bpdb(const char* filepath) {
         }
         chains++;
         uint16_t num_atoms = *(uint16_t*)(buffer + offset + 2);
-        char c2_raw = buffer[offset + 5];
-        int has_op3 = (c2_raw & 0x80) != 0;
-        int has_oxt = (c2_raw & 0x40) != 0;
         offset += 8;
 
         int seq_bytes = 0; uint32_t expected_atoms = 0;
-        if (has_op3) expected_atoms++;
-        if (has_oxt) expected_atoms++;
 
         const uint8_t* seq_ptr = buffer + offset;
         for (uint32_t r = 0; r < num_residues; r++) {
             uint8_t type = seq_ptr[seq_bytes++];
             if (type == 0x7C) {
                 seq_bytes++;
-            } else if (type != 0x00 && type != 0x7F && type != 0x7E && type != 0x7D) {
+            } else if (type == 0x7E || type == 0x7D) {
+                expected_atoms++;
+            } else if (type != 0x00 && type != 0x7F) {
                 expected_atoms += r_natoms[type & 0xFF];
                 total_residues++;
             }
@@ -125,11 +123,9 @@ void stat_bpdb(const char* filepath) {
         int atoms_left = 0; uint32_t parsed_base_atoms = 0;
         int s_idx = 0; uint8_t last_valid_type = 0;
         
-        if (has_op3) { atoms_left = 1; last_valid_type = seq_ptr[0] & 0xFF; }
-
         for (uint32_t a = 0; a < num_atoms; a++) {
             if (atoms_left == 0) {
-                if (parsed_base_atoms < expected_atoms - (has_oxt ? 1 : 0) - (has_op3 ? 1 : 0)) {
+                if (parsed_base_atoms < expected_atoms) {
                     uint8_t meta; int current_has_5p = 0, current_has_3p = 0;
                     do {
                         if (s_idx >= seq_bytes) break;
@@ -145,8 +141,6 @@ void stat_bpdb(const char* filepath) {
                     } else {
                         atoms_left = 1; 
                     }
-                } else if (has_oxt && parsed_base_atoms == expected_atoms - 1) {
-                    atoms_left = 1;
                 } else {
                     atoms_left = 1;
                 }

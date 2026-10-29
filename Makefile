@@ -1,5 +1,6 @@
 CC = gcc
-CFLAGS = -O3 -Wall -Wextra -march=native -flto
+CFLAGS = -O3 -Wall -Wextra -march=native -flto -falign-loops=32
+# CFLAGS = -g -O0 -Wall -Wextra
 
 .PHONY: all clean
 

@@ -157,7 +157,7 @@
                                                        (list :wild-inferiors))
                                     :name :wild :type "pdb")))
       
-      (setf *random-state* (sb-ext:seed-random-state 42))
+      (setf *random-state* (sb-ext:seed-random-state 1238))
       
       (with-open-file (log-stream "test_results.log" :direction :output 
                                   :if-exists :supersede :if-does-not-exist :create)

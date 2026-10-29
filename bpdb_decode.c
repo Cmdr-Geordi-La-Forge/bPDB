@@ -190,6 +190,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
     if (mask & (1ULL << 8)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
     if (mask & (1ULL << 9)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
     if (mask & (1ULL << 10)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+    if (mask & (1ULL << 11)) { dict_scan_off += 8; }
 
     offset = dict_scan_off;
 
@@ -249,6 +250,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
     const uint8_t* p_helices = NULL; uint64_t num_helices = 0;
     const uint8_t* p_sheets = NULL;  uint64_t num_sheets = 0;
     const uint8_t* p_sites = NULL;   uint64_t len_sites = 0;
+    uint32_t num_models = 1;
 
     UniDict* UDICT = (UniDict*)malloc(256 * sizeof(UniDict));
     for (int i = 0; i < NUM_DICT_RES; i++) {
@@ -280,12 +282,14 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
     if (mask & (1ULL << 8)) { uint64_t L = *(uint64_t*)(buffer + offset); offset += 8; p_ssbonds = buffer + offset; num_ssbonds = L / sizeof(MetaSSBond); offset += L; offset += (8 - (L % 8)) % 8; }
     if (mask & (1ULL << 9)) { uint64_t L = *(uint64_t*)(buffer + offset); offset += 8; p_cispeps = buffer + offset; num_cispeps = L / sizeof(MetaCispep); offset += L; offset += (8 - (L % 8)) % 8; }
     if (mask & (1ULL << 10)) { uint64_t L = *(uint64_t*)(buffer + offset); offset += 8; p_sites = buffer + offset; len_sites = L; offset += L; offset += (8 - (L % 8)) % 8; }
+    if (mask & (1ULL << 11)) { num_models = *(uint32_t*)(buffer + offset); offset += 8; }
 
     size_t out_lines = 1;
     if (title_len > 0) out_lines += (title_len + 69) / 70;
     if (expdta_len > 0) out_lines++;
     if (resolution > 0.0f) out_lines += 2;
     if (strlen(p_program) > 0) out_lines += 3;
+    if (num_models > 1) out_lines += num_models;
     out_lines += num_helices + num_sheets + num_ssbonds + num_cispeps;
     
     size_t scan_off = offset, conect_offset = 0;
@@ -389,13 +393,23 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
         }
     }
 
-    int atom_serial = 1; int model_count = 1;
+    int atom_serial = 1; 
+    uint32_t current_model = 1;
+    if (num_models > 1) {
+        int len = snprintf(tbuf, 128, "MODEL     %4d", current_model++);
+        memcpy(w_ptr, tbuf, len); w_ptr += 81;
+    }
+
     int has_anchor = 0;
     while (offset < size) {
         uint16_t num_residues = *(uint16_t*)(buffer + offset);
         if (num_residues == 0xFFFE) { 
             memcpy(w_ptr, "ENDMDL                                                                          ", 80); w_ptr += 81;
-            offset += 2; atom_serial = 1; model_count++; 
+            if (num_models > 1 && current_model <= num_models) {
+                int len = snprintf(tbuf, 128, "MODEL     %4d", current_model++);
+                memcpy(w_ptr, tbuf, len); w_ptr += 81;
+            }
+            offset += 2; atom_serial = 1;  
             continue; 
         }
         if (num_residues == 0xFFFF) { break; }
@@ -404,10 +418,8 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
         char c1_raw = buffer[offset + 4];
         char c2_raw = buffer[offset + 5]; 
         char c1 = c1_raw & 0x7F;
-        char c2 = c2_raw & 0x3F;
+        char c2 = c2_raw;
         int has_ter = (c1_raw & 0x80) != 0;
-        int has_op3 = (c2_raw & 0x80) != 0;
-        int has_oxt = (c2_raw & 0x40) != 0;
         if (c1 == 0) c1 = ' '; 
         if (c2 == 0) c2 = ' ';
         int16_t start_resSeq = *(int16_t*)(buffer + offset + 6);
@@ -416,14 +428,13 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
         const uint8_t* seq_ptr = buffer + offset;
         int seq_bytes = 0; uint32_t expected_atoms = 0;
         
-        if (has_op3) expected_atoms++;
-        if (has_oxt) expected_atoms++;
-        
         for (uint32_t r = 0; r < num_residues; r++) { 
             uint8_t type = seq_ptr[seq_bytes++];
             if (type == 0x7C) {
                 seq_bytes++;
-            } else if (type != 0x00 && type != 0x7F && type != 0x7E && type != 0x7D) {
+            } else if (type == 0x7E || type == 0x7D) {
+                expected_atoms++;
+            } else if (type != 0x00 && type != 0x7F) {
                 expected_atoms += r_natoms[type & 0xFF];
             }
         }
@@ -457,8 +468,6 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
         int s_idx = 0;
         int no_inc = 0;
         
-        if (has_op3) { atoms_left = 1; atom_dict_idx = -1; last_valid_type = seq_ptr[0] & 0xFF; }
-
         for (uint32_t block_idx = 0; block_idx < num_atoms; block_idx++) {
             if (atom_serial > 99999) atom_serial = 0;
             
@@ -467,8 +476,9 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
                     accum = anchor_accum;
                     has_anchor = 0;
                 }
-                if (parsed_base_atoms < expected_atoms - (has_oxt ? 1 : 0) - (has_op3 ? 1 : 0)) {
+                if (parsed_base_atoms < expected_atoms) {
                     uint8_t meta; int current_has_5p = 0, current_has_3p = 0;
+                    iCode = ' ';
                     do {
                         if (s_idx >= seq_bytes) break;
                         meta = seq_ptr[s_idx++];
@@ -489,9 +499,6 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
                     } else {
                         atoms_left = 1; 
                     }
-                } else if (has_oxt && parsed_base_atoms == expected_atoms - 1) {
-                    atoms_left = 1;
-                    atom_dict_idx = -2;
                 } else {
                     atoms_left = 1;
                 }
@@ -500,6 +507,10 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
 
             int i = atom_dict_idx;
             int alt_flag = 0;
+            
+            if (i == r_natoms[last_valid_type] && has_anchor && active_alt_char == 'A') {
+                accum = anchor_accum;
+            }
             
             if (*(uint64_t*)atom_ptr != 0) {
                 int32_t v_b;
@@ -522,7 +533,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
                 
                 if (i == -1) {
                     a_name = " OP3"; e_name = " O";
-                } else if (i == -2) {
+                } else if (i == -2 || i == r_natoms[last_valid_type]) {
                     a_name = " OXT"; e_name = " O";
                 } else if (i >= 0 && i < r_natoms[last_valid_type]) {
                     a_name = UDICT[last_valid_type].atom_names[i];
@@ -531,7 +542,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
                     a_name = " UNK"; e_name = " X"; 
                 }
 
-                const char* prefix = (last_valid_type < 0x80 || i == -1 || i == -2) ? "ATOM  " : "HETATM";
+                const char* prefix = (last_valid_type < 0x80 || i == -1 || i == -2 || i == r_natoms[last_valid_type]) ? "ATOM  " : "HETATM";
                 
                 if (af_mode) {
                     int len = snprintf(tbuf, 128, "%s%5d %-4s%c%3s%c%c%4d%c   %8.3f%8.3f%8.3f  1.00%6.2f          %2s  ",
@@ -554,7 +565,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out) {
 
             if (alt_flag == 0) {
                 atoms_left--;
-                if (i >= 0) atom_dict_idx++;
+                atom_dict_idx++;
                 parsed_base_atoms++;
                 active_alt_char = 'A';
             }

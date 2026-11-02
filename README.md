@@ -1,10 +1,8 @@
-# Binary PDB (bPDB) Format Specification (V5)
+# Binary PDB (bPDB) Format Specification (V6)
 
-The bPDB V5 architecture utilizes a Data-Oriented (SoA), completely unmasked coordinate atom stream. It achieves extreme compression and zero-shift SIMD parsing speeds by employing native 16-bit signed integer deltas, perfectly interleaved 16-byte New Anchor blocks, and an unbroken geometric running sum across the entire chain.
+The bPDB V6 architecture utilizes a Data-Oriented (SoA), completely unmasked coordinate atom stream. It achieves extreme compression and zero-shift SIMD parsing speeds by employing native 16-bit signed integer deltas, perfectly interleaved 16-byte New Anchor blocks, and an unbroken geometric running sum across the entire chain. Models are isolated into independent files to support concurrent streaming.
 
 Every structure and section in the format is strictly **8-byte aligned**.
-
----
 
 ## 1. File Architecture Overview
 
@@ -14,24 +12,24 @@ A valid bPDB file consists of four sequential sections:
 3. **Chain Clusters** (Repeated: Header -> Bytecode Sequence -> Coordinate Stream)
 4. **CONECT Stream** (Flat 32-bit integer array to EOF)
 
----
-
 ## 2. Global Header & Metadata
 
 ### 2.1 Fixed Global Header (64 Bytes)
-| Offset | Type       | Description                                                  |
-|:-------|:-----------|:-------------------------------------------------------------|
-| `+0`   | `char[4]`  | Magic String: `"bPDB"`                                       |
-| `+4`   | `uint8`    | Format Version (`0x05`)                                      |
-| `+5`   | `uint8`    | Deposition Day (1-31)                                        |
-| `+6`   | `uint8`    | Deposition Month (1-12)                                      |
-| `+7`   | `uint8`    | Deposition Year (`YYYY - 1973`)                              |
-| `+8`   | `char[16]` | `pdbID` (null-padded)                                        |
-| `+24`  | `char[40]` | `classification` (HEADER classification string, null-padded) |
+| Offset | Type       | Description                                                   |
+|:-------|:-----------|:--------------------------------------------------------------|
+| `+0`   | `char[4]`  | Magic String: `"bPDB"`                                        |
+| `+4`   | `uint8`    | Format Version (`0x06`)                                       |
+| `+5`   | `uint8`    | Deposition Day (1-31)                                         |
+| `+6`   | `uint8`    | Deposition Month (1-12)                                       |
+| `+7`   | `uint8`    | Deposition Year (`YYYY - 1973`)                               |
+| `+8`   | `char[12]` | `pdbID` (null-padded, stripped of AF DB prefixes/suffixes)    |
+| `+20`  | `uint16`   | `total_models_minus_1` (0 indicates a single-model structure) |
+| `+22`  | `uint16`   | `current_model_minus_1` (0 indicates the first model)         |
+| `+24`  | `char[40]` | `classification` (HEADER classification string, null-padded)  |
 
 ### 2.2 Global 64-bit Metadata Bitmask
 Immediately following the 64-byte fixed header is a single 8-byte (`uint64_t`) metadata header.
-*   **Bits 0-7:** File version duplicate (`0x05`).
+*   **Bits 0-7:** File version duplicate (`0x06`).
 *   **Bits 16-63:** The 48-bit Metadata Presence Mask.
 
 The decoder reads this mask to determine exactly which metadata payloads follow. Payloads are written in bit-sequential order, heavily padded to 8-byte boundaries:
@@ -44,8 +42,6 @@ The decoder reads this mask to determine exactly which metadata payloads follow.
 *   **Bit 5 (`HET_DICT`):** `uint64_t` dict_length + `uint8_t` custom_count + inline dictionary definitions + padding.
 *   **Bits 6-10:** Binary arrays for `HELIX`, `SHEET`, `SSBOND`, `CISPEP`, and `SITE`. Each starts with an 8-byte `length` followed by raw `struct` dumps, aligned to 8 bytes.
 
----
-
 ## 3. The Chain Clusters
 
 Coordinates are organized into sequential "Chains." Each chain declares its topology and length up front, followed by an unbroken stream of atom blocks.
@@ -53,7 +49,7 @@ Coordinates are organized into sequential "Chains." Each chain declares its topo
 ### 3.1 Chain Header (8 Bytes)
 | Offset | Type     | Description                                                                                                                                     |
 |:-------|:---------|:------------------------------------------------------------------------------------------------------------------------------------------------|
-| `+0`   | `uint16` | **num_residues**: Number of 1-byte links in the Sequence Track. (`0xFFFF` signals EOF).                                                         |
+| `+0`   | `uint16` | **num_residues**: Number of 1-byte links in the Sequence Track. `0xFFFF` signals EOF, `0xFFFE` signals a fragment boundary.                     |
 | `+2`   | `uint16` | **num_atoms**: Total number of spatial atoms in the stream.                                                                                     |
 | `+4`   | `uint8`  | **chain_id 1 & TER flag**: Bits `0-6` encode the 7-bit ASCII chain char. **Bit 7 (`0x80`) is the `TER` flag** (`1` = Print `TER` at chain end). |
 | `+5`   | `char`   | **chain_id 2**: Second chain character (if any, else space).                                                                                    |
@@ -72,14 +68,12 @@ A 1-dimensional array of `uint8_t` immediately following the Chain Header. The d
 
 *(The Sequence Track is padded with `0x00` to the nearest 8-byte boundary).*
 
----
-
 ## 4. Coordinate Atom Track (Zero-Shift SIMD Array)
 
 To achieve native SIMD load speeds, standard atom coordinates no longer use per-lane bit-packing. Math operations execute natively on perfectly aligned signed 16-bit integers. Properties like Occupancy, Charge, and Alternate Locations are evaluated natively, and explicitly written into the stream via an interleaved 16-byte New Anchor Block only when necessary.
 
 ### 4.1 Unbroken Difference Accumulation (`Control == 0`)
-A standard 8-byte block handles native intra-chain coordinate deltas up to **$\pm 32.767$ Å** (scaled by 1000). The accumulator is a pure unbroken running sum, ignoring residue boundaries entirely. Standard blocks natively imply a sparse charge of `0`.
+A standard 8-byte block handles native intra-chain coordinate deltas up to **± 32.767 Å** (scaled by 1000). The accumulator is a pure unbroken running sum, ignoring residue boundaries entirely. Standard blocks natively imply a sparse charge of `0`.
 
 | Bytes | Type       | Description                                                                                                |
 |:------|:-----------|:-----------------------------------------------------------------------------------------------------------|
@@ -89,11 +83,11 @@ A standard 8-byte block handles native intra-chain coordinate deltas up to **$\p
 | `6-7` | `int16_t`  | $\Delta Z$ relative to previous atom.                                                                      |
 
 ### 4.2 Absolute New Anchors & Sparse Charge (`Control == 1`)
-If a spatial jump exceeds $\pm 32.767$ Å (chain gaps, isolated HETATMs, waters), OR if the implicit atom states (Occupancy or physical Charge) change, the stream emits a 16-byte absolute New Anchor. 
+If a spatial jump exceeds ± 32.767 Å (chain gaps, isolated HETATMs, waters), OR if the implicit atom states (Occupancy or physical Charge) change, the stream emits a 16-byte absolute New Anchor.
 
 Because ~99% of biological atoms are uncharged, charge is not a persistent state variable. If an atom has a non-zero charge, it is forced to use a New Anchor. The immediate next standard block intrinsically drops the charge back to 0 without requiring another jump.
 
-This leverages 31-bit native geometry via direct memory concatenation: The Base block MSBs combine perfectly with the 16-bit LSBs from the immediate next Atom block to stably construct absolute coordinates up to **$\pm 8,388.6$ Å** using native pointer loading. A 3-bit charge (-3 to +4) is compressed into the lowest bit of each coordinate MSB byte.
+This leverages 31-bit native geometry via direct memory concatenation: The Base block MSBs combine perfectly with the 16-bit LSBs from the immediate next Atom block to stably construct absolute coordinates up to **± 8,388.6 Å** using native pointer loading. A 3-bit charge (-3 to +4) is compressed into the lowest bit of each coordinate MSB byte.
 
 **1. The Base Jump Block (8 Bytes, `Control == 1`)**
 Appears first. Contains perfectly interleaved 15-bit MSBs and sparse charge encoding.
@@ -116,15 +110,15 @@ Explicit alternate location characters (`0x7F DUP` flags) are completely removed
 ### 4.4 Terminal OXT Inference
 There is no `OXT` instruction in the sequence bytecode. Upon sequence track exhaustion, the decoder processes the final remaining atoms in the chain dynamically as the terminal `OXT` atoms.
 
----
-
 ## 5. End of File & Connectivity
 
-### 5.1 EOF Marker
-The coordinate stream ends when a Chain Header presents a `num_residues` value of `0xFFFF`.
+### 5.1 Fragment Boundary & End of Model Markers
+The coordinate stream incorporates topological opcode boundaries injected directly into the `num_residues` parameter of the Chain Header:
+*   **Fragment Boundary (`0xFFFE`):** Indicates a seamless transition between split input files (e.g., AF-DB fragments). The decoder ignores this boundary, skipping 8 bytes to continue the geometric stream without breaking the structure output.
+*   **End of Model (`0xFFFF`):** Indicates the absolute end of the spatial coordinate stream for the current model, triggering the decoder to break the coordinate loop.
 
 ### 5.2 CONECT Stream
-Following the EOF marker is a flat array of 32-bit integers representing atomic linkages.
+Following the `0xFFFF` EOF marker is a flat array of 32-bit integers representing atomic linkages.
 1. `int32_t N` (Number of target atoms)
 2. `int32_t source_atom_id`
 3. $N$ sequential `int32_t target_atom_ids`

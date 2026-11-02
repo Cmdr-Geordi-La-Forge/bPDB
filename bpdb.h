@@ -101,6 +101,6 @@ int parse_month(const char* m);
 void trim_string(char* str);
 
 void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb);
-void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out);
+void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_model, int is_last_model);
 
 #endif // BPDB_H

@@ -4,9 +4,6 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define CTRL_TER        0x04
-#define CTRL_TER_OXT    0x08
-
 #define META_TITLE      0x0001
 #define META_HET_DICT   0x0002
 #define META_EXPDTA     0x0003
@@ -19,14 +16,12 @@
 #define META_SITE       0x000A
 #define META_HYDROGENS  0x000B
 
-#define NUM_DICT_RES    38
-
 typedef struct {
   uint8_t type_id;
   char resName[4];
   int num_atoms;
-  char atom_names[32][5];
-  char elements[32][3];
+  char atom_names[64][5];
+  char elements[64][3];
 } ResidueDict;
 
 typedef struct {
@@ -44,12 +39,12 @@ typedef struct {
 } PdbResId;
 
 typedef struct {
-    PdbResId res1;
-    PdbResId res2;
-    char sym1[8];
-    char sym2[8];
-    float length;
-    uint32_t pad;
+  PdbResId res1;
+  PdbResId res2;
+  char sym1[8];
+  char sym2[8];
+  float length;
+  uint32_t pad;
 } MetaSSBond;
 
 typedef struct {
@@ -84,7 +79,9 @@ typedef struct {
   uint32_t num_res;
 } MetaSiteHeader;
 
-extern const ResidueDict DICT[NUM_DICT_RES];
+extern const ResidueDict DICT[];
+extern const ResidueDict DICT_H[];
+extern const size_t NUM_DICT_RES;
 extern const char* MONTHS[];
 
 typedef struct {

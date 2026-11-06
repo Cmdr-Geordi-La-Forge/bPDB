@@ -126,6 +126,7 @@ static inline void encode_alt_array(ChainBuilder* cb, AltArray* arr, int force_j
   }
 }
 
+// Replace flush_residue entirely with this updated version
 void flush_residue(ChainBuilder* cb, EncoderState* st, UniDict* UDICT) {
   if (st->type <= 0) return;
   if (cb->num_residues == 0) cb->start_resSeq = st->resSeq;
@@ -139,49 +140,59 @@ void flush_residue(ChainBuilder* cb, EncoderState* st, UniDict* UDICT) {
     }
   }
 
-  if (st->has_op3) { cb->seq_track[cb->seq_bytes++] = 0x7E; cb->num_residues++; }
-  if (st->has_oxt) { cb->seq_track[cb->seq_bytes++] = 0x7D; cb->num_residues++; }
-
   if (st->iCode != ' ' && st->iCode != 0) {
     cb->seq_track[cb->seq_bytes++] = 0x7C;
     cb->seq_track[cb->seq_bytes++] = st->iCode;
     cb->num_residues++;
   }
 
-  cb->seq_track[cb->seq_bytes++] = st->type;
+  uint8_t enc_type = st->type;
+  if (st->type < 0x20 && st->has_op3) enc_type += 0x10;
+  if (st->type >= 0x20 && st->type < 0x40 && st->has_oxt) enc_type += 0x20;
+
+  cb->seq_track[cb->seq_bytes++] = enc_type;
   cb->num_residues++;
-  int is_hetatm = (st->type >= 0x80);
-  if (st->has_op3) encode_alt_array(cb, &st->op3, 0);
+  
+  int is_hetatm = (enc_type >= 0x80);
 
-  for (int i = 0; i < UDICT[st->type].num_atoms; i++) {
-    if (!st->present[i] || st->atoms[i].count == 0) {
-      memset(&cb->atom_track[cb->atom_bytes], 0, 8);
-      cb->atom_bytes += 8; cb->num_atoms++;
-      continue;
-    }
-    encode_alt_array(cb, &st->atoms[i], (is_hetatm && i == 0));
-  }
-
-  if (st->type < 0x80) {
-    int anchor_idx = (st->type < 0x40) ? 2 : 8;
-    if (st->present[anchor_idx] && st->atoms[anchor_idx].count > 0) {
-      cb->current_x = st->atoms[anchor_idx].x[0];
-      cb->current_y = st->atoms[anchor_idx].y[0];
-      cb->current_z = st->atoms[anchor_idx].z[0];
-    }
-  }
-
-  if (st->has_oxt) {
-    encode_alt_array(cb, &st->oxt, 0);
-    if (st->type < 0x80) {
-      int anchor_idx = (st->type < 0x40) ? 2 : 8;
-      if (st->present[anchor_idx] && st->atoms[anchor_idx].count > 0) {
-        cb->current_x = st->atoms[anchor_idx].x[0];
-        cb->current_y = st->atoms[anchor_idx].y[0];
-        cb->current_z = st->atoms[anchor_idx].z[0];
+  for (int i = 0; i < UDICT[enc_type].num_atoms; i++) {
+    if (strncmp(UDICT[enc_type].atom_names[i], " OXT", 4) == 0 && st->has_oxt) {
+      encode_alt_array(cb, &st->oxt, 0);
+    } else if (strncmp(UDICT[enc_type].atom_names[i], " OP3", 4) == 0 && st->has_op3) {
+      encode_alt_array(cb, &st->op3, 0);
+    } else {
+      int base_idx = -1;
+      for(int b=0; b<UDICT[st->type].num_atoms; b++) {
+        if (strncmp(UDICT[enc_type].atom_names[i], UDICT[st->type].atom_names[b], 4) == 0) {
+          base_idx = b; break;
+        }
+      }
+      if (base_idx != -1 && st->present[base_idx] && st->atoms[base_idx].count > 0) {
+        encode_alt_array(cb, &st->atoms[base_idx], (is_hetatm && i == 0));
+      } else {
+        memset(&cb->atom_track[cb->atom_bytes], 0, 8);
+        cb->atom_bytes += 8; cb->num_atoms++;
       }
     }
   }
+
+  if (enc_type < 0x80) {
+    int anchor_idx = (enc_type >= 0x20 && enc_type < 0x60) ? 2 : 8;
+    if (anchor_idx < UDICT[enc_type].num_atoms) {
+      int base_idx = -1;
+      for(int b=0; b<UDICT[st->type].num_atoms; b++) {
+        if (strncmp(UDICT[enc_type].atom_names[anchor_idx], UDICT[st->type].atom_names[b], 4) == 0) {
+          base_idx = b; break;
+        }
+      }
+      if (base_idx != -1 && st->present[base_idx] && st->atoms[base_idx].count > 0) {
+        cb->current_x = st->atoms[base_idx].x[0];
+        cb->current_y = st->atoms[base_idx].y[0];
+        cb->current_z = st->atoms[base_idx].z[0];
+      }
+    }
+  }
+
   cb->last_resSeq = st->resSeq; cb->last_iCode = st->iCode;
 }
 
@@ -231,7 +242,7 @@ static void save_model_file(const char* base_out, uint16_t total_m1, uint16_t cu
 void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
   UniDict* UDICT = (UniDict*)calloc(256, sizeof(UniDict));
   int custom_het_idx = 0x81;
-  for (int i = 0; i < NUM_DICT_RES; i++) {
+  for (size_t i = 0; i < NUM_DICT_RES; i++) {
     uint8_t tid = DICT[i].type_id;
     strcpy(UDICT[tid].resName, DICT[i].resName);
     UDICT[tid].num_atoms = DICT[i].num_atoms;

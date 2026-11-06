@@ -48,7 +48,7 @@ void stat_bpdb(const char* filepath) {
   static uint8_t base_natoms[256] = {0};
   static int dict_init = 0;
   if (!dict_init) {
-    for (int i = 0; i < NUM_DICT_RES; i++) base_natoms[DICT[i].type_id] = DICT[i].num_atoms;
+    for (size_t i = 0; i < NUM_DICT_RES; i++) base_natoms[DICT[i].type_id] = DICT[i].num_atoms;
     dict_init = 1;
   }
 
@@ -111,8 +111,6 @@ void stat_bpdb(const char* filepath) {
       uint8_t type = seq_ptr[seq_bytes++];
       if (type == 0x7C) {
         seq_bytes++;
-      } else if (type == 0x7E || type == 0x7D) {
-        expected_atoms++;
       } else if (type != 0x00 && type != 0x7F) {
         expected_atoms += r_natoms[type & 0xFF];
         total_residues++;

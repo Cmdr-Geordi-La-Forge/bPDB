@@ -162,7 +162,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
   static uint8_t base_natoms[256] = {0};
   static int dict_init = 0;
   if (!dict_init) {
-    for (int i = 0; i < NUM_DICT_RES; i++) base_natoms[DICT[i].type_id] = DICT[i].num_atoms;
+    for (size_t i = 0; i < NUM_DICT_RES; i++) base_natoms[DICT[i].type_id] = DICT[i].num_atoms;
     dict_init = 1;
   }
 
@@ -208,7 +208,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
       for (uint32_t r = 0; r < num_residues; r++) {
         if (seq_ptr[seq_bytes++] == 0x7C) seq_bytes++;
       }
-
+      
       offset += seq_bytes + ((8 - (seq_bytes & 7)) & 7);
       const uint8_t* atom_ptr = buffer + offset;
 
@@ -253,7 +253,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
   const uint8_t* p_sites = NULL;   uint64_t len_sites = 0;
 
   UniDict* UDICT = (UniDict*)malloc(256 * sizeof(UniDict));
-  for (int i = 0; i < NUM_DICT_RES; i++) {
+  for (size_t i = 0; i < NUM_DICT_RES; i++) {
     uint8_t tid = DICT[i].type_id;
     strcpy(UDICT[tid].resName, DICT[i].resName); UDICT[tid].num_atoms = DICT[i].num_atoms;
     for (int a = 0; a < DICT[i].num_atoms; a++) { strcpy(UDICT[tid].atom_names[a], DICT[i].atom_names[a]); strcpy(UDICT[tid].elements[a], DICT[i].elements[a]); }
@@ -432,8 +432,6 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
       uint8_t type = seq_ptr[seq_bytes++];
       if (type == 0x7C) {
         seq_bytes++;
-      } else if (type == 0x7E || type == 0x7D) {
-        expected_atoms++;
       } else if (type != 0x00 && type != 0x7F) {
         expected_atoms += r_natoms[type & 0xFF];
       }
@@ -477,25 +475,23 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
           has_anchor = 0;
         }
         if (parsed_base_atoms < expected_atoms) {
-          uint8_t meta; int current_has_5p = 0, current_has_3p = 0;
+          uint8_t meta; 
           iCode = ' ';
           do {
             if (s_idx >= seq_bytes) break;
             meta = seq_ptr[s_idx++];
             if (meta == 0x00) { current_resSeq++; first_res = 0; no_inc = 0; }
             else if (meta == 0x7F) { no_inc = 1; }
-            else if (meta == 0x7E) { current_has_5p = 1; }
-            else if (meta == 0x7D) { current_has_3p = 1; }
             else if (meta == 0x7C) { iCode = seq_ptr[s_idx++]; }
-          } while (meta == 0x00 || meta == 0x7F || meta == 0x7E || meta == 0x7D || meta == 0x7C);
+          } while (meta == 0x00 || meta == 0x7F || meta == 0x7C);
 
           if (s_idx <= seq_bytes) {
             last_valid_type = meta & 0xFF;
             if (!first_res && !no_inc) current_resSeq++;
             first_res = 0;
             no_inc = 0;
-            atoms_left = r_natoms[last_valid_type] + current_has_5p + current_has_3p;
-            atom_dict_idx = current_has_5p ? -1 : 0;
+            atoms_left = r_natoms[last_valid_type];
+            atom_dict_idx = 0;
           } else {
             atoms_left = 1;
           }
@@ -506,17 +502,15 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
       }
 
       int i = atom_dict_idx;
+      // Inside decode_bpdb, around line 390 (The main atom decoding logic):
       int alt_flag = 0;
-
-      if (i == r_natoms[last_valid_type] && has_anchor && active_alt_char == 'A') {
-        accum = anchor_accum;
-      }
 
       if (*(uint64_t*)atom_ptr != 0) {
         int32_t v_b;
         SIMD_DECODE_MACRO(atom_ptr, accum, current_occ, current_charge, v_b, alt_flag);
 
-        if ((last_valid_type < 0x40 && i == 2) || (last_valid_type >= 0x40 && last_valid_type < 0x80 && i == 8)) {
+        int anchor_idx = (last_valid_type >= 0x20 && last_valid_type < 0x60) ? 2 : 8;
+        if (last_valid_type < 0x80 && i == anchor_idx) {
           if (active_alt_char == 'A') {
             anchor_accum = accum;
             has_anchor = 1;
@@ -531,18 +525,14 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
         const char* a_name;
         const char* e_name;
 
-        if (i == -1) {
-          a_name = " OP3"; e_name = " O";
-        } else if (i == -2 || i == r_natoms[last_valid_type]) {
-          a_name = " OXT"; e_name = " O";
-        } else if (i >= 0 && i < r_natoms[last_valid_type]) {
+        if (i >= 0 && i < r_natoms[last_valid_type]) {
           a_name = UDICT[last_valid_type].atom_names[i];
           e_name = UDICT[last_valid_type].elements[i];
         } else {
           a_name = " UNK"; e_name = " X";
         }
 
-        const char* prefix = (last_valid_type < 0x80 || i == -1 || i == -2 || i == r_natoms[last_valid_type]) ? "ATOM  " : "HETATM";
+        const char* prefix = (last_valid_type < 0x80) ? "ATOM  " : "HETATM";
 
         if (af_mode) {
           int len = snprintf(tbuf, 128, "%s%5d %-4s%c%3s%c%c%4d%c   %8.3f%8.3f%8.3f  1.00%6.2f          %2s  ",

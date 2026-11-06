@@ -56,14 +56,15 @@ Coordinates are organized into sequential "Chains." Each chain declares its topo
 | `+6`   | `uint16` | **start_resSeq**: The starting Residue Sequence Number.                                                                                         |
 
 ### 3.2 Sequence Track (Bytecode Machine)
-A 1-dimensional array of `uint8_t` immediately following the Chain Header. The dictionary operates on a **1-based index**.
-
+A 1-dimensional array of `uint8_t` immediately following the Chain Header. The dictionary memory map naturally dictates the presence of terminal atoms.
 *   **`0x00` (GAP):** Indicates a missing residue. Increments `resSeq` by 1. Parses no atoms.
-*   **`0x7D` (OXT):** Modifies the next residue to explicitly inject a 3' terminal `OXT` atom from the dictionary.
-*   **`0x7E` (OP3):** Modifies the next residue to explicitly inject a 5' terminal `OP3` atom from the dictionary.
-*   **Bits 0-6 (Type ID):** Encodes Valid Residues (1 to 126):
-    *   `1-37`: Standard Amino/Nucleic Acids.
-    *   `38+`: Special termini (`NH2`) and Custom `HET_DICT` molecules.
+*   **Bits 0-6 (Type ID):** Encodes Valid Residues:
+    *   `0x00-0x0F`: Standard Nucleic Acids.
+    *   `0x10-0x1F`: Nucleic Acids + explicitly included `OP3` terminal atom.
+    *   `0x20-0x3F`: Standard Amino Acids.
+    *   `0x40-0x5F`: Amino Acids + explicitly included `OXT` terminal atom.
+    *   `0x60-0x7F`: Solvents.
+    *   `0x80+`: Custom `HET_DICT` molecules.
 *   **Bit 7 (`0x80` - iCode Flag):** If set, the *immediately following byte* in the array is an ASCII Insertion Code character (e.g., `'A'`).
 
 *(The Sequence Track is padded with `0x00` to the nearest 8-byte boundary).*

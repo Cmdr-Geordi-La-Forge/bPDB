@@ -41,6 +41,7 @@ The decoder reads this mask to determine exactly which metadata payloads follow.
 *   **Bit 4 (`PROGRAM`):** `uint64_t` length + payload string + 8-byte alignment padding.
 *   **Bit 5 (`HET_DICT`):** `uint64_t` dict_length + `uint8_t` custom_count + inline dictionary definitions + padding.
 *   **Bits 6-10:** Binary arrays for `HELIX`, `SHEET`, `SSBOND`, `CISPEP`, and `SITE`. Each starts with an 8-byte `length` followed by raw `struct` dumps, aligned to 8 bytes.
+*   **Bit 11 (`HYDROGENS`):** If `1`, indicates the coordinate stream natively interleaves explicit hydrogen atoms.
 
 ## 3. The Chain Clusters
 
@@ -51,18 +52,16 @@ Coordinates are organized into sequential "Chains." Each chain declares its topo
 |:-------|:---------|:------------------------------------------------------------------------------------------------------------------------------------------------|
 | `+0`   | `uint16` | **num_residues**: Number of 1-byte links in the Sequence Track. `0xFFFF` signals EOF, `0xFFFE` signals a fragment boundary.                     |
 | `+2`   | `uint16` | **num_atoms**: Total number of spatial atoms in the stream.                                                                                     |
-| `+4`   | `uint8`  | **chain_id 1 & TER flag**: Bits `0-6` encode the 7-bit ASCII chain char. **Bit 7 (`0x80`) is the `TER` flag** (`1` = Print `TER` at chain end). |
-| `+5`   | `char`   | **chain_id 2**: Second chain character (if any, else space).                                                                                    |
-| `+6`   | `uint16` | **start_resSeq**: The starting Residue Sequence Number.                                                                                         |
+| `+4`   | `uint8`  | **chain_id 1 & N-Term flag**: Bits `0-6` encode the 7-bit ASCII chain char. **Bit 7 (`0x80`) is the `is_n_term` flag**.                         |
+| `+5`   | `uint8`  | **chain_id 2 & C-Term flag**: Bits `0-6` encode the second ASCII chain char. **Bit 7 (`0x80`) is the `is_c_term` flag**.                        |
+| `+6`   | `int16`  | **start_resSeq & TER flag**: Signed starting Residue Sequence Number shifted left by 1 bit (`resSeq << 1`). **Bit 0 (LSB) is the `TER` flag**.  |
 
 ### 3.2 Sequence Track (Bytecode Machine)
-A 1-dimensional array of `uint8_t` immediately following the Chain Header. The dictionary memory map naturally dictates the presence of terminal atoms.
+A 1-dimensional array of `uint8_t` immediately following the Chain Header. The dictionary memory map natively defines terminal bounds based on the chain header flags.
 *   **`0x00` (GAP):** Indicates a missing residue. Increments `resSeq` by 1. Parses no atoms.
-*   **Bits 0-6 (Type ID):** Encodes Valid Residues:
-    *   `0x00-0x0F`: Standard Nucleic Acids.
-    *   `0x10-0x1F`: Nucleic Acids + explicitly included `OP3` terminal atom.
-    *   `0x20-0x3F`: Standard Amino Acids.
-    *   `0x40-0x5F`: Amino Acids + explicitly included `OXT` terminal atom.
+*   **Bits 0-6 (Type ID):** Encodes Valid Residues mapped directly to the internal 256-element dictionary array:
+    *   `0x01-0x1F`: Standard Nucleic Acids.
+    *   `0x20-0x5F`: Standard Amino Acids.
     *   `0x60-0x7F`: Solvents.
     *   `0x80+`: Custom `HET_DICT` molecules.
 *   **Bit 7 (`0x80` - iCode Flag):** If set, the *immediately following byte* in the array is an ASCII Insertion Code character (e.g., `'A'`).
@@ -108,8 +107,10 @@ Immediately follows the Base Block. Contains 16-bit LSBs.
 ### 4.3 Implicit Alternate Location Engine
 Explicit alternate location characters (`0x7F DUP` flags) are completely removed from the format. The decoder relies strictly on topological grouping natively stored in the stream. The `AltLoc Presence Flag` (`bit 1` of the Atom Block) temporarily pauses the decoder's sequence dictionary iterator while natively driving an implicit alphabetical state machine (`A -> B -> C`) for infinite overlapping conformers without overhead.
 
-### 4.4 Terminal OXT Inference
-There is no `OXT` instruction in the sequence bytecode. Upon sequence track exhaustion, the decoder processes the final remaining atoms in the chain dynamically as the terminal `OXT` atoms.
+### 4.4 Split-Topology Dictionary & Hydrogen Stream
+The internal dictionary handles complex terminal variations intrinsically. Heavy atoms and hydrogen atoms are strictly partitioned into parallel data tracks (`h_atoms`, `hy_atoms`) with dedicated topological bounds (`start_norm`, `end_norm`, `end_cterm`).
+
+By referencing the `is_n_term` and `is_c_term` bits encoded directly into the Chain Header, the decoder effortlessly snaps its local dictionary iteration bounds to include or exclude terminal variants (like `H1/H2/H3`, `OXT`, `HO5'`, `OP3`) without requiring any explicit bytecodes in the sequence stream.
 
 ## 5. End of File & Connectivity
 

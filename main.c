@@ -45,15 +45,15 @@ void stat_bpdb(const char* filepath) {
     if (mask & (1ULL << i)) num_meta++;
   }
 
-  static uint8_t base_natoms[256] = {0};
+  static ResidueDict UDICT[256];
   static int dict_init = 0;
   if (!dict_init) {
-    for (size_t i = 0; i < NUM_DICT_RES; i++) base_natoms[DICT[i].type_id] = DICT[i].num_atoms;
+    memset(UDICT, 0, sizeof(UDICT));
+    for (size_t i = 0; i < NUM_DICT_RES; i++) {
+      UDICT[DICT[i].type_id] = DICT[i];
+    }
     dict_init = 1;
   }
-
-  uint8_t r_natoms[256];
-  memcpy(r_natoms, base_natoms, 256);
 
   size_t dict_scan_off = offset;
   if (mask & (1ULL << 1)) dict_scan_off += 8;
@@ -67,7 +67,9 @@ void stat_bpdb(const char* filepath) {
     size_t ptr = 1;
     for (int c = 0; c < custom_count; c++) {
       int u = 0x81 + c; ptr += 4;
-      r_natoms[u] = p_het_dict[ptr++]; ptr += r_natoms[u] * 6;
+      UDICT[u].h_end_norm = p_het_dict[ptr++];
+      UDICT[u].h_end_cterm = UDICT[u].h_end_norm;
+      ptr += UDICT[u].h_end_norm * 6;
     }
     dict_scan_off += dict_len + ((8 - (dict_len % 8)) % 8);
   }
@@ -101,18 +103,33 @@ void stat_bpdb(const char* filepath) {
       break;
     }
     chains++;
+    
+    uint8_t c1_raw = buffer[offset + 4];
+    uint8_t c2_raw = buffer[offset + 5];
+    int is_n_term = (c1_raw & 0x80) != 0;
+    int is_c_term = (c2_raw & 0x80) != 0;
+    int has_hydrogens = (mask & (1ULL << 11)) ? 1 : 0;
+    
     uint16_t num_atoms = *(uint16_t*)(buffer + offset + 2);
     offset += 8;
 
     int seq_bytes = 0; uint32_t expected_atoms = 0;
-
     const uint8_t* seq_ptr = buffer + offset;
+    int first_seen = 0;
+    
     for (uint32_t r = 0; r < num_residues; r++) {
       uint8_t type = seq_ptr[seq_bytes++];
       if (type == 0x7C) {
         seq_bytes++;
       } else if (type != 0x00 && type != 0x7F) {
-        expected_atoms += r_natoms[type & 0xFF];
+        int is_first = (!first_seen) && is_n_term;
+        int is_last  = (r == (uint32_t)(num_residues - 1)) && is_c_term;
+        first_seen = 1;
+        
+        expected_atoms += (is_last ? UDICT[type].h_end_cterm : UDICT[type].h_end_norm) - (is_first ? 0 : UDICT[type].h_start_norm);
+        if (has_hydrogens) {
+          expected_atoms += (is_last ? UDICT[type].hy_end_cterm : UDICT[type].hy_end_norm) - (is_first ? 0 : UDICT[type].hy_start_norm);
+        }
         total_residues++;
       }
     }
@@ -121,25 +138,37 @@ void stat_bpdb(const char* filepath) {
     offset += padded_seq;
 
     const uint8_t* atom_ptr = buffer + offset;
-
     int atoms_left = 0; uint32_t parsed_base_atoms = 0;
     int s_idx = 0; uint8_t last_valid_type = 0;
+    int first_decoded = 0;
 
     for (uint32_t a = 0; a < num_atoms; a++) {
       if (atoms_left == 0) {
         if (parsed_base_atoms < expected_atoms) {
-          uint8_t meta; int current_has_5p = 0, current_has_3p = 0;
+          uint8_t meta;
           do {
             if (s_idx >= seq_bytes) break;
             meta = seq_ptr[s_idx++];
-            if (meta == 0x7E) current_has_5p = 1;
-            else if (meta == 0x7D) current_has_3p = 1;
-            else if (meta == 0x7C) s_idx++;
-          } while (meta == 0x00 || meta == 0x7F || meta == 0x7E || meta == 0x7D || meta == 0x7C);
+            if (meta == 0x7C) { s_idx++; }
+          } while (meta == 0x00 || meta == 0x7F || meta == 0x7C);
 
           if (s_idx <= seq_bytes) {
             last_valid_type = meta & 0xFF;
-            atoms_left = r_natoms[last_valid_type] + current_has_5p + current_has_3p;
+            
+            int is_first = (!first_decoded) && is_n_term;
+            int is_last  = (s_idx == seq_bytes) && is_c_term;
+            first_decoded = 1;
+            
+            int h_start = is_first ? 0 : UDICT[last_valid_type].h_start_norm;
+            int h_end   = is_last  ? UDICT[last_valid_type].h_end_cterm : UDICT[last_valid_type].h_end_norm;
+            
+            int hy_start = 0, hy_end = 0;
+            if (has_hydrogens) {
+                hy_start = is_first ? 0 : UDICT[last_valid_type].hy_start_norm;
+                hy_end   = is_last  ? UDICT[last_valid_type].hy_end_cterm : UDICT[last_valid_type].hy_end_norm;
+            }
+            
+            atoms_left = (h_end - h_start) + (hy_end - hy_start);
           } else {
             atoms_left = 1;
           }
@@ -228,17 +257,23 @@ void stat_bpdb(const char* filepath) {
 
 int main(int argc, char** argv) {
   if (argc < 3) {
-    printf("Usage Encode: %s encode <in1.pdb> [in2.pdb...] <out.bpdb>\n", argv[0]);
+    printf("Usage Encode: %s encode [-h|--hydrogens] <in1.pdb> [in2.pdb...] <out.bpdb>\n", argv[0]);
     printf("Usage Test  : %s test <in1.bpdb> [in2.bpdb...] <out.pdb>\n", argv[0]);
     printf("Usage Stat  : %s stat <in.bpdb>\n", argv[0]);
     return 1;
   }
 
   if (strcmp(argv[1], "encode") == 0) {
+    int include_hydrogens = 0;
+    int file_start = 2;
+    if (strcmp(argv[2], "-h") == 0 || strcmp(argv[2], "--hydrogens") == 0) {
+      include_hydrogens = 1;
+      file_start = 3;
+    }
     const char* out_bpdb = argv[argc - 1];
-    int num_files = argc - 3;
-    const char** in_pdbs = (const char**)&argv[2];
-    encode_bpdb(num_files, in_pdbs, out_bpdb);
+    int num_files = argc - file_start - 1;
+    const char** in_pdbs = (const char**)&argv[file_start];
+    encode_bpdb(num_files, in_pdbs, out_bpdb, include_hydrogens);
     if (strcmp(out_bpdb, "-") != 0) {
       printf("[+] Encoded %d files to %s\n", num_files, out_bpdb);
     }

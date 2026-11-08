@@ -21,7 +21,10 @@
                      line)))
     (when (starts-with-p "HETATM" padded)
       (setf (subseq padded 0 6) "ATOM  "))
+    
+    ;; [RESTORED] Ignores PDB atom serials missing in original gaps
     (when (>= (length padded) 11) (setf (subseq padded 6 11) "     "))
+    
     (when (>= (length padded) 17) (setf (char padded 16) #\Space))
     (when (and (>= (length padded) 60) (char= (char padded 56) #\1))
       (setf (subseq padded 57 60) ".00"))
@@ -50,19 +53,16 @@
                  (let* ((processed (process-atom-line norm))
                         (padded (if (< (length processed) 80)
                                     (concatenate 'string processed (make-string (- 80 (length processed)) :initial-element #\Space))
-                                    processed))
-                        (name (subseq padded 12 16))
-                        (elem (trim-r (string-left-trim '(#\Space) (subseq padded 76 78)))))
-                   (unless (or (find #\H name) (string= elem "H") (string= elem "D"))
-                     (let ((key (subseq padded 21 27)))
-                       (if (string= key current-key)
-                           (push processed current-block)
-                           (progn
-                             (when current-block
-                               (push (stable-sort current-block #'string<
-                                                  :key (lambda (x) (subseq (concatenate 'string x "                    ") 12 16))) res-blocks))
-                             (setf current-key key)
-                             (setf current-block (list processed))))))))
+                                    processed)))
+                   (let ((key (subseq padded 21 27)))
+                     (if (string= key current-key)
+                         (push processed current-block)
+                         (progn
+                           (when current-block
+                             (push (stable-sort current-block #'string<
+                                                :key (lambda (x) (subseq (concatenate 'string x "                    ") 12 16))) res-blocks))
+                           (setf current-key key)
+                           (setf current-block (list processed)))))))
                 ((starts-with-p "TER   " norm)
                  (when current-block
                    (push (stable-sort current-block #'string<
@@ -100,12 +100,18 @@
   (with-input-from-string (in str)
     (normalize-stream in)))
 
-(defun compare-lists (l1 l2)
+(defun compare-lists-with-context (l1 l2 context-lines)
   (loop for x in l1
         for y in l2
         for i from 1
         unless (string= x y)
-        do (return (format nil "Mismatch at line ~D:~%Orig: '~A'~%Dec : '~A'" i x y))
+        do (let* ((start-idx (max 0 (- i context-lines 1)))
+                  (end-idx1 (min (length l1) (+ i context-lines)))
+                  (end-idx2 (min (length l2) (+ i context-lines)))
+                  (ctx-orig (subseq l1 start-idx end-idx1))
+                  (ctx-dec (subseq l2 start-idx end-idx2)))
+             (return (format nil "Mismatch at line ~D:~%~%-- Original Context --~%~{~A~%~}~%-- Decoded Context --~%~{~A~%~}"
+                             i ctx-orig ctx-dec)))
         finally (if (= (length l1) (length l2))
                     (return nil)
                     (return (format nil "Length mismatch: Original ~D lines, Decoded ~D lines." (length l1) (length l2))))))
@@ -116,7 +122,7 @@
   (let* ((orig-lines (normalize-file pdb-file))
          (tmp-base (format nil "temp_test_~A" (random 100000)))
          (tmp-bpdb (concatenate 'string tmp-base ".bpdb"))
-         (cmd-enc (format nil "~A encode ~A ~A" bpdb-bin (namestring pdb-file) tmp-bpdb)))
+         (cmd-enc (format nil "~A encode -h ~A ~A" bpdb-bin (namestring pdb-file) tmp-bpdb)))
     (uiop:run-program (list "sh" "-c" cmd-enc) :ignore-error-status t)
     (let ((decoded-str ""))
       (if (probe-file tmp-bpdb)
@@ -134,7 +140,7 @@
                 (setf decoded-str out)
                 (dolist (f files) (delete-file f))))))
       (let ((dec-lines (normalize-string decoded-str)))
-        (let ((diff (compare-lists orig-lines dec-lines)))
+        (let ((diff (compare-lists-with-context orig-lines dec-lines 5)))
           (if diff
               (values nil diff)
               (values t nil)))))))

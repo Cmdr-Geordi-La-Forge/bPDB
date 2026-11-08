@@ -19,17 +19,21 @@
 typedef struct {
   uint8_t type_id;
   char resName[4];
-  int num_atoms;
-  char atom_names[64][5];
-  char elements[64][3];
-} ResidueDict;
+  
+  // Heavy Atom Topology
+  uint8_t h_start_norm;
+  uint8_t h_end_norm;
+  uint8_t h_end_cterm;
+  char h_atoms[256][5];
+  char h_elements[256][3];
 
-typedef struct {
-  char resName[4];
-  int num_atoms;
-  char atom_names[256][5];
-  char elements[256][3];
-} UniDict;
+  // Hydrogen Topology
+  uint8_t hy_start_norm;
+  uint8_t hy_end_norm;
+  uint8_t hy_end_cterm;
+  char hy_atoms[256][5];
+  char hy_elements[256][3];
+} ResidueDict;
 
 typedef struct {
   char resName[4];
@@ -80,7 +84,6 @@ typedef struct {
 } MetaSiteHeader;
 
 extern const ResidueDict DICT[];
-extern const ResidueDict DICT_H[];
 extern const size_t NUM_DICT_RES;
 extern const char* MONTHS[];
 
@@ -97,7 +100,7 @@ void stream_free(StreamBuffer* buf);
 int parse_month(const char* m);
 void trim_string(char* str);
 
-void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb);
+void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int include_hydrogens);
 void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_model, int is_last_model);
 
 #endif // BPDB_H

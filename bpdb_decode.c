@@ -158,16 +158,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
   uint64_t meta_header = *(uint64_t*)(buffer + offset); offset += 8;
   uint64_t mask = meta_header >> 16;
   int af_mode = (mask & (1ULL << 0)) ? 1 : 0;
-
-  static uint8_t base_natoms[256] = {0};
-  static int dict_init = 0;
-  if (!dict_init) {
-    for (size_t i = 0; i < NUM_DICT_RES; i++) base_natoms[DICT[i].type_id] = DICT[i].num_atoms;
-    dict_init = 1;
-  }
-
-  uint8_t r_natoms[256];
-  memcpy(r_natoms, base_natoms, 256);
+  int has_hydrogens = (mask & (1ULL << 11)) ? 1 : 0;
 
   size_t dict_scan_off = offset;
   if (mask & (1ULL << 1)) dict_scan_off += 8;
@@ -175,15 +166,8 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
   if (mask & (1ULL << 3)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
   if (mask & (1ULL << 4)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
   if (mask & (1ULL << 5)) {
-    uint64_t dict_len = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8;
-    const uint8_t* p_het_dict = buffer + dict_scan_off;
-    uint8_t custom_count = p_het_dict[0];
-    size_t ptr = 1;
-    for (int c = 0; c < custom_count; c++) {
-      int u = 0x81 + c; ptr += 4;
-      r_natoms[u] = p_het_dict[ptr++]; ptr += r_natoms[u] * 6;
-    }
-    dict_scan_off += dict_len + ((8 - (dict_len % 8)) % 8);
+    uint64_t dict_len = *(uint64_t*)(buffer + dict_scan_off); 
+    dict_scan_off += 8 + dict_len + ((8 - (dict_len % 8)) % 8);
   }
   if (mask & (1ULL << 6)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
   if (mask & (1ULL << 7)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
@@ -208,7 +192,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
       for (uint32_t r = 0; r < num_residues; r++) {
         if (seq_ptr[seq_bytes++] == 0x7C) seq_bytes++;
       }
-      
+
       offset += seq_bytes + ((8 - (seq_bytes & 7)) & 7);
       const uint8_t* atom_ptr = buffer + offset;
 
@@ -234,6 +218,11 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
     return;
   }
 
+  ResidueDict* UDICT = (ResidueDict*)calloc(256, sizeof(ResidueDict));
+  for (size_t i = 0; i < NUM_DICT_RES; i++) {
+    UDICT[DICT[i].type_id] = DICT[i];
+  }
+
   int day = buffer[5], month = buffer[6], year = 1973 + buffer[7];
   char pdbID[13] = {0}; memcpy(pdbID, buffer + 8, 12); trim_string(pdbID);
   uint16_t total_models_minus_1 = *(uint16_t*)(buffer + 20);
@@ -252,13 +241,6 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
   const uint8_t* p_sheets = NULL;  uint64_t num_sheets = 0;
   const uint8_t* p_sites = NULL;   uint64_t len_sites = 0;
 
-  UniDict* UDICT = (UniDict*)malloc(256 * sizeof(UniDict));
-  for (size_t i = 0; i < NUM_DICT_RES; i++) {
-    uint8_t tid = DICT[i].type_id;
-    strcpy(UDICT[tid].resName, DICT[i].resName); UDICT[tid].num_atoms = DICT[i].num_atoms;
-    for (int a = 0; a < DICT[i].num_atoms; a++) { strcpy(UDICT[tid].atom_names[a], DICT[i].atom_names[a]); strcpy(UDICT[tid].elements[a], DICT[i].elements[a]); }
-  }
-
   if (mask & (1ULL << 1)) { resolution = *(float*)(buffer + offset); offset += 8; }
   if (mask & (1ULL << 2)) { title_len = *(uint64_t*)(buffer + offset); offset += 8; p_title = (const char*)(buffer + offset); offset += title_len; offset += (8 - (title_len % 8)) % 8; }
   if (mask & (1ULL << 3)) { expdta_len = *(uint64_t*)(buffer + offset); offset += 8; p_expdta = (const char*)(buffer + offset); offset += expdta_len; offset += (8 - (expdta_len % 8)) % 8; }
@@ -269,10 +251,10 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
     uint8_t custom_count = p_het_dict[0]; size_t ptr = 1;
     for (int c = 0; c < custom_count; c++) {
       int u_idx = 0x81 + c; memcpy(UDICT[u_idx].resName, p_het_dict + ptr, 3); UDICT[u_idx].resName[3] = '\0'; ptr += 4;
-      UDICT[u_idx].num_atoms = p_het_dict[ptr]; ptr++;
-      for (int a = 0; a < UDICT[u_idx].num_atoms; a++) {
-        memcpy(UDICT[u_idx].atom_names[a], p_het_dict + ptr, 4); UDICT[u_idx].atom_names[a][4] = '\0'; ptr += 4;
-        memcpy(UDICT[u_idx].elements[a], p_het_dict + ptr, 2); UDICT[u_idx].elements[a][2] = '\0'; ptr += 2;
+      UDICT[u_idx].h_end_norm = p_het_dict[ptr]; UDICT[u_idx].h_end_cterm = p_het_dict[ptr]; ptr++;
+      for (int a = 0; a < UDICT[u_idx].h_end_norm; a++) {
+        memcpy(UDICT[u_idx].h_atoms[a], p_het_dict + ptr, 4); UDICT[u_idx].h_atoms[a][4] = '\0'; ptr += 4;
+        memcpy(UDICT[u_idx].h_elements[a], p_het_dict + ptr, 2); UDICT[u_idx].h_elements[a][2] = '\0'; ptr += 2;
       }
     }
     offset += dict_len; offset += (8 - (dict_len % 8)) % 8;
@@ -310,7 +292,8 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
     if (num_residues == 0xFFFE) { scan_off += 8; continue; }
     if (num_residues == 0xFFFF) { scan_off += 8; conect_offset = scan_off; break; }
     uint16_t num_atoms = *(uint16_t*)(buffer + scan_off + 2);
-    char c1_raw = buffer[scan_off + 4]; int has_ter = (c1_raw & 0x80) != 0;
+    int16_t seq_raw = *(int16_t*)(buffer + scan_off + 6);
+    int has_ter = seq_raw & 1;
     scan_off += 8;
 
     int scan_seq_bytes = 0;
@@ -415,25 +398,37 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
     if (num_residues == 0xFFFF) { break; }
 
     uint16_t num_atoms = *(uint16_t*)(buffer + offset + 2);
-    char c1_raw = buffer[offset + 4];
-    char c2_raw = buffer[offset + 5];
-    char c1 = c1_raw & 0x7F;
-    char c2 = c2_raw;
-    int has_ter = (c1_raw & 0x80) != 0;
-    if (c1 == 0) c1 = ' ';
-    if (c2 == 0) c2 = ' ';
-    int16_t start_resSeq = *(int16_t*)(buffer + offset + 6);
+    uint8_t c1_raw = buffer[offset + 4];
+    uint8_t c2_raw = buffer[offset + 5];
+    int16_t seq_raw = *(int16_t*)(buffer + offset + 6);
+    
+    char c1 = c1_raw & 0x7F; if (c1 == 0) c1 = ' ';
+    char c2 = c2_raw & 0x7F; if (c2 == 0) c2 = ' ';
+    
+    int is_n_term = (c1_raw & 0x80) != 0;
+    int is_c_term = (c2_raw & 0x80) != 0;
+    int has_ter = seq_raw & 1;
+    int16_t start_resSeq = seq_raw >> 1; 
+    
     offset += 8;
 
     const uint8_t* seq_ptr = buffer + offset;
     int seq_bytes = 0; uint32_t expected_atoms = 0;
+    int first_seen = 0;
 
     for (uint32_t r = 0; r < num_residues; r++) {
       uint8_t type = seq_ptr[seq_bytes++];
       if (type == 0x7C) {
         seq_bytes++;
       } else if (type != 0x00 && type != 0x7F) {
-        expected_atoms += r_natoms[type & 0xFF];
+        int is_first = (!first_seen) && is_n_term;
+        int is_last  = (r == (uint32_t)(num_residues - 1)) && is_c_term;
+        first_seen = 1;
+        
+        expected_atoms += (is_last ? UDICT[type].h_end_cterm : UDICT[type].h_end_norm) - (is_first ? 0 : UDICT[type].h_start_norm);
+        if (has_hydrogens) {
+          expected_atoms += (is_last ? UDICT[type].hy_end_cterm : UDICT[type].hy_end_norm) - (is_first ? 0 : UDICT[type].hy_start_norm);
+        }
       }
     }
     offset += seq_bytes + ((8 - (seq_bytes & 7)) & 7);
@@ -445,6 +440,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
     int32_t current_occ = 10000;
     int8_t current_charge = 0;
     char active_alt_char = 'A';
+    int first_decoded = 0; // Add this tracking flag here
 
     accum_t accum;
     accum_t anchor_accum;
@@ -465,6 +461,10 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
     uint32_t parsed_base_atoms = 0;
     int s_idx = 0;
     int no_inc = 0;
+    
+    int processing_hydrogens = 0;
+    int h_start = 0, h_end = 0;
+    int hy_start = 0, hy_end = 0;
 
     for (uint32_t block_idx = 0; block_idx < num_atoms; block_idx++) {
       if (atom_serial > 99999) atom_serial = 0;
@@ -480,18 +480,31 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
           do {
             if (s_idx >= seq_bytes) break;
             meta = seq_ptr[s_idx++];
-            if (meta == 0x00) { current_resSeq++; first_res = 0; no_inc = 0; }
+            if (meta == 0x00) { current_resSeq++; first_res = 0; no_inc = 0;}
             else if (meta == 0x7F) { no_inc = 1; }
             else if (meta == 0x7C) { iCode = seq_ptr[s_idx++]; }
           } while (meta == 0x00 || meta == 0x7F || meta == 0x7C);
-
           if (s_idx <= seq_bytes) {
             last_valid_type = meta & 0xFF;
-            if (!first_res && !no_inc) current_resSeq++;
-            first_res = 0;
-            no_inc = 0;
-            atoms_left = r_natoms[last_valid_type];
-            atom_dict_idx = 0;
+            if (!first_res && !no_inc) { current_resSeq++; }
+            first_res = 0; no_inc = 0;
+            
+            int is_first = (!first_decoded) && is_n_term;
+            int is_last  = (s_idx == seq_bytes) && is_c_term;
+            first_decoded = 1;
+            
+            h_start = is_first ? 0 : UDICT[last_valid_type].h_start_norm;
+            h_end   = is_last  ? UDICT[last_valid_type].h_end_cterm : UDICT[last_valid_type].h_end_norm;
+            
+            hy_start = 0; hy_end = 0;
+            if (has_hydrogens) {
+                hy_start = is_first ? 0 : UDICT[last_valid_type].hy_start_norm;
+                hy_end   = is_last  ? UDICT[last_valid_type].hy_end_cterm : UDICT[last_valid_type].hy_end_norm;
+            }
+            
+            atoms_left = (h_end - h_start) + (hy_end - hy_start);
+            atom_dict_idx = h_start; 
+            processing_hydrogens = 0;
           } else {
             atoms_left = 1;
           }
@@ -501,8 +514,6 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
         active_alt_char = 'A';
       }
 
-      int i = atom_dict_idx;
-      // Inside decode_bpdb, around line 390 (The main atom decoding logic):
       int alt_flag = 0;
 
       if (*(uint64_t*)atom_ptr != 0) {
@@ -510,7 +521,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
         SIMD_DECODE_MACRO(atom_ptr, accum, current_occ, current_charge, v_b, alt_flag);
 
         int anchor_idx = (last_valid_type >= 0x20 && last_valid_type < 0x60) ? 2 : 8;
-        if (last_valid_type < 0x80 && i == anchor_idx) {
+        if (last_valid_type < 0x80 && atom_dict_idx == anchor_idx && !processing_hydrogens) {
           if (active_alt_char == 'A') {
             anchor_accum = accum;
             has_anchor = 1;
@@ -525,11 +536,15 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
         const char* a_name;
         const char* e_name;
 
-        if (i >= 0 && i < r_natoms[last_valid_type]) {
-          a_name = UDICT[last_valid_type].atom_names[i];
-          e_name = UDICT[last_valid_type].elements[i];
+        if (!processing_hydrogens && atom_dict_idx >= h_start && atom_dict_idx < h_end) {
+            a_name = UDICT[last_valid_type].h_atoms[atom_dict_idx];
+            e_name = UDICT[last_valid_type].h_elements[atom_dict_idx];
+        } else if (processing_hydrogens && atom_dict_idx >= hy_start && atom_dict_idx < hy_end) {
+            a_name = UDICT[last_valid_type].hy_atoms[atom_dict_idx];
+            e_name = UDICT[last_valid_type].hy_elements[atom_dict_idx];
         } else {
-          a_name = " UNK"; e_name = " X";
+            a_name = " UNK"; 
+            e_name = " X";
         }
 
         const char* prefix = (last_valid_type < 0x80) ? "ATOM  " : "HETATM";
@@ -538,6 +553,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
           int len = snprintf(tbuf, 128, "%s%5d %-4s%c%3s%c%c%4d%c   %8.3f%8.3f%8.3f  1.00%6.2f          %2s  ",
                              prefix, atom_serial++, a_name, altLoc, UDICT[last_valid_type].resName,
                              c1, c2, current_resSeq, iCode, GET_SIMD_X(accum) / 1000.0f, GET_SIMD_Y(accum) / 1000.0f, GET_SIMD_Z(accum) / 1000.0f, v_b / 100.0f, e_name);
+          if (len > 80) len = 80;
           memcpy(w_ptr, tbuf, len); w_ptr += 81;
         } else {
           char chg_str[3] = "  ";
@@ -547,6 +563,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
           int len = snprintf(tbuf, 128, "%s%5d %-4s%c%3s%c%c%4d%c   %8.3f%8.3f%8.3f%6.2f%6.2f          %2s%2s",
                              prefix, atom_serial++, a_name, altLoc, UDICT[last_valid_type].resName,
                              c1, c2, current_resSeq, iCode, GET_SIMD_X(accum) / 1000.0f, GET_SIMD_Y(accum) / 1000.0f, GET_SIMD_Z(accum) / 1000.0f, current_occ / 100.0f, v_b / 100.0f, e_name, chg_str);
+          if (len > 80) len = 80;
           memcpy(w_ptr, tbuf, len); w_ptr += 81;
         }
       } else {
@@ -555,9 +572,14 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
 
       if (alt_flag == 0) {
         atoms_left--;
-        atom_dict_idx++;
         parsed_base_atoms++;
+        atom_dict_idx++;
         active_alt_char = 'A';
+        
+        if (!processing_hydrogens && atom_dict_idx == h_end) {
+            processing_hydrogens = 1;
+            atom_dict_idx = hy_start;
+        }
       }
     }
 

@@ -49,9 +49,8 @@ void alt_free(AltArray* a) {
 
 typedef struct {
   int resSeq; char iCode; int type;
-  AltArray atoms[256]; int present[256];
-  int has_oxt; AltArray oxt;
-  int has_op3; AltArray op3;
+  AltArray h_atoms[256]; int h_present[256];
+  AltArray hy_atoms[256]; int hy_present[256];
 } EncoderState;
 
 typedef struct {
@@ -61,34 +60,38 @@ typedef struct {
   int32_t current_occ;
   int start_resSeq; int last_resSeq; char last_iCode;
   char c1, c2; int has_ter, has_ter_raw;
+  int is_n_term, is_c_term;
 } ChainBuilder;
 
 void cb_init(ChainBuilder* cb) {
   cb->seq_track = (uint8_t*)malloc(240000); cb->atom_track = (uint8_t*)malloc(120000 * 8 + 100);
   cb->seq_bytes = 0; cb->atom_bytes = 0; cb->num_atoms = 0; cb->num_residues = 0;
   cb->start_resSeq = 0; cb->has_ter = 0; cb->has_ter_raw = 0;
+  cb->is_n_term = 0; cb->is_c_term = 0;
   cb->current_occ = 100;
 }
 void cb_free(ChainBuilder* cb) { free(cb->seq_track); free(cb->atom_track); }
 
 void flush_chain(ChainBuilder* cb, StreamBuffer* buf) {
   if (cb->num_atoms == 0) {
-    cb->has_ter = 0; cb->has_ter_raw = 0;
+    cb->has_ter = 0; cb->has_ter_raw = 0; cb->is_n_term = 0; cb->is_c_term = 0;
     return;
   }
   uint8_t header[8] = {0};
   *(uint16_t*)(header + 0) = cb->num_residues;
   *(uint16_t*)(header + 2) = cb->num_atoms;
-  header[4] = cb->c1 | (cb->has_ter ? 0x80 : 0);
-  header[5] = cb->c2;
-  *(uint16_t*)(header + 6) = cb->start_resSeq;
+  
+  header[4] = (cb->c1 & 0x7F) | (cb->is_n_term ? 0x80 : 0);
+  header[5] = (cb->c2 & 0x7F) | (cb->is_c_term ? 0x80 : 0);
+  *(int16_t*)(header + 6) = (cb->start_resSeq << 1) | (cb->has_ter ? 1 : 0);
+  
   stream_write(buf, header, 8);
   stream_write(buf, cb->seq_track, cb->seq_bytes);
   uint32_t pad = (8 - (cb->seq_bytes & 7)) & 7;
   if (pad > 0) { uint64_t zero = 0; stream_write(buf, &zero, pad); }
   stream_write(buf, cb->atom_track, cb->atom_bytes);
   cb->seq_bytes = 0; cb->atom_bytes = 0; cb->num_atoms = 0; cb->num_residues = 0;
-  cb->has_ter = 0; cb->has_ter_raw = 0; cb->current_occ = 100;
+  cb->has_ter = 0; cb->has_ter_raw = 0; cb->is_n_term = 0; cb->is_c_term = 0; cb->current_occ = 100;
 }
 
 static inline void encode_alt_array(ChainBuilder* cb, AltArray* arr, int force_jump) {
@@ -126,8 +129,7 @@ static inline void encode_alt_array(ChainBuilder* cb, AltArray* arr, int force_j
   }
 }
 
-// Replace flush_residue entirely with this updated version
-void flush_residue(ChainBuilder* cb, EncoderState* st, UniDict* UDICT) {
+void flush_residue(ChainBuilder* cb, EncoderState* st, ResidueDict* UDICT, int is_first, int is_last, int include_hydrogens) {
   if (st->type <= 0) return;
   if (cb->num_residues == 0) cb->start_resSeq = st->resSeq;
 
@@ -146,50 +148,42 @@ void flush_residue(ChainBuilder* cb, EncoderState* st, UniDict* UDICT) {
     cb->num_residues++;
   }
 
-  uint8_t enc_type = st->type;
-  if (st->type < 0x20 && st->has_op3) enc_type += 0x10;
-  if (st->type >= 0x20 && st->type < 0x40 && st->has_oxt) enc_type += 0x20;
-
-  cb->seq_track[cb->seq_bytes++] = enc_type;
+  cb->seq_track[cb->seq_bytes++] = st->type;
   cb->num_residues++;
-  
-  int is_hetatm = (enc_type >= 0x80);
+  int is_hetatm = (st->type >= 0x60); 
 
-  for (int i = 0; i < UDICT[enc_type].num_atoms; i++) {
-    if (strncmp(UDICT[enc_type].atom_names[i], " OXT", 4) == 0 && st->has_oxt) {
-      encode_alt_array(cb, &st->oxt, 0);
-    } else if (strncmp(UDICT[enc_type].atom_names[i], " OP3", 4) == 0 && st->has_op3) {
-      encode_alt_array(cb, &st->op3, 0);
-    } else {
-      int base_idx = -1;
-      for(int b=0; b<UDICT[st->type].num_atoms; b++) {
-        if (strncmp(UDICT[enc_type].atom_names[i], UDICT[st->type].atom_names[b], 4) == 0) {
-          base_idx = b; break;
-        }
-      }
-      if (base_idx != -1 && st->present[base_idx] && st->atoms[base_idx].count > 0) {
-        encode_alt_array(cb, &st->atoms[base_idx], (is_hetatm && i == 0));
-      } else {
+  int h_start = is_first ? 0 : UDICT[st->type].h_start_norm;
+  int h_end   = is_last  ? UDICT[st->type].h_end_cterm : UDICT[st->type].h_end_norm;
+  
+  for (int i = h_start; i < h_end; i++) {
+    if (!st->h_present[i] || st->h_atoms[i].count == 0) {
+      memset(&cb->atom_track[cb->atom_bytes], 0, 8);
+      cb->atom_bytes += 8; cb->num_atoms++;
+      continue;
+    }
+    encode_alt_array(cb, &st->h_atoms[i], (is_hetatm && i == h_start));
+  }
+
+  if (include_hydrogens) {
+    int hy_start = is_first ? 0 : UDICT[st->type].hy_start_norm;
+    int hy_end   = is_last  ? UDICT[st->type].hy_end_cterm : UDICT[st->type].hy_end_norm;
+    
+    for (int i = hy_start; i < hy_end; i++) {
+      if (!st->hy_present[i] || st->hy_atoms[i].count == 0) {
         memset(&cb->atom_track[cb->atom_bytes], 0, 8);
         cb->atom_bytes += 8; cb->num_atoms++;
+        continue;
       }
+      encode_alt_array(cb, &st->hy_atoms[i], 0);
     }
   }
 
-  if (enc_type < 0x80) {
-    int anchor_idx = (enc_type >= 0x20 && enc_type < 0x60) ? 2 : 8;
-    if (anchor_idx < UDICT[enc_type].num_atoms) {
-      int base_idx = -1;
-      for(int b=0; b<UDICT[st->type].num_atoms; b++) {
-        if (strncmp(UDICT[enc_type].atom_names[anchor_idx], UDICT[st->type].atom_names[b], 4) == 0) {
-          base_idx = b; break;
-        }
-      }
-      if (base_idx != -1 && st->present[base_idx] && st->atoms[base_idx].count > 0) {
-        cb->current_x = st->atoms[base_idx].x[0];
-        cb->current_y = st->atoms[base_idx].y[0];
-        cb->current_z = st->atoms[base_idx].z[0];
-      }
+  if (!is_hetatm) {
+    int anchor_idx = (st->type >= 0x20 && st->type < 0x60) ? 2 : 8; 
+    if (anchor_idx >= h_start && anchor_idx < h_end && st->h_present[anchor_idx]) {
+      cb->current_x = st->h_atoms[anchor_idx].x[0];
+      cb->current_y = st->h_atoms[anchor_idx].y[0];
+      cb->current_z = st->h_atoms[anchor_idx].z[0];
     }
   }
 
@@ -239,17 +233,11 @@ static void save_model_file(const char* base_out, uint16_t total_m1, uint16_t cu
   }
 }
 
-void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
-  UniDict* UDICT = (UniDict*)calloc(256, sizeof(UniDict));
+void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int include_hydrogens) {
+  ResidueDict* UDICT = (ResidueDict*)calloc(256, sizeof(ResidueDict));
   int custom_het_idx = 0x81;
   for (size_t i = 0; i < NUM_DICT_RES; i++) {
-    uint8_t tid = DICT[i].type_id;
-    strcpy(UDICT[tid].resName, DICT[i].resName);
-    UDICT[tid].num_atoms = DICT[i].num_atoms;
-    for (int a = 0; a < DICT[i].num_atoms; a++) {
-      strcpy(UDICT[tid].atom_names[a], DICT[i].atom_names[a]);
-      strcpy(UDICT[tid].elements[a], DICT[i].elements[a]);
-    }
+    UDICT[DICT[i].type_id] = DICT[i];
   }
 
   char global_title[4096] = {0}; char global_id[13] = {0}; char global_class[128] = {0};
@@ -338,19 +326,28 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
         char res_name[4] = {0}; memcpy(res_name, line + 17, 3);
         char atom_name[5] = {0}; memcpy(atom_name, line + 12, 4);
         char clean_atom[5] = {0}; memcpy(clean_atom, line + 12, 4);
+        if (!include_hydrogens && (clean_atom[1] == 'H' || clean_atom[0] == 'H' || (line[76] == ' ' && line[77] == 'D'))) continue;
 
         int type = -1;
-        for (int i = 1; i < 256; i++) { if (UDICT[i].num_atoms > 0 && strncmp(UDICT[i].resName, res_name, 3) == 0) { type = i; break; } }
-
-        if (clean_atom[1] == 'H' || clean_atom[0] == 'H' || (line[76] == ' ' && line[77] == 'D') ||
-            ((strncmp(clean_atom, " OXT", 4) == 0 || strncmp(clean_atom, " OP3", 4) == 0) && type != -1 && type < 0x80)) continue;
+        for (int i = 1; i < 256; i++) { 
+          if ((UDICT[i].h_end_norm > 0 || UDICT[i].h_end_cterm > 0) && strncmp(UDICT[i].resName, res_name, 3) == 0) { type = i; break; } 
+        }
 
         if (type != -1) {
-          int a_idx = -1; for (int a = 0; a < UDICT[type].num_atoms; a++) { if (strncmp(UDICT[type].atom_names[a], atom_name, 4) == 0) { a_idx = a; break; } }
-          if (a_idx == -1 && type >= 0x80 && UDICT[type].num_atoms < 255) { a_idx = UDICT[type].num_atoms++; memcpy(UDICT[type].atom_names[a_idx], atom_name, 4); UDICT[type].elements[a_idx][0] = line[76]; UDICT[type].elements[a_idx][1] = line[77]; }
+          int a_idx = -1; 
+          for (int a = 0; a < UDICT[type].h_end_norm; a++) { 
+            if (strncmp(UDICT[type].h_atoms[a], atom_name, 4) == 0) { a_idx = a; break; } 
+          }
+          if (a_idx == -1 && type >= 0x80 && UDICT[type].h_end_norm < 255) { 
+            a_idx = UDICT[type].h_end_norm++; UDICT[type].h_end_cterm = UDICT[type].h_end_norm;
+            memcpy(UDICT[type].h_atoms[a_idx], atom_name, 4); UDICT[type].h_atoms[a_idx][4] = '\0';
+            UDICT[type].h_elements[a_idx][0] = line[76]; UDICT[type].h_elements[a_idx][1] = line[77]; UDICT[type].h_elements[a_idx][2] = '\0';
+          }
         } else if (custom_het_idx < 192) {
-          type = custom_het_idx++; memcpy(UDICT[type].resName, res_name, 3); UDICT[type].num_atoms = 1;
-          memcpy(UDICT[type].atom_names[0], atom_name, 4); UDICT[type].elements[0][0] = line[76]; UDICT[type].elements[0][1] = line[77];
+          type = custom_het_idx++; memcpy(UDICT[type].resName, res_name, 3); UDICT[type].resName[3] = '\0';
+          UDICT[type].h_end_norm = 1; UDICT[type].h_end_cterm = 1;
+          memcpy(UDICT[type].h_atoms[0], atom_name, 4); UDICT[type].h_atoms[0][4] = '\0';
+          UDICT[type].h_elements[0][0] = line[76]; UDICT[type].h_elements[0][1] = line[77]; UDICT[type].h_elements[0][2] = '\0';
         }
       }
     }
@@ -386,6 +383,7 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
   if (ssbonds.len > 0) meta_mask |= (1ULL << 8);
   if (cispeps.len > 0) meta_mask |= (1ULL << 9);
   if (sites.len > 0) meta_mask |= (1ULL << 10);
+  if (include_hydrogens) meta_mask |= (1ULL << 11);
 
   StreamBuffer meta_buffer; stream_init(&meta_buffer);
   uint64_t meta_header = 6 | (meta_mask << 16);
@@ -396,13 +394,13 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
   if (meta_mask & (1ULL << 3)) { stream_write(&meta_buffer, &expdta_len, 8); stream_write(&meta_buffer, global_expdta, expdta_len); size_t pad = (8 - (expdta_len % 8)) % 8; if (pad > 0) stream_write(&meta_buffer, &zero, pad); }
   if (meta_mask & (1ULL << 4)) { uint64_t p_len = 56; stream_write(&meta_buffer, &p_len, 8); stream_write(&meta_buffer, global_program, 56); }
   if (meta_mask & (1ULL << 5)) {
-    uint64_t dict_len = 1; for (int i = 0x81; i < custom_het_idx; i++) dict_len += 5 + UDICT[i].num_atoms * 6;
+    uint64_t dict_len = 1; for (int i = 0x81; i < custom_het_idx; i++) dict_len += 5 + UDICT[i].h_end_norm * 6;
     stream_write(&meta_buffer, &dict_len, 8);
     uint8_t custom_count = custom_het_idx - 0x81; stream_write(&meta_buffer, &custom_count, 1);
     for (int i = 0x81; i < custom_het_idx; i++) {
       char r_name[4] = {0}; memcpy(r_name, UDICT[i].resName, 3); r_name[3] = ' '; stream_write(&meta_buffer, r_name, 4);
-      uint8_t a_count = UDICT[i].num_atoms; stream_write(&meta_buffer, &a_count, 1);
-      for (int a = 0; a < a_count; a++) { stream_write(&meta_buffer, UDICT[i].atom_names[a], 4); stream_write(&meta_buffer, UDICT[i].elements[a], 2); }
+      uint8_t a_count = UDICT[i].h_end_norm; stream_write(&meta_buffer, &a_count, 1);
+      for (int a = 0; a < a_count; a++) { stream_write(&meta_buffer, UDICT[i].h_atoms[a], 4); stream_write(&meta_buffer, UDICT[i].h_elements[a], 2); }
     }
     size_t pad = (8 - (dict_len % 8)) % 8; if (pad > 0) stream_write(&meta_buffer, &zero, pad);
   }
@@ -414,8 +412,7 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
 
   StreamBuffer coords; stream_init(&coords);
   EncoderState st; memset(&st, 0, sizeof(st)); st.type = -1;
-  for(int i=0; i<256; i++) { alt_init(&st.atoms[i]); }
-  alt_init(&st.oxt); alt_init(&st.op3);
+  for(int i=0; i<256; i++) { alt_init(&st.h_atoms[i]); alt_init(&st.hy_atoms[i]); }
 
   ChainBuilder cb; cb_init(&cb); char current_c1 = '\0', current_c2 = '\0';
   uint16_t current_model_idx = 0;
@@ -426,42 +423,45 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
     while (fgets(line, sizeof(line), fin)) {
       if (strncmp(line, "TER   ", 6) == 0) {
         cb.has_ter_raw = 1;
-        if (st.type > 0) flush_residue(&cb, &st, UDICT);
+        if (st.type > 0) flush_residue(&cb, &st, UDICT, (cb.num_residues == 0), 1, include_hydrogens);
         if (cb.num_atoms > 0) {
           unsigned char ch = cb.c1; cb.has_ter = (cb.has_ter_raw || has_seqres_chain[ch]) ? 1 : 0;
+          cb.is_n_term = 1; cb.is_c_term = cb.has_ter;
           flush_chain(&cb, &coords);
         } else { cb.has_ter_raw = 0; }
-        st.type = -1; memset(st.present, 0, sizeof(st.present)); st.has_oxt = 0; st.oxt.count = 0; st.has_op3 = 0; st.op3.count = 0;
-        for (int k = 0; k < 256; k++) st.atoms[k].count = 0;
+        st.type = -1; memset(st.h_present, 0, sizeof(st.h_present)); memset(st.hy_present, 0, sizeof(st.hy_present));
+        for (int k = 0; k < 256; k++) { st.h_atoms[k].count = 0; st.hy_atoms[k].count = 0; }
         continue;
       }
       if (strncmp(line, "ENDMDL", 6) == 0) {
-        if (st.type > 0) flush_residue(&cb, &st, UDICT);
+        if (st.type > 0) flush_residue(&cb, &st, UDICT, (cb.num_residues == 0), 1, include_hydrogens);
         if (cb.num_atoms > 0) {
           unsigned char ch = cb.c1; cb.has_ter = (cb.has_ter_raw || has_seqres_chain[ch]) ? 1 : 0;
+          cb.is_n_term = 1; cb.is_c_term = cb.has_ter;
           flush_chain(&cb, &coords);
         }
         uint64_t end_stream = 0xFFFF; stream_write(&coords, &end_stream, 8);
         save_model_file(out_bpdb, total_models_minus_1, current_model_idx, global_id, global_class, day, month, year, &meta_buffer, &coords, &conects);
         coords.len = 0; current_model_idx++;
 
-        st.type = -1; memset(st.present, 0, sizeof(st.present)); st.has_oxt = 0; st.oxt.count = 0; st.has_op3 = 0; st.op3.count = 0;
-        for (int k = 0; k < 256; k++) st.atoms[k].count = 0;
+        st.type = -1; memset(st.h_present, 0, sizeof(st.h_present)); memset(st.hy_present, 0, sizeof(st.hy_present));
+        for (int k = 0; k < 256; k++) { st.h_atoms[k].count = 0; st.hy_atoms[k].count = 0; }
         continue;
       }
 
       if (strncmp(line, "ATOM  ", 6) != 0 && strncmp(line, "HETATM", 6) != 0) continue;
 
       char res_name[4] = {0}; memcpy(res_name, line + 17, 3);
-      char atom_name[5] = {0}; memcpy(atom_name, line + 12, 4);
       char altLoc = line[16], iCode = line[26], c1 = line[20], c2 = line[21];
       int resSeq = atoi(line + 22);
 
       char clean_atom[5] = {0}; memcpy(clean_atom, line + 12, 4);
-      if (clean_atom[1] == 'H' || clean_atom[0] == 'H' || (line[76] == ' ' && line[77] == 'D')) continue;
+      if (!include_hydrogens && (clean_atom[1] == 'H' || clean_atom[0] == 'H' || (line[76] == ' ' && line[77] == 'D'))) continue;
 
       int type = -1;
-      for (int i = 1; i < 256; i++) { if (UDICT[i].num_atoms > 0 && strncmp(UDICT[i].resName, res_name, 3) == 0) { type = i; break; } }
+      for (int i = 1; i < 256; i++) { 
+        if ((UDICT[i].h_end_norm > 0 || UDICT[i].h_end_cterm > 0) && strncmp(UDICT[i].resName, res_name, 3) == 0) { type = i; break; } 
+      }
       if (type == -1) continue;
 
       int new_chain = (c1 != current_c1 || c2 != current_c2);
@@ -480,67 +480,84 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
         if (charge < -3) charge = -3; else if (charge > 4) charge = 4;
       }
 
-      int atom_idx = -1;
-      for (int i = 0; i < UDICT[type].num_atoms; i++) { if (strncmp(clean_atom, UDICT[type].atom_names[i], 4) == 0) { atom_idx = i; break; } }
-      if (atom_idx == -1 && strncmp(clean_atom, " OXT", 4) != 0 && strncmp(clean_atom, " OP3", 4) != 0) continue;
+      int h_idx = -1, hy_idx = -1;
+      for (int i = 0; i < UDICT[type].h_end_cterm; i++) { 
+        if (strncmp(clean_atom, UDICT[type].h_atoms[i], 4) == 0) { h_idx = i; break; } 
+      }
+      if (include_hydrogens && h_idx == -1) {
+        for (int i = 0; i < UDICT[type].hy_end_cterm; i++) { 
+          if (strncmp(clean_atom, UDICT[type].hy_atoms[i], 4) == 0) { hy_idx = i; break; } 
+        }
+      }
+      if (h_idx == -1 && hy_idx == -1) continue;
 
       if (resSeq != st.resSeq || iCode != st.iCode || new_chain || cb.atom_bytes >= 580000 || type != st.type) {
-        if (st.type > 0) flush_residue(&cb, &st, UDICT);
-        if (new_chain || cb.atom_bytes >= 580000 || (resSeq < cb.last_resSeq) || (resSeq - cb.last_resSeq > 100)) {
+        
+        // --- NEW OXT DETECTION BLOCK ---
+        int has_oxt = 0;
+        if (st.type > 0 && UDICT[st.type].h_end_cterm > UDICT[st.type].h_end_norm) {
+          if (st.h_present[UDICT[st.type].h_end_cterm - 1]) has_oxt = 1;
+        }
+
+        if (st.type > 0) flush_residue(&cb, &st, UDICT, (cb.num_residues == 0), has_oxt, include_hydrogens);
+        
+        // Trigger a chain break if a missing TER card was implicitly detected via OXT
+        if (new_chain || cb.atom_bytes >= 580000 || (resSeq < cb.last_resSeq) || (resSeq - cb.last_resSeq > 100) || has_oxt) {
           if (cb.num_atoms > 0) {
-            unsigned char ch = cb.c1; cb.has_ter = (cb.has_ter_raw || has_seqres_chain[ch]) ? 1 : 0;
+            unsigned char ch = cb.c1; cb.has_ter = (cb.has_ter_raw || has_seqres_chain[ch] || has_oxt) ? 1 : 0;
+            cb.is_n_term = 1; cb.is_c_term = cb.has_ter;
             flush_chain(&cb, &coords);
           }
           if (new_chain) { current_c1 = c1; current_c2 = c2; }
           cb.c1 = c1; cb.c2 = c2;
         }
+        // --- END OXT DETECTION BLOCK ---
+
         st.resSeq = resSeq; st.iCode = iCode; st.type = type;
-        memset(st.present, 0, sizeof(st.present)); st.has_oxt = 0; st.oxt.count = 0; st.has_op3 = 0; st.op3.count = 0;
-        for (int k = 0; k < 256; k++) st.atoms[k].count = 0;
-      } else if (atom_idx != -1 && st.present[atom_idx]) {
+        memset(st.h_present, 0, sizeof(st.h_present)); memset(st.hy_present, 0, sizeof(st.hy_present));
+        for (int k = 0; k < 256; k++) { st.h_atoms[k].count = 0; st.hy_atoms[k].count = 0; }
+      } else {
         int is_dup_atom = 0;
-        for (int c = 0; c < st.atoms[atom_idx].count; c++) {
-          if (st.atoms[atom_idx].alt[c] == altLoc) { is_dup_atom = 1; break; }
+        if (h_idx != -1 && st.h_present[h_idx]) {
+          for (int c = 0; c < st.h_atoms[h_idx].count; c++) { if (st.h_atoms[h_idx].alt[c] == altLoc) { is_dup_atom = 1; break; } }
+        } else if (hy_idx != -1 && st.hy_present[hy_idx]) {
+          for (int c = 0; c < st.hy_atoms[hy_idx].count; c++) { if (st.hy_atoms[hy_idx].alt[c] == altLoc) { is_dup_atom = 1; break; } }
         }
         if (is_dup_atom) {
-          flush_residue(&cb, &st, UDICT);
-          memset(st.present, 0, sizeof(st.present)); st.has_oxt = 0; st.oxt.count = 0; st.has_op3 = 0; st.op3.count = 0;
-          for (int k = 0; k < 256; k++) st.atoms[k].count = 0;
+          flush_residue(&cb, &st, UDICT, (cb.num_residues == 0), 0, include_hydrogens);
+          memset(st.h_present, 0, sizeof(st.h_present)); memset(st.hy_present, 0, sizeof(st.hy_present));
+          for (int k = 0; k < 256; k++) { st.h_atoms[k].count = 0; st.hy_atoms[k].count = 0; }
         }
       }
 
-      if (strncmp(clean_atom, " OXT", 4) == 0 && type < 0x80) {
-        st.has_oxt = 1;
-        alt_push(&st.oxt, (int32_t)round(temp * 100.0f), x_int, y_int, z_int, (int32_t)round(occ), charge, altLoc);
-        continue;
+      if (h_idx != -1) {
+        alt_push(&st.h_atoms[h_idx], (int32_t)round(temp * 100.0f), x_int, y_int, z_int, (int32_t)round(occ), charge, altLoc);
+        st.h_present[h_idx] = 1;
+      } else if (hy_idx != -1) {
+        alt_push(&st.hy_atoms[hy_idx], (int32_t)round(temp * 100.0f), x_int, y_int, z_int, (int32_t)round(occ), charge, altLoc);
+        st.hy_present[hy_idx] = 1;
       }
-      if (strncmp(clean_atom, " OP3", 4) == 0 && type < 0x80) {
-        st.has_op3 = 1;
-        alt_push(&st.op3, (int32_t)round(temp * 100.0f), x_int, y_int, z_int, (int32_t)round(occ), charge, altLoc);
-        continue;
-      }
-
-      alt_push(&st.atoms[atom_idx], (int32_t)round(temp * 100.0f), x_int, y_int, z_int, (int32_t)round(occ), charge, altLoc);
-      st.present[atom_idx] = 1;
     }
     fclose(fin);
 
     if (f < num_files - 1 && coords.len > 0) {
-      if (st.type > 0) flush_residue(&cb, &st, UDICT);
+      if (st.type > 0) flush_residue(&cb, &st, UDICT, (cb.num_residues == 0), 1, include_hydrogens);
       if (cb.num_atoms > 0) {
         unsigned char ch = cb.c1; cb.has_ter = (cb.has_ter_raw || has_seqres_chain[ch]) ? 1 : 0;
+        cb.is_n_term = 1; cb.is_c_term = cb.has_ter;
         flush_chain(&cb, &coords);
       }
       uint64_t frag_stream = 0xFFFE; stream_write(&coords, &frag_stream, 8);
-      st.type = -1; memset(st.present, 0, sizeof(st.present)); st.has_oxt = 0; st.oxt.count = 0; st.has_op3 = 0; st.op3.count = 0;
-      for (int k = 0; k < 256; k++) st.atoms[k].count = 0;
+      st.type = -1; memset(st.h_present, 0, sizeof(st.h_present)); memset(st.hy_present, 0, sizeof(st.hy_present));
+      for (int k = 0; k < 256; k++) { st.h_atoms[k].count = 0; st.hy_atoms[k].count = 0; }
     }
   }
 
   if (coords.len > 0) {
-    if (st.type > 0) flush_residue(&cb, &st, UDICT);
+    if (st.type > 0) flush_residue(&cb, &st, UDICT, (cb.num_residues == 0), 1, include_hydrogens);
     if (cb.num_atoms > 0) {
       unsigned char ch = cb.c1; cb.has_ter = (cb.has_ter_raw || has_seqres_chain[ch]) ? 1 : 0;
+      cb.is_n_term = 1; cb.is_c_term = cb.has_ter;
       flush_chain(&cb, &coords);
     }
     uint64_t end_stream = 0xFFFF; stream_write(&coords, &end_stream, 8);
@@ -552,6 +569,6 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb) {
   stream_free(&cispeps); stream_free(&helices); stream_free(&sheets);
   stream_free(&sites); stream_free(&meta_buffer);
 
-  for(int i=0; i<256; i++) { alt_free(&st.atoms[i]); }
-  alt_free(&st.oxt); alt_free(&st.op3); free(UDICT);
+  for(int i=0; i<256; i++) { alt_free(&st.h_atoms[i]); alt_free(&st.hy_atoms[i]); }
+  free(UDICT);
 }

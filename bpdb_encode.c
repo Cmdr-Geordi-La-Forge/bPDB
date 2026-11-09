@@ -56,8 +56,7 @@ typedef struct {
 typedef struct {
   uint8_t* seq_track; uint8_t* atom_track;
   int seq_bytes; int atom_bytes; int num_atoms; int num_residues;
-  int32_t current_x, current_y, current_z;
-  int32_t current_occ;
+  int32_t current_x, current_y, current_z, current_b;
   int start_resSeq; int last_resSeq; char last_iCode;
   char c1, c2; int has_ter, has_ter_raw;
   int is_n_term, is_c_term;
@@ -68,8 +67,9 @@ void cb_init(ChainBuilder* cb) {
   cb->seq_bytes = 0; cb->atom_bytes = 0; cb->num_atoms = 0; cb->num_residues = 0;
   cb->start_resSeq = 0; cb->has_ter = 0; cb->has_ter_raw = 0;
   cb->is_n_term = 0; cb->is_c_term = 0;
-  cb->current_occ = 100;
+  cb->current_b = 0;
 }
+
 void cb_free(ChainBuilder* cb) { free(cb->seq_track); free(cb->atom_track); }
 
 void flush_chain(ChainBuilder* cb, StreamBuffer* buf) {
@@ -78,54 +78,70 @@ void flush_chain(ChainBuilder* cb, StreamBuffer* buf) {
     return;
   }
   uint8_t header[8] = {0};
-  *(uint16_t*)(header + 0) = cb->num_residues;
-  *(uint16_t*)(header + 2) = cb->num_atoms;
-  
+  *(uint32_t*)(header + 0) = (cb->num_residues << 18) | (cb->num_atoms & 0x3FFFF);
+
   header[4] = (cb->c1 & 0x7F) | (cb->is_n_term ? 0x80 : 0);
   header[5] = (cb->c2 & 0x7F) | (cb->is_c_term ? 0x80 : 0);
   *(int16_t*)(header + 6) = (cb->start_resSeq << 1) | (cb->has_ter ? 1 : 0);
-  
+
   stream_write(buf, header, 8);
   stream_write(buf, cb->seq_track, cb->seq_bytes);
   uint32_t pad = (8 - (cb->seq_bytes & 7)) & 7;
   if (pad > 0) { uint64_t zero = 0; stream_write(buf, &zero, pad); }
   stream_write(buf, cb->atom_track, cb->atom_bytes);
   cb->seq_bytes = 0; cb->atom_bytes = 0; cb->num_atoms = 0; cb->num_residues = 0;
-  cb->has_ter = 0; cb->has_ter_raw = 0; cb->is_n_term = 0; cb->is_c_term = 0; cb->current_occ = 100;
+  cb->has_ter = 0; cb->has_ter_raw = 0; cb->is_n_term = 0; cb->is_c_term = 0; cb->current_b = 0;
 }
 
 static inline void encode_alt_array(ChainBuilder* cb, AltArray* arr, int force_jump) {
   for (int a = 0; a < arr->count; a++) {
-    int32_t x = arr->x[a], y = arr->y[a], z = arr->z[a];
-    if (cb->num_atoms == 0) { cb->current_x = x; cb->current_y = y; cb->current_z = z; }
-    int32_t dx = x - cb->current_x, dy = y - cb->current_y, dz = z - cb->current_z;
-    int32_t b_int = arr->b[a]; if (b_int > 4194303) b_int = 4194303; if (b_int < 0) b_int = 0;
+    int32_t x = arr->x[a], y = arr->y[a], z = arr->z[a], b_int = arr->b[a];
+    if (b_int > 4194303) b_int = 4194303;
+    if (b_int < 0) b_int = 0;
+
+    if (cb->num_atoms == 0) {
+      cb->current_x = x; cb->current_y = y; cb->current_z = z; cb->current_b = b_int;
+    }
+
+    int32_t dx = x - cb->current_x, dy = y - cb->current_y;
+    int32_t dz = z - cb->current_z, db = b_int - cb->current_b;
+
     int alt_flag = (a < arr->count - 1) ? 1 : 0;
     int32_t occ_int = arr->occ[a]; if (occ_int > 100) occ_int = 100; else if (occ_int < 0) occ_int = 0;
     int8_t raw_charge = arr->charge[a];
     uint8_t charge_u = (raw_charge + 3) & 0x07;
 
-    int needs_jump = (cb->num_atoms == 0) || (cb->atom_bytes == cb->num_atoms * 8) || (force_jump && a == 0) ||
-      (dx > 32767 || dx < -32768 || dy > 32767 || dy < -32768 || dz > 32767 || dz < -32768) ||
-      (occ_int != cb->current_occ) || (raw_charge != 0) ||
-      (b_int > 16383);
+    int needs_jump = (cb->num_atoms == 0) || (force_jump && a == 0) ||
+      (dx > 4095 || dx < -4096 || dy > 4095 || dy < -4096 ||
+       dz > 4095 || dz < -4096 || db > 4095 || db < -4096);
 
     uint8_t* ptr = &cb->atom_track[cb->atom_bytes];
-    uint16_t b_ctrl = ((b_int & 0x3FFF) << 2) | (alt_flag << 1) | 0;
     if (needs_jump) {
-      uint16_t x_anchor = (((x >> 16) & 0x7FFF) << 1) | (charge_u & 1);
-      uint16_t y_anchor = (((y >> 16) & 0x7FFF) << 1) | ((charge_u >> 1) & 1);
-      uint16_t z_anchor = (((z >> 16) & 0x7FFF) << 1) | ((charge_u >> 2) & 1);
-      ptr[0] = (occ_int << 1) | 1; ptr[1] = (b_int >> 14) & 0xFF;
-      *(uint16_t*)(ptr + 2) = x_anchor; *(uint16_t*)(ptr + 4) = y_anchor; *(uint16_t*)(ptr + 6) = z_anchor;
-      *(uint16_t*)(ptr + 8) = b_ctrl;
-      *(uint16_t*)(ptr + 10) = x & 0xFFFF; *(uint16_t*)(ptr + 12) = y & 0xFFFF; *(uint16_t*)(ptr + 14) = z & 0xFFFF;
-      cb->current_occ = occ_int; cb->atom_bytes += 16;
+      int32_t w0 = (x << 2) | (alt_flag << 1) | 1;
+      int32_t w1 = y;
+      int32_t w2 = z;
+      int32_t w3 = (b_int << 10) | (occ_int << 3) | charge_u;
+
+      *(int32_t*)(ptr)      = w0;
+      *(int32_t*)(ptr + 4)  = w1;
+      *(int32_t*)(ptr + 8)  = w2;
+      *(int32_t*)(ptr + 12) = w3;
+      cb->atom_bytes += 16;
     } else {
-      *(uint16_t*)ptr = b_ctrl; *(int16_t*)(ptr + 2) = dx; *(int16_t*)(ptr + 4) = dy; *(int16_t*)(ptr + 6) = dz;
+      uint16_t b_ctrl = (db << 3) | (((occ_int >> 6) & 1) << 2) | (alt_flag << 1) | 0;
+      uint16_t x_ctrl = (dx << 3) | ((occ_int >> 3) & 7);
+      uint16_t y_ctrl = (dy << 3) | (occ_int & 7);
+      uint16_t z_ctrl = (dz << 3) | charge_u;
+
+      *(uint16_t*)(ptr)     = b_ctrl;
+      *(uint16_t*)(ptr + 2) = x_ctrl;
+      *(uint16_t*)(ptr + 4) = y_ctrl;
+      *(uint16_t*)(ptr + 6) = z_ctrl;
       cb->atom_bytes += 8;
     }
-    cb->current_x = x; cb->current_y = y; cb->current_z = z; cb->num_atoms++;
+
+    cb->current_x = x; cb->current_y = y; cb->current_z = z; cb->current_b = b_int;
+    cb->num_atoms++;
   }
 }
 
@@ -150,11 +166,11 @@ void flush_residue(ChainBuilder* cb, EncoderState* st, ResidueDict* UDICT, int i
 
   cb->seq_track[cb->seq_bytes++] = st->type;
   cb->num_residues++;
-  int is_hetatm = (st->type >= 0x60); 
+  int is_hetatm = (st->type >= 0x60);
 
   int h_start = is_first ? 0 : UDICT[st->type].h_start_norm;
   int h_end   = is_last  ? UDICT[st->type].h_end_cterm : UDICT[st->type].h_end_norm;
-  
+
   for (int i = h_start; i < h_end; i++) {
     if (!st->h_present[i] || st->h_atoms[i].count == 0) {
       memset(&cb->atom_track[cb->atom_bytes], 0, 8);
@@ -167,7 +183,7 @@ void flush_residue(ChainBuilder* cb, EncoderState* st, ResidueDict* UDICT, int i
   if (include_hydrogens) {
     int hy_start = is_first ? 0 : UDICT[st->type].hy_start_norm;
     int hy_end   = is_last  ? UDICT[st->type].hy_end_cterm : UDICT[st->type].hy_end_norm;
-    
+
     for (int i = hy_start; i < hy_end; i++) {
       if (!st->hy_present[i] || st->hy_atoms[i].count == 0) {
         memset(&cb->atom_track[cb->atom_bytes], 0, 8);
@@ -179,11 +195,12 @@ void flush_residue(ChainBuilder* cb, EncoderState* st, ResidueDict* UDICT, int i
   }
 
   if (!is_hetatm) {
-    int anchor_idx = (st->type >= 0x20 && st->type < 0x60) ? 2 : 8; 
+    int anchor_idx = (st->type >= 0x20 && st->type < 0x60) ? 2 : 8;
     if (anchor_idx >= h_start && anchor_idx < h_end && st->h_present[anchor_idx]) {
       cb->current_x = st->h_atoms[anchor_idx].x[0];
       cb->current_y = st->h_atoms[anchor_idx].y[0];
       cb->current_z = st->h_atoms[anchor_idx].z[0];
+      cb->current_b = st->h_atoms[anchor_idx].b[0];
     }
   }
 
@@ -329,16 +346,16 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int 
         if (!include_hydrogens && (clean_atom[1] == 'H' || clean_atom[0] == 'H' || (line[76] == ' ' && line[77] == 'D'))) continue;
 
         int type = -1;
-        for (int i = 1; i < 256; i++) { 
-          if ((UDICT[i].h_end_norm > 0 || UDICT[i].h_end_cterm > 0) && strncmp(UDICT[i].resName, res_name, 3) == 0) { type = i; break; } 
+        for (int i = 1; i < 256; i++) {
+          if ((UDICT[i].h_end_norm > 0 || UDICT[i].h_end_cterm > 0) && strncmp(UDICT[i].resName, res_name, 3) == 0) { type = i; break; }
         }
 
         if (type != -1) {
-          int a_idx = -1; 
-          for (int a = 0; a < UDICT[type].h_end_norm; a++) { 
-            if (strncmp(UDICT[type].h_atoms[a], atom_name, 4) == 0) { a_idx = a; break; } 
+          int a_idx = -1;
+          for (int a = 0; a < UDICT[type].h_end_norm; a++) {
+            if (strncmp(UDICT[type].h_atoms[a], atom_name, 4) == 0) { a_idx = a; break; }
           }
-          if (a_idx == -1 && type >= 0x80 && UDICT[type].h_end_norm < 255) { 
+          if (a_idx == -1 && type >= 0x80 && UDICT[type].h_end_norm < 255) {
             a_idx = UDICT[type].h_end_norm++; UDICT[type].h_end_cterm = UDICT[type].h_end_norm;
             memcpy(UDICT[type].h_atoms[a_idx], atom_name, 4); UDICT[type].h_atoms[a_idx][4] = '\0';
             UDICT[type].h_elements[a_idx][0] = line[76]; UDICT[type].h_elements[a_idx][1] = line[77]; UDICT[type].h_elements[a_idx][2] = '\0';
@@ -426,7 +443,7 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int 
         if (st.type > 0) flush_residue(&cb, &st, UDICT, (cb.num_residues == 0), 1, include_hydrogens);
         if (cb.num_atoms > 0) {
           unsigned char ch = cb.c1; cb.has_ter = (cb.has_ter_raw || has_seqres_chain[ch]) ? 1 : 0;
-          cb.is_n_term = 1; cb.is_c_term = cb.has_ter;
+          cb.is_n_term = 1; cb.is_c_term = 1;
           flush_chain(&cb, &coords);
         } else { cb.has_ter_raw = 0; }
         st.type = -1; memset(st.h_present, 0, sizeof(st.h_present)); memset(st.hy_present, 0, sizeof(st.hy_present));
@@ -437,10 +454,10 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int 
         if (st.type > 0) flush_residue(&cb, &st, UDICT, (cb.num_residues == 0), 1, include_hydrogens);
         if (cb.num_atoms > 0) {
           unsigned char ch = cb.c1; cb.has_ter = (cb.has_ter_raw || has_seqres_chain[ch]) ? 1 : 0;
-          cb.is_n_term = 1; cb.is_c_term = cb.has_ter;
+          cb.is_n_term = 1; cb.is_c_term = 1;
           flush_chain(&cb, &coords);
         }
-        uint64_t end_stream = 0xFFFF; stream_write(&coords, &end_stream, 8);
+        uint64_t end_stream = (0x3FFFULL << 18); stream_write(&coords, &end_stream, 8);
         save_model_file(out_bpdb, total_models_minus_1, current_model_idx, global_id, global_class, day, month, year, &meta_buffer, &coords, &conects);
         coords.len = 0; current_model_idx++;
 
@@ -459,8 +476,8 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int 
       if (!include_hydrogens && (clean_atom[1] == 'H' || clean_atom[0] == 'H' || (line[76] == ' ' && line[77] == 'D'))) continue;
 
       int type = -1;
-      for (int i = 1; i < 256; i++) { 
-        if ((UDICT[i].h_end_norm > 0 || UDICT[i].h_end_cterm > 0) && strncmp(UDICT[i].resName, res_name, 3) == 0) { type = i; break; } 
+      for (int i = 1; i < 256; i++) {
+        if ((UDICT[i].h_end_norm > 0 || UDICT[i].h_end_cterm > 0) && strncmp(UDICT[i].resName, res_name, 3) == 0) { type = i; break; }
       }
       if (type == -1) continue;
 
@@ -481,37 +498,34 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int 
       }
 
       int h_idx = -1, hy_idx = -1;
-      for (int i = 0; i < UDICT[type].h_end_cterm; i++) { 
-        if (strncmp(clean_atom, UDICT[type].h_atoms[i], 4) == 0) { h_idx = i; break; } 
+      for (int i = 0; i < UDICT[type].h_end_cterm; i++) {
+        if (strncmp(clean_atom, UDICT[type].h_atoms[i], 4) == 0) { h_idx = i; break; }
       }
       if (include_hydrogens && h_idx == -1) {
-        for (int i = 0; i < UDICT[type].hy_end_cterm; i++) { 
-          if (strncmp(clean_atom, UDICT[type].hy_atoms[i], 4) == 0) { hy_idx = i; break; } 
+        for (int i = 0; i < UDICT[type].hy_end_cterm; i++) {
+          if (strncmp(clean_atom, UDICT[type].hy_atoms[i], 4) == 0) { hy_idx = i; break; }
         }
       }
       if (h_idx == -1 && hy_idx == -1) continue;
 
       if (resSeq != st.resSeq || iCode != st.iCode || new_chain || cb.atom_bytes >= 580000 || type != st.type) {
-        
-        // --- NEW OXT DETECTION BLOCK ---
+
         int has_oxt = 0;
         if (st.type > 0 && UDICT[st.type].h_end_cterm > UDICT[st.type].h_end_norm) {
           if (st.h_present[UDICT[st.type].h_end_cterm - 1]) has_oxt = 1;
         }
 
         if (st.type > 0) flush_residue(&cb, &st, UDICT, (cb.num_residues == 0), has_oxt, include_hydrogens);
-        
-        // Trigger a chain break if a missing TER card was implicitly detected via OXT
+
         if (new_chain || cb.atom_bytes >= 580000 || (resSeq < cb.last_resSeq) || (resSeq - cb.last_resSeq > 100) || has_oxt) {
           if (cb.num_atoms > 0) {
             unsigned char ch = cb.c1; cb.has_ter = (cb.has_ter_raw || has_seqres_chain[ch] || has_oxt) ? 1 : 0;
-            cb.is_n_term = 1; cb.is_c_term = cb.has_ter;
+            cb.is_n_term = 1; cb.is_c_term = has_oxt;
             flush_chain(&cb, &coords);
           }
           if (new_chain) { current_c1 = c1; current_c2 = c2; }
           cb.c1 = c1; cb.c2 = c2;
         }
-        // --- END OXT DETECTION BLOCK ---
 
         st.resSeq = resSeq; st.iCode = iCode; st.type = type;
         memset(st.h_present, 0, sizeof(st.h_present)); memset(st.hy_present, 0, sizeof(st.hy_present));
@@ -544,10 +558,10 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int 
       if (st.type > 0) flush_residue(&cb, &st, UDICT, (cb.num_residues == 0), 1, include_hydrogens);
       if (cb.num_atoms > 0) {
         unsigned char ch = cb.c1; cb.has_ter = (cb.has_ter_raw || has_seqres_chain[ch]) ? 1 : 0;
-        cb.is_n_term = 1; cb.is_c_term = cb.has_ter;
+        cb.is_n_term = 1; cb.is_c_term = 1;
         flush_chain(&cb, &coords);
       }
-      uint64_t frag_stream = 0xFFFE; stream_write(&coords, &frag_stream, 8);
+      uint64_t frag_stream = (0x3FFEULL << 18); stream_write(&coords, &frag_stream, 8);
       st.type = -1; memset(st.h_present, 0, sizeof(st.h_present)); memset(st.hy_present, 0, sizeof(st.hy_present));
       for (int k = 0; k < 256; k++) { st.h_atoms[k].count = 0; st.hy_atoms[k].count = 0; }
     }
@@ -557,10 +571,10 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int 
     if (st.type > 0) flush_residue(&cb, &st, UDICT, (cb.num_residues == 0), 1, include_hydrogens);
     if (cb.num_atoms > 0) {
       unsigned char ch = cb.c1; cb.has_ter = (cb.has_ter_raw || has_seqres_chain[ch]) ? 1 : 0;
-      cb.is_n_term = 1; cb.is_c_term = cb.has_ter;
+      cb.is_n_term = 1; cb.is_c_term = 1;
       flush_chain(&cb, &coords);
     }
-    uint64_t end_stream = 0xFFFF; stream_write(&coords, &end_stream, 8);
+    uint64_t end_stream = (0x3FFFULL << 18); stream_write(&coords, &end_stream, 8);
     save_model_file(out_bpdb, total_models_minus_1, current_model_idx, global_id, global_class, day, month, year, &meta_buffer, &coords, &conects);
   }
 

@@ -5,145 +5,165 @@
 #if defined(__AVX2__) || defined(__SSE4_1__)
 #include <immintrin.h>
 typedef __m128i accum_t;
+#define GET_SIMD_B(acc) _mm_extract_epi32((acc), 0)
 #define GET_SIMD_X(acc) _mm_extract_epi32((acc), 1)
 #define GET_SIMD_Y(acc) _mm_extract_epi32((acc), 2)
 #define GET_SIMD_Z(acc) _mm_extract_epi32((acc), 3)
 #elif defined(__aarch64__) || defined(__ARM_NEON)
 #include <arm_neon.h>
 typedef int32x4_t accum_t;
+#define GET_SIMD_B(acc) vgetq_lane_s32((acc), 0)
 #define GET_SIMD_X(acc) vgetq_lane_s32((acc), 1)
 #define GET_SIMD_Y(acc) vgetq_lane_s32((acc), 2)
 #define GET_SIMD_Z(acc) vgetq_lane_s32((acc), 3)
 #else
-typedef struct { int32_t unused, x, y, z; } accum_t;
+typedef struct { int32_t b, x, y, z; } accum_t;
+#define GET_SIMD_B(acc) ((acc).b)
 #define GET_SIMD_X(acc) ((acc).x)
 #define GET_SIMD_Y(acc) ((acc).y)
 #define GET_SIMD_Z(acc) ((acc).z)
 #endif
 
+// Unifies memory reads to prevent Partial Register Stalls
 #if defined(__AVX2__) || defined(__SSE4_1__)
 #define SIMD_DECODE_PHASE1(ptr, out_accum) do {                         \
-    if ((ptr)[0] & 0x01) {                                              \
-      int32_t vx = (((int16_t)*(uint16_t*)((ptr) + 2)) >> 1 << 16) | *(uint16_t*)((ptr) + 10); \
-      int32_t vy = (((int16_t)*(uint16_t*)((ptr) + 4)) >> 1 << 16) | *(uint16_t*)((ptr) + 12); \
-      int32_t vz = (((int16_t)*(uint16_t*)((ptr) + 6)) >> 1 << 16) | *(uint16_t*)((ptr) + 14); \
-      out_accum = _mm_set_epi32(vz, vy, vx, 0);                         \
+    uint64_t ctrl = *(uint64_t*)(ptr);                                  \
+    if ((uint32_t)ctrl & 0x01) {                                        \
+      int32_t w0 = (int32_t)ctrl;                                       \
+      int32_t w1 = *(int32_t*)(ptr + 4);                                \
+      int32_t w2 = *(int32_t*)(ptr + 8);                                \
+      int32_t w3 = *(int32_t*)(ptr + 12);                               \
+      out_accum = _mm_set_epi32(w2, w1, w0 >> 2, w3 >> 10);             \
       ptr += 16;                                                        \
     } else {                                                            \
-      out_accum = _mm_add_epi32(out_accum, _mm_cvtepi16_epi32(_mm_loadl_epi64((const __m128i*)(ptr)))); \
+      __m128i loaded = _mm_cvtsi64_si128(ctrl);                         \
+      __m128i deltas = _mm_srai_epi16(loaded, 3);                       \
+      out_accum = _mm_add_epi32(out_accum, _mm_cvtepi16_epi32(deltas)); \
       ptr += 8;                                                         \
     }                                                                   \
   } while(0)
 #elif defined(__aarch64__) || defined(__ARM_NEON)
 #define SIMD_DECODE_PHASE1(ptr, out_accum) do {                         \
-    if ((ptr)[0] & 0x01) {                                              \
-      int32_t vx = (((int16_t)*(uint16_t*)((ptr) + 2)) >> 1 << 16) | *(uint16_t*)((ptr) + 10); \
-      int32_t vy = (((int16_t)*(uint16_t*)((ptr) + 4)) >> 1 << 16) | *(uint16_t*)((ptr) + 12); \
-      int32_t vz = (((int16_t)*(uint16_t*)((ptr) + 6)) >> 1 << 16) | *(uint16_t*)((ptr) + 14); \
-      out_accum = (int32x4_t){0, vx, vy, vz};                           \
+    uint64_t ctrl = *(uint64_t*)(ptr);                                  \
+    if ((uint32_t)ctrl & 0x01) {                                        \
+      int32_t w0 = (int32_t)ctrl;                                       \
+      int32_t w1 = *(int32_t*)(ptr + 4);                                \
+      int32_t w2 = *(int32_t*)(ptr + 8);                                \
+      int32_t w3 = *(int32_t*)(ptr + 12);                               \
+      out_accum = (int32x4_t){w3 >> 10, w0 >> 2, w1, w2};               \
       ptr += 16;                                                        \
     } else {                                                            \
-      out_accum = vaddq_s32(out_accum, vmovl_s16(vreinterpret_s16_u8(vld1_u8(ptr)))); \
+      int16x4_t loaded = vreinterpret_s16_u8(vcreate_u8(ctrl));         \
+      int16x4_t deltas = vshr_n_s16(loaded, 3);                         \
+      out_accum = vaddq_s32(out_accum, vmovl_s16(deltas));              \
       ptr += 8;                                                         \
     }                                                                   \
   } while(0)
 #else
 #define SIMD_DECODE_PHASE1(ptr, out_accum) do {                         \
-    if ((ptr)[0] & 0x01) {                                              \
-      out_accum.x = (((int16_t)*(uint16_t*)((ptr) + 2)) >> 1 << 16) | *(uint16_t*)((ptr) + 10); \
-      out_accum.y = (((int16_t)*(uint16_t*)((ptr) + 4)) >> 1 << 16) | *(uint16_t*)((ptr) + 12); \
-      out_accum.z = (((int16_t)*(uint16_t*)((ptr) + 6)) >> 1 << 16) | *(uint16_t*)((ptr) + 14); \
+    uint64_t ctrl = *(uint64_t*)(ptr);                                  \
+    if ((uint32_t)ctrl & 0x01) {                                        \
+      int32_t w0 = (int32_t)ctrl;                                       \
+      int32_t w1 = *(int32_t*)(ptr + 4);                                \
+      int32_t w2 = *(int32_t*)(ptr + 8);                                \
+      int32_t w3 = *(int32_t*)(ptr + 12);                               \
+      out_accum.b = w3 >> 10;                                           \
+      out_accum.x = w0 >> 2;                                            \
+      out_accum.y = w1;                                                 \
+      out_accum.z = w2;                                                 \
       ptr += 16;                                                        \
     } else {                                                            \
-      out_accum.x += *(int16_t*)((ptr)+2);                              \
-      out_accum.y += *(int16_t*)((ptr)+4);                              \
-      out_accum.z += *(int16_t*)((ptr)+6);                              \
+      out_accum.b += ((int16_t)(uint16_t)ctrl) >> 3;                    \
+      out_accum.x += ((int16_t)(uint16_t)(ctrl >> 16)) >> 3;            \
+      out_accum.y += ((int16_t)(uint16_t)(ctrl >> 32)) >> 3;            \
+      out_accum.z += ((int16_t)(uint16_t)(ctrl >> 48)) >> 3;            \
       ptr += 8;                                                         \
     }                                                                   \
   } while(0)
 #endif
 
 #if defined(__AVX2__) || defined(__SSE4_1__)
-#define SIMD_DECODE_MACRO(ptr, out_accum, c_occ, c_chg, b_out, alt_out) do { \
-    if ((ptr)[0] & 0x01) {                                              \
-      uint16_t xa = *(uint16_t*)((ptr) + 2);                            \
-      uint16_t ya = *(uint16_t*)((ptr) + 4);                            \
-      uint16_t za = *(uint16_t*)((ptr) + 6);                            \
-      c_chg = (xa & 1) | ((ya & 1) << 1) | ((za & 1) << 2);             \
-      c_chg -= 3;                                                       \
-      c_occ = (ptr)[0] >> 1;                                            \
-      int32_t b_msb = (ptr)[1];                                         \
-      int32_t vx = (((int16_t)xa) >> 1 << 16) | *(uint16_t*)((ptr) + 10); \
-      int32_t vy = (((int16_t)ya) >> 1 << 16) | *(uint16_t*)((ptr) + 12); \
-      int32_t vz = (((int16_t)za) >> 1 << 16) | *(uint16_t*)((ptr) + 14); \
-      out_accum = _mm_set_epi32(vz, vy, vx, 0);                         \
-      uint16_t b_ctrl = *(uint16_t*)((ptr) + 8);                        \
-      alt_out = (b_ctrl >> 1) & 0x01;                                   \
-      b_out = (b_msb << 14) | (b_ctrl >> 2);                            \
+#define SIMD_DECODE_MACRO(ptr, out_accum, c_occ, c_chg, alt_out) do {   \
+    uint64_t ctrl = *(uint64_t*)(ptr);                                  \
+    if ((uint32_t)ctrl & 0x01) {                                        \
+      int32_t w0 = (int32_t)ctrl;                                       \
+      int32_t w1 = *(int32_t*)(ptr + 4);                                \
+      int32_t w2 = *(int32_t*)(ptr + 8);                                \
+      int32_t w3 = *(int32_t*)(ptr + 12);                               \
+      alt_out = (w0 >> 1) & 1;                                          \
+      c_occ = (w3 >> 3) & 0x7F;                                         \
+      c_chg = (w3 & 7) - 3;                                             \
+      out_accum = _mm_set_epi32(w2, w1, w0 >> 2, w3 >> 10);             \
       ptr += 16;                                                        \
     } else {                                                            \
-      c_chg = 0;                                                        \
-      uint16_t b_ctrl = *(uint16_t*)(ptr);                              \
-      alt_out = (b_ctrl >> 1) & 0x01;                                   \
-      b_out = b_ctrl >> 2;                                              \
-      out_accum = _mm_add_epi32(out_accum, _mm_cvtepi16_epi32(_mm_loadl_epi64((const __m128i*)(ptr)))); \
+      uint16_t b_ctrl = (uint16_t)ctrl;                                 \
+      uint16_t x_ctrl = (uint16_t)(ctrl >> 16);                         \
+      uint16_t y_ctrl = (uint16_t)(ctrl >> 32);                         \
+      uint16_t z_ctrl = (uint16_t)(ctrl >> 48);                         \
+      alt_out = (b_ctrl >> 1) & 1;                                      \
+      c_occ = ((b_ctrl & 4) << 4) | ((x_ctrl & 7) << 3) | (y_ctrl & 7); \
+      c_chg = (z_ctrl & 7) - 3;                                         \
+      __m128i loaded = _mm_cvtsi64_si128(ctrl);                         \
+      __m128i deltas = _mm_srai_epi16(loaded, 3);                       \
+      out_accum = _mm_add_epi32(out_accum, _mm_cvtepi16_epi32(deltas)); \
       ptr += 8;                                                         \
     }                                                                   \
   } while(0)
 #elif defined(__aarch64__) || defined(__ARM_NEON)
-#define SIMD_DECODE_MACRO(ptr, out_accum, c_occ, c_chg, b_out, alt_out) do { \
-    if ((ptr)[0] & 0x01) {                                              \
-      uint16_t xa = *(uint16_t*)((ptr) + 2);                            \
-      uint16_t ya = *(uint16_t*)((ptr) + 4);                            \
-      uint16_t za = *(uint16_t*)((ptr) + 6);                            \
-      c_chg = (xa & 1) | ((ya & 1) << 1) | ((za & 1) << 2);             \
-      c_chg -= 3;                                                       \
-      c_occ = (ptr)[0] >> 1;                                            \
-      int32_t b_msb = (ptr)[1];                                         \
-      int32_t vx = (((int16_t)xa) >> 1 << 16) | *(uint16_t*)((ptr) + 10); \
-      int32_t vy = (((int16_t)ya) >> 1 << 16) | *(uint16_t*)((ptr) + 12); \
-      int32_t vz = (((int16_t)za) >> 1 << 16) | *(uint16_t*)((ptr) + 14); \
-      out_accum = (int32x4_t){0, vx, vy, vz};                           \
-      uint16_t b_ctrl = *(uint16_t*)((ptr) + 8);                        \
-      alt_out = (b_ctrl >> 1) & 0x01;                                   \
-      b_out = (b_msb << 14) | (b_ctrl >> 2);                            \
+#define SIMD_DECODE_MACRO(ptr, out_accum, c_occ, c_chg, alt_out) do {   \
+    uint64_t ctrl = *(uint64_t*)(ptr);                                  \
+    if ((uint32_t)ctrl & 0x01) {                                        \
+      int32_t w0 = (int32_t)ctrl;                                       \
+      int32_t w1 = *(int32_t*)(ptr + 4);                                \
+      int32_t w2 = *(int32_t*)(ptr + 8);                                \
+      int32_t w3 = *(int32_t*)(ptr + 12);                               \
+      alt_out = (w0 >> 1) & 1;                                          \
+      c_occ = (w3 >> 3) & 0x7F;                                         \
+      c_chg = (w3 & 7) - 3;                                             \
+      out_accum = (int32x4_t){w3 >> 10, w0 >> 2, w1, w2};               \
       ptr += 16;                                                        \
     } else {                                                            \
-      c_chg = 0;                                                        \
-      uint16_t b_ctrl = *(uint16_t*)(ptr);                              \
-      alt_out = (b_ctrl >> 1) & 0x01;                                   \
-      b_out = b_ctrl >> 2;                                              \
-      int32x4_t loaded = vmovl_s16(vreinterpret_s16_u8(vld1_u8(ptr)));  \
-      loaded = vandq_s32(loaded, (int32x4_t){0, -1, -1, -1});           \
-      out_accum = vaddq_s32(out_accum, loaded);                         \
+      uint16_t b_ctrl = (uint16_t)ctrl;                                 \
+      uint16_t x_ctrl = (uint16_t)(ctrl >> 16);                         \
+      uint16_t y_ctrl = (uint16_t)(ctrl >> 32);                         \
+      uint16_t z_ctrl = (uint16_t)(ctrl >> 48);                         \
+      alt_out = (b_ctrl >> 1) & 1;                                      \
+      c_occ = ((b_ctrl & 4) << 4) | ((x_ctrl & 7) << 3) | (y_ctrl & 7); \
+      c_chg = (z_ctrl & 7) - 3;                                         \
+      int16x4_t loaded = vreinterpret_s16_u8(vcreate_u8(ctrl));         \
+      int16x4_t deltas = vshr_n_s16(loaded, 3);                         \
+      out_accum = vaddq_s32(out_accum, vmovl_s16(deltas));              \
       ptr += 8;                                                         \
     }                                                                   \
   } while(0)
 #else
-#define SIMD_DECODE_MACRO(ptr, out_accum, c_occ, c_chg, b_out, alt_out) do { \
-    if ((ptr)[0] & 0x01) {                                              \
-      uint16_t xa = *(uint16_t*)((ptr) + 2);                            \
-      uint16_t ya = *(uint16_t*)((ptr) + 4);                            \
-      uint16_t za = *(uint16_t*)((ptr) + 6);                            \
-      c_chg = (xa & 1) | ((ya & 1) << 1) | ((za & 1) << 2);             \
-      c_chg -= 3;                                                       \
-      c_occ = (ptr)[0] >> 1;                                            \
-      int32_t b_msb = (ptr)[1];                                         \
-      out_accum.x = (((int16_t)xa) >> 1 << 16) | *(uint16_t*)((ptr) + 10); \
-      out_accum.y = (((int16_t)ya) >> 1 << 16) | *(uint16_t*)((ptr) + 12); \
-      out_accum.z = (((int16_t)za) >> 1 << 16) | *(uint16_t*)((ptr) + 14); \
-      uint16_t b_ctrl = *(uint16_t*)((ptr) + 8);                        \
-      alt_out = (b_ctrl >> 1) & 0x01;                                   \
-      b_out = (b_msb << 14) | (b_ctrl >> 2);                            \
+#define SIMD_DECODE_MACRO(ptr, out_accum, c_occ, c_chg, alt_out) do {   \
+    uint64_t ctrl = *(uint64_t*)(ptr);                                  \
+    if ((uint32_t)ctrl & 0x01) {                                        \
+      int32_t w0 = (int32_t)ctrl;                                       \
+      int32_t w1 = *(int32_t*)(ptr + 4);                                \
+      int32_t w2 = *(int32_t*)(ptr + 8);                                \
+      int32_t w3 = *(int32_t*)(ptr + 12);                               \
+      alt_out = (w0 >> 1) & 1;                                          \
+      c_occ = (w3 >> 3) & 0x7F;                                         \
+      c_chg = (w3 & 7) - 3;                                             \
+      out_accum.b = w3 >> 10;                                           \
+      out_accum.x = w0 >> 2;                                            \
+      out_accum.y = w1;                                                 \
+      out_accum.z = w2;                                                 \
       ptr += 16;                                                        \
     } else {                                                            \
-      c_chg = 0;                                                        \
-      uint16_t b_ctrl = *(uint16_t*)(ptr);                              \
-      alt_out = (b_ctrl >> 1) & 0x01;                                   \
-      b_out = b_ctrl >> 2;                                              \
-      out_accum.x += *(int16_t*)((ptr)+2);                              \
-      out_accum.y += *(int16_t*)((ptr)+4);                              \
-      out_accum.z += *(int16_t*)((ptr)+6);                              \
+      uint16_t b_ctrl = (uint16_t)ctrl;                                 \
+      uint16_t x_ctrl = (uint16_t)(ctrl >> 16);                         \
+      uint16_t y_ctrl = (uint16_t)(ctrl >> 32);                         \
+      uint16_t z_ctrl = (uint16_t)(ctrl >> 48);                         \
+      alt_out = (b_ctrl >> 1) & 1;                                      \
+      c_occ = ((b_ctrl & 4) << 4) | ((x_ctrl & 7) << 3) | (y_ctrl & 7); \
+      c_chg = (z_ctrl & 7) - 3;                                         \
+      out_accum.b += ((int16_t)b_ctrl) >> 3;                            \
+      out_accum.x += ((int16_t)x_ctrl) >> 3;                            \
+      out_accum.y += ((int16_t)y_ctrl) >> 3;                            \
+      out_accum.z += ((int16_t)z_ctrl) >> 3;                            \
       ptr += 8;                                                         \
     }                                                                   \
   } while(0)
@@ -166,7 +186,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
   if (mask & (1ULL << 3)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
   if (mask & (1ULL << 4)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
   if (mask & (1ULL << 5)) {
-    uint64_t dict_len = *(uint64_t*)(buffer + dict_scan_off); 
+    uint64_t dict_len = *(uint64_t*)(buffer + dict_scan_off);
     dict_scan_off += 8 + dict_len + ((8 - (dict_len % 8)) % 8);
   }
   if (mask & (1ULL << 6)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
@@ -180,17 +200,26 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
   if (!out) {
     int32_t local_sink = 0;
     while (offset < size) {
-      uint16_t num_residues = *(uint16_t*)(buffer + offset);
-      if (num_residues == 0xFFFE) { offset += 8; continue; }
-      if (num_residues == 0xFFFF) break;
+      uint32_t r_a = *(uint32_t*)(buffer + offset);
+      uint32_t num_residues = r_a >> 18;
+      uint32_t num_atoms = r_a & 0x3FFFF;
 
-      uint16_t num_atoms = *(uint16_t*)(buffer + offset + 2);
+      if (num_residues == 0x3FFE) { offset += 8; continue; }
+      if (num_residues == 0x3FFF) { offset += 8; break; }
+
       offset += 8;
 
       const uint8_t* seq_ptr = buffer + offset;
-      int seq_bytes = 0;
-      for (uint32_t r = 0; r < num_residues; r++) {
-        if (seq_ptr[seq_bytes++] == 0x7C) seq_bytes++;
+      int seq_bytes = num_residues;
+      const uint8_t* search_ptr = seq_ptr;
+      const uint8_t* end_ptr = seq_ptr + seq_bytes;
+
+      // Vectorized memory scanning skips scalar bottlenecks
+      while (search_ptr < end_ptr) {
+        const uint8_t* found = (const uint8_t*)memchr(search_ptr, 0x7C, end_ptr - search_ptr);
+        if (!found) break;
+        seq_bytes++; end_ptr++;
+        search_ptr = found + 2;
       }
 
       offset += seq_bytes + ((8 - (seq_bytes & 7)) & 7);
@@ -202,15 +231,12 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
 #elif defined(__aarch64__) || defined(__ARM_NEON)
       accum = vdupq_n_s32(0);
 #else
-      accum.x = 0; accum.y = 0; accum.z = 0;
+      accum.x = 0; accum.y = 0; accum.z = 0; accum.b = 0;
 #endif
 
+      // Removed the empty slot branch (adding 0 is harmless)
       for (uint32_t a = 0; a < num_atoms; a++) {
-        if (*(uint64_t*)atom_ptr != 0) {
-          SIMD_DECODE_PHASE1(atom_ptr, accum);
-        } else {
-          atom_ptr += 8;
-        }
+        SIMD_DECODE_PHASE1(atom_ptr, accum);
       }
       local_sink += GET_SIMD_X(accum); offset = (size_t)(atom_ptr - buffer);
     }
@@ -288,18 +314,25 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
 
   size_t scan_off = offset, conect_offset = 0;
   while (scan_off < size) {
-    uint16_t num_residues = *(uint16_t*)(buffer + scan_off);
-    if (num_residues == 0xFFFE) { scan_off += 8; continue; }
-    if (num_residues == 0xFFFF) { scan_off += 8; conect_offset = scan_off; break; }
-    uint16_t num_atoms = *(uint16_t*)(buffer + scan_off + 2);
+    uint32_t r_a = *(uint32_t*)(buffer + scan_off);
+    uint32_t num_residues = r_a >> 18;
+    uint32_t num_atoms = r_a & 0x3FFFF;
+    if (num_residues == 0x3FFE) { scan_off += 8; continue; }
+    if (num_residues == 0x3FFF) { scan_off += 8; conect_offset = scan_off; break; }
+
     int16_t seq_raw = *(int16_t*)(buffer + scan_off + 6);
     int has_ter = seq_raw & 1;
     scan_off += 8;
 
-    int scan_seq_bytes = 0;
     const uint8_t* scan_seq_ptr = buffer + scan_off;
-    for (uint32_t r = 0; r < num_residues; r++) {
-      if (scan_seq_ptr[scan_seq_bytes++] == 0x7C) scan_seq_bytes++;
+    int scan_seq_bytes = num_residues;
+    const uint8_t* search_ptr = scan_seq_ptr;
+    const uint8_t* end_ptr = scan_seq_ptr + scan_seq_bytes;
+    while (search_ptr < end_ptr) {
+      const uint8_t* found = (const uint8_t*)memchr(search_ptr, 0x7C, end_ptr - search_ptr);
+      if (!found) break;
+      scan_seq_bytes++; end_ptr++;
+      search_ptr = found + 2;
     }
     scan_off += scan_seq_bytes + ((8 - (scan_seq_bytes & 7)) & 7);
 
@@ -393,23 +426,24 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
 
   int has_anchor = 0;
   while (offset < size) {
-    uint16_t num_residues = *(uint16_t*)(buffer + offset);
-    if (num_residues == 0xFFFE) { offset += 8; continue; }
-    if (num_residues == 0xFFFF) { break; }
+    uint32_t r_a = *(uint32_t*)(buffer + offset);
+    uint32_t num_residues = r_a >> 18;
+    uint32_t num_atoms = r_a & 0x3FFFF;
+    if (num_residues == 0x3FFE) { offset += 8; continue; }
+    if (num_residues == 0x3FFF) { break; }
 
-    uint16_t num_atoms = *(uint16_t*)(buffer + offset + 2);
     uint8_t c1_raw = buffer[offset + 4];
     uint8_t c2_raw = buffer[offset + 5];
     int16_t seq_raw = *(int16_t*)(buffer + offset + 6);
-    
+
     char c1 = c1_raw & 0x7F; if (c1 == 0) c1 = ' ';
     char c2 = c2_raw & 0x7F; if (c2 == 0) c2 = ' ';
-    
+
     int is_n_term = (c1_raw & 0x80) != 0;
     int is_c_term = (c2_raw & 0x80) != 0;
     int has_ter = seq_raw & 1;
-    int16_t start_resSeq = seq_raw >> 1; 
-    
+    int16_t start_resSeq = seq_raw >> 1;
+
     offset += 8;
 
     const uint8_t* seq_ptr = buffer + offset;
@@ -424,7 +458,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
         int is_first = (!first_seen) && is_n_term;
         int is_last  = (r == (uint32_t)(num_residues - 1)) && is_c_term;
         first_seen = 1;
-        
+
         expected_atoms += (is_last ? UDICT[type].h_end_cterm : UDICT[type].h_end_norm) - (is_first ? 0 : UDICT[type].h_start_norm);
         if (has_hydrogens) {
           expected_atoms += (is_last ? UDICT[type].hy_end_cterm : UDICT[type].hy_end_norm) - (is_first ? 0 : UDICT[type].hy_start_norm);
@@ -437,10 +471,10 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
     int32_t current_resSeq = start_resSeq; int first_res = 1;
     uint8_t last_valid_type = 0; char iCode = ' ';
 
-    int32_t current_occ = 10000;
+    int32_t current_occ = 100;
     int8_t current_charge = 0;
     char active_alt_char = 'A';
-    int first_decoded = 0; // Add this tracking flag here
+    int first_decoded = 0;
 
     accum_t accum;
     accum_t anchor_accum;
@@ -452,8 +486,8 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
     accum = vdupq_n_s32(0);
     anchor_accum = vdupq_n_s32(0);
 #else
-    accum.x = 0; accum.y = 0; accum.z = 0;
-    anchor_accum.x = 0; anchor_accum.y = 0; anchor_accum.z = 0;
+    accum.x = 0; accum.y = 0; accum.z = 0; accum.b = 0;
+    anchor_accum.x = 0; anchor_accum.y = 0; anchor_accum.z = 0; anchor_accum.b = 0;
 #endif
 
     int atoms_left = 0;
@@ -461,7 +495,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
     uint32_t parsed_base_atoms = 0;
     int s_idx = 0;
     int no_inc = 0;
-    
+
     int processing_hydrogens = 0;
     int h_start = 0, h_end = 0;
     int hy_start = 0, hy_end = 0;
@@ -475,7 +509,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
           has_anchor = 0;
         }
         if (parsed_base_atoms < expected_atoms) {
-          uint8_t meta; 
+          uint8_t meta;
           iCode = ' ';
           do {
             if (s_idx >= seq_bytes) break;
@@ -488,22 +522,22 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
             last_valid_type = meta & 0xFF;
             if (!first_res && !no_inc) { current_resSeq++; }
             first_res = 0; no_inc = 0;
-            
+
             int is_first = (!first_decoded) && is_n_term;
             int is_last  = (s_idx == seq_bytes) && is_c_term;
             first_decoded = 1;
-            
+
             h_start = is_first ? 0 : UDICT[last_valid_type].h_start_norm;
             h_end   = is_last  ? UDICT[last_valid_type].h_end_cterm : UDICT[last_valid_type].h_end_norm;
-            
+
             hy_start = 0; hy_end = 0;
             if (has_hydrogens) {
                 hy_start = is_first ? 0 : UDICT[last_valid_type].hy_start_norm;
                 hy_end   = is_last  ? UDICT[last_valid_type].hy_end_cterm : UDICT[last_valid_type].hy_end_norm;
             }
-            
+
             atoms_left = (h_end - h_start) + (hy_end - hy_start);
-            atom_dict_idx = h_start; 
+            atom_dict_idx = h_start;
             processing_hydrogens = 0;
           } else {
             atoms_left = 1;
@@ -517,8 +551,8 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
       int alt_flag = 0;
 
       if (*(uint64_t*)atom_ptr != 0) {
-        int32_t v_b;
-        SIMD_DECODE_MACRO(atom_ptr, accum, current_occ, current_charge, v_b, alt_flag);
+        SIMD_DECODE_MACRO(atom_ptr, accum, current_occ, current_charge, alt_flag);
+        int32_t v_b = GET_SIMD_B(accum);
 
         int anchor_idx = (last_valid_type >= 0x20 && last_valid_type < 0x60) ? 2 : 8;
         if (last_valid_type < 0x80 && atom_dict_idx == anchor_idx && !processing_hydrogens) {
@@ -543,7 +577,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
             a_name = UDICT[last_valid_type].hy_atoms[atom_dict_idx];
             e_name = UDICT[last_valid_type].hy_elements[atom_dict_idx];
         } else {
-            a_name = " UNK"; 
+            a_name = " UNK";
             e_name = " X";
         }
 
@@ -575,7 +609,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
         parsed_base_atoms++;
         atom_dict_idx++;
         active_alt_char = 'A';
-        
+
         if (!processing_hydrogens && atom_dict_idx == h_end) {
             processing_hydrogens = 1;
             atom_dict_idx = hy_start;

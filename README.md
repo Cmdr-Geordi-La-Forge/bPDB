@@ -1,6 +1,6 @@
 # Binary PDB (bPDB) Format Specification (V6)
 
-The bPDB V6 architecture utilizes a Data-Oriented (SoA), completely unmasked coordinate atom stream. It achieves extreme compression and zero-shift SIMD parsing speeds by employing native 16-bit signed integer deltas, perfectly interleaved 16-byte New Anchor blocks, and an unbroken geometric running sum across the entire chain. Models are isolated into independent files to support concurrent streaming.
+The bPDB V6 architecture utilizes a Data-Oriented (SoA), completely unmasked coordinate atom stream. It achieves extreme compression and zero-shift SIMD parsing speeds by employing native 13-bit and 32-bit integer deltas, perfectly interleaved 16-byte New Anchor blocks, and an unbroken geometric running sum across the entire chain. Models are isolated into independent files to support concurrent streaming.
 
 Every structure and section in the format is strictly **8-byte aligned**.
 
@@ -48,79 +48,70 @@ The decoder reads this mask to determine exactly which metadata payloads follow.
 Coordinates are organized into sequential "Chains." Each chain declares its topology and length up front, followed by an unbroken stream of atom blocks.
 
 ### 3.1 Chain Header (8 Bytes)
-| Offset | Type     | Description                                                                                                                                     |
-|:-------|:---------|:------------------------------------------------------------------------------------------------------------------------------------------------|
-| `+0`   | `uint16` | **num_residues**: Number of 1-byte links in the Sequence Track. `0xFFFF` signals EOF, `0xFFFE` signals a fragment boundary.                     |
-| `+2`   | `uint16` | **num_atoms**: Total number of spatial atoms in the stream.                                                                                     |
-| `+4`   | `uint8`  | **chain_id 1 & N-Term flag**: Bits `0-6` encode the 7-bit ASCII chain char. **Bit 7 (`0x80`) is the `is_n_term` flag**.                         |
-| `+5`   | `uint8`  | **chain_id 2 & C-Term flag**: Bits `0-6` encode the second ASCII chain char. **Bit 7 (`0x80`) is the `is_c_term` flag**.                        |
-| `+6`   | `int16`  | **start_resSeq & TER flag**: Signed starting Residue Sequence Number shifted left by 1 bit (`resSeq << 1`). **Bit 0 (LSB) is the `TER` flag**.  |
+| Offset | Type     | Description                                                                                                                     |
+|:-------|:---------|:--------------------------------------------------------------------------------------------------------------------------------|
+| `+0`   | `uint32` | **num_residues** (14-bit MSB) & **num_atoms** (18-bit LSB). `num_residues` = `0x3FFF` signals EOF, `0x3FFE` signals a fragment. |
+| `+4`   | `uint8`  | **chain_id 1 & N-Term flag**: Bits `0-6` encode the 7-bit ASCII chain char. **Bit 7 (`0x80`) is the `is_n_term` flag**.         |
+| `+5`   | `uint8`  | **chain_id 2 & C-Term flag**: Bits `0-6` encode the second ASCII chain char. **Bit 7 (`0x80`) is the `is_c_term` flag**.        |
+| `+6`   | `int16`  | **start_resSeq & TER flag**: Signed starting Residue Sequence Number shifted left (`resSeq << 1`). **Bit 0 is the `TER` flag**. |
 
 ### 3.2 Sequence Track (Bytecode Machine)
 A 1-dimensional array of `uint8_t` immediately following the Chain Header. The dictionary memory map natively defines terminal bounds based on the chain header flags.
 *   **`0x00` (GAP):** Indicates a missing residue. Increments `resSeq` by 1. Parses no atoms.
 *   **Bits 0-6 (Type ID):** Encodes Valid Residues mapped directly to the internal 256-element dictionary array:
-    *   `0x01-0x1F`: Standard Nucleic Acids.
-    *   `0x20-0x5F`: Standard Amino Acids.
-    *   `0x60-0x7F`: Solvents.
-    *   `0x80+`: Custom `HET_DICT` molecules.
+
+    *   **`0x01-0x1F`: Standard Nucleic Acids**
+        * `0x01`: A, `0x02`: C, `0x03`: G, `0x04`: U, `0x05`: I, `0x06`: DA, `0x07`: DC, `0x08`: DG, `0x09`: DT, `0x0A`: DU, `0x0B`: DI, `0x0C`: N
+    *   **`0x20-0x5F`: Standard Amino Acids**
+        * `0x21`: ALA, `0x22`: ARG, `0x23`: ASN, `0x24`: ASP, `0x25`: CYS, `0x26`: GLN, `0x27`: GLU, `0x28`: GLY, `0x29`: HIS, `0x2A`: ILE, `0x2B`: LEU, `0x2C`: LYS, `0x2D`: MET, `0x2E`: PHE, `0x2F`: PRO, `0x30`: SER, `0x31`: THR, `0x32`: TRP, `0x33`: TYR, `0x34`: VAL, `0x35`: SEC, `0x36`: PYL, `0x37`: ASX, `0x38`: GLX, `0x39`: UNK
+    *   **`0x60-0x7F`: Solvents**
+        * `0x61`: HOH
+    *   **`0x80+`:** Custom `HET_DICT` molecules.
+
 *   **Bit 7 (`0x80` - iCode Flag):** If set, the *immediately following byte* in the array is an ASCII Insertion Code character (e.g., `'A'`).
 
 *(The Sequence Track is padded with `0x00` to the nearest 8-byte boundary).*
 
 ## 4. Coordinate Atom Track (Zero-Shift SIMD Array)
 
-To achieve native SIMD load speeds, standard atom coordinates no longer use per-lane bit-packing. Math operations execute natively on perfectly aligned signed 16-bit integers. Properties like Occupancy, Charge, and Alternate Locations are evaluated natively, and explicitly written into the stream via an interleaved 16-byte New Anchor Block only when necessary.
+Math operations execute natively on perfectly aligned blocks. Properties like Occupancy, Charge, and Alternate Locations are evaluated natively within the 8-byte atom lanes, dropping state-tracking requirements.
 
 ### 4.1 Unbroken Difference Accumulation (`Control == 0`)
-A standard 8-byte block handles native intra-chain coordinate deltas up to **± 32.767 Å** (scaled by 1000). The accumulator is a pure unbroken running sum, ignoring residue boundaries entirely. Standard blocks natively imply a sparse charge of `0`.
+A standard 8-byte block handles native intra-chain coordinate deltas up to **± 4.095 Å** (scaled by 1000). The accumulator is a pure unbroken running sum, ignoring residue boundaries entirely.
 
-| Bytes | Type       | Description                                                                                                |
-|:------|:-----------|:-----------------------------------------------------------------------------------------------------------|
-| `0-1` | `uint16_t` | Bits 2-15: Absolute B-factor (0.00 to 163.83). Bit 1: AltLoc Presence Flag. **Bit 0: Control Flag (`0`)**. |
-| `2-3` | `int16_t`  | $\Delta X$ relative to previous atom.                                                                      |
-| `4-5` | `int16_t`  | $\Delta Y$ relative to previous atom.                                                                      |
-| `6-7` | `int16_t`  | $\Delta Z$ relative to previous atom.                                                                      |
+| Bytes | Type     | Description                                                                                                    |
+|:------|:---------|:---------------------------------------------------------------------------------------------------------------|
+| `0-1` | `uint16` | Bits 3-15: $\Delta B$ (13-bit). Bit 2: Occupancy bit 6. Bit 1: AltLoc Presence Flag. **Bit 0: Control (`0`)**. |
+| `2-3` | `uint16` | Bits 3-15: $\Delta X$ (13-bit). Bits 0-2: Occupancy bits 3-5.                                                  |
+| `4-5` | `uint16` | Bits 3-15: $\Delta Y$ (13-bit). Bits 0-2: Occupancy bits 0-2.                                                  |
+| `6-7` | `uint16` | Bits 3-15: $\Delta Z$ (13-bit). Bits 0-2: Charge (3-bit unsigned, evaluate as `val - 3`).                      |
 
-### 4.2 Absolute New Anchors & Sparse Charge (`Control == 1`)
-If a spatial jump exceeds ± 32.767 Å (chain gaps, isolated HETATMs, waters), OR if the implicit atom states (Occupancy or physical Charge) change, the stream emits a 16-byte absolute New Anchor.
+### 4.2 Absolute New Anchors (`Control == 1`)
+If a spatial jump exceeds ± 4.095 Å (chain gaps, isolated HETATMs, waters), the stream emits a 16-byte absolute New Anchor.
 
-Because ~99% of biological atoms are uncharged, charge is not a persistent state variable. If an atom has a non-zero charge, it is forced to use a New Anchor. The immediate next standard block intrinsically drops the charge back to 0 without requiring another jump.
-
-This leverages 31-bit native geometry via direct memory concatenation: The Base block MSBs combine perfectly with the 16-bit LSBs from the immediate next Atom block to stably construct absolute coordinates up to **± 8,388.6 Å** using native pointer loading. A 3-bit charge (-3 to +4) is compressed into the lowest bit of each coordinate MSB byte.
-
-**1. The Base Jump Block (8 Bytes, `Control == 1`)**
-Appears first. Contains perfectly interleaved 15-bit MSBs and sparse charge encoding.
-*   `+0`: Absolute Occupancy (0-100) `<< 1` | **Control Flag (`1`)**.
-*   `+1`: Absolute B-factor MSB.
-*   `+2-3`: 15-bit Absolute X-coordinate MSB `<< 1` | Charge Bit 0.
-*   `+4-5`: 15-bit Absolute Y-coordinate MSB `<< 1` | Charge Bit 1.
-*   `+6-7`: 15-bit Absolute Z-coordinate MSB `<< 1` | Charge Bit 2.
-
-**2. The Concatenated Atom Block (8 Bytes)**
-Immediately follows the Base Block. Contains 16-bit LSBs.
-*   `+0-1`: Absolute B-factor LSBs (14 bits) `<< 2` | AltLoc Presence Flag `<< 1` | Control Flag (`0`).
-*   `+2-3`: X-coordinate LSBs (16 bits).
-*   `+4-5`: Y-coordinate LSBs (16 bits).
-*   `+6-7`: Z-coordinate LSBs (16 bits).
+**The Anchor Block (16 Bytes, `Control == 1`)**
+*   **Word 0 (Bytes 0-3):** 30-bit absolute X-coordinate `<< 2` | `alt_flag` `<< 1` | `Control (1)`.
+*   **Word 1 (Bytes 4-7):** 32-bit absolute Y-coordinate.
+*   **Word 2 (Bytes 8-11):** 32-bit absolute Z-coordinate.
+*   **Word 3 (Bytes 12-15):** 22-bit absolute B-factor `<< 10` | Absolute Occupancy (7 bits) `<< 3` | Charge (3 bits).
 
 ### 4.3 Implicit Alternate Location Engine
-Explicit alternate location characters (`0x7F DUP` flags) are completely removed from the format. The decoder relies strictly on topological grouping natively stored in the stream. The `AltLoc Presence Flag` (`bit 1` of the Atom Block) temporarily pauses the decoder's sequence dictionary iterator while natively driving an implicit alphabetical state machine (`A -> B -> C`) for infinite overlapping conformers without overhead.
+Explicit alternate location characters (`0x7F DUP` flags) are completely removed from the format. The decoder relies strictly on topological grouping natively stored in the stream. The `AltLoc Presence Flag` temporarily pauses the decoder's sequence dictionary iterator while natively driving an implicit alphabetical state machine (`A -> B -> C`) for infinite overlapping conformers without overhead.
 
 ### 4.4 Split-Topology Dictionary & Hydrogen Stream
 The internal dictionary handles complex terminal variations intrinsically. Heavy atoms and hydrogen atoms are strictly partitioned into parallel data tracks (`h_atoms`, `hy_atoms`) with dedicated topological bounds (`start_norm`, `end_norm`, `end_cterm`).
 
-By referencing the `is_n_term` and `is_c_term` bits encoded directly into the Chain Header, the decoder effortlessly snaps its local dictionary iteration bounds to include or exclude terminal variants (like `H1/H2/H3`, `OXT`, `HO5'`, `OP3`) without requiring any explicit bytecodes in the sequence stream.
+By referencing the `is_n_term` and `is_c_term` bits encoded directly into the Chain Header, the decoder effortlessly snaps its local dictionary iteration bounds to include or exclude terminal variants without requiring any explicit bytecodes in the sequence stream.
 
 ## 5. End of File & Connectivity
 
 ### 5.1 Fragment Boundary & End of Model Markers
 The coordinate stream incorporates topological opcode boundaries injected directly into the `num_residues` parameter of the Chain Header:
-*   **Fragment Boundary (`0xFFFE`):** Indicates a seamless transition between split input files (e.g., AF-DB fragments). The decoder ignores this boundary, skipping 8 bytes to continue the geometric stream without breaking the structure output.
-*   **End of Model (`0xFFFF`):** Indicates the absolute end of the spatial coordinate stream for the current model, triggering the decoder to break the coordinate loop.
+*   **Fragment Boundary (`0x3FFE`):** Indicates a seamless transition between split input files (e.g., AF-DB fragments).
+*   **End of Model (`0x3FFF`):** Indicates the absolute end of the spatial coordinate stream for the current model, triggering the decoder to break the coordinate loop.
 
 ### 5.2 CONECT Stream
-Following the `0xFFFF` EOF marker is a flat array of 32-bit integers representing atomic linkages.
+Following the `0x3FFF` EOF marker is a flat array of 32-bit integers representing atomic linkages.
 1. `int32_t N` (Number of target atoms)
 2. `int32_t source_atom_id`
 3. $N$ sequential `int32_t target_atom_ids`

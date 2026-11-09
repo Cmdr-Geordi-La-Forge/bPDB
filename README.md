@@ -1,6 +1,6 @@
-# Binary PDB (bPDB) Format Specification (V6)
+# Binary PDB (bPDB) Format Specification (V0)
 
-The bPDB V6 architecture utilizes a Data-Oriented (SoA), completely unmasked coordinate atom stream. It achieves extreme compression and zero-shift SIMD parsing speeds by employing native 13-bit and 32-bit integer deltas, perfectly interleaved 16-byte New Anchor blocks, and an unbroken geometric running sum across the entire chain. Models are isolated into independent files to support concurrent streaming.
+The bPDB V0 architecture utilizes a Data-Oriented (SoA), completely unmasked coordinate atom stream. It achieves extreme compression and zero-shift SIMD parsing speeds by employing native 13-bit integer deltas and completely symmetric 16-byte absolute Anchor blocks. The geometric running sum is perfectly unbroken across the entire chain. Models are isolated into independent files to support concurrent streaming.
 
 Every structure and section in the format is strictly **8-byte aligned**.
 
@@ -18,7 +18,7 @@ A valid bPDB file consists of four sequential sections:
 | Offset | Type       | Description                                                   |
 |:-------|:-----------|:--------------------------------------------------------------|
 | `+0`   | `char[4]`  | Magic String: `"bPDB"`                                        |
-| `+4`   | `uint8`    | Format Version (`0x06`)                                       |
+| `+4`   | `uint8`    | Format Version (`0x00`)                                       |
 | `+5`   | `uint8`    | Deposition Day (1-31)                                         |
 | `+6`   | `uint8`    | Deposition Month (1-12)                                       |
 | `+7`   | `uint8`    | Deposition Year (`YYYY - 1973`)                               |
@@ -29,12 +29,12 @@ A valid bPDB file consists of four sequential sections:
 
 ### 2.2 Global 64-bit Metadata Bitmask
 Immediately following the 64-byte fixed header is a single 8-byte (`uint64_t`) metadata header.
-*   **Bits 0-7:** File version duplicate (`0x06`).
+*   **Bits 0-7:** File version duplicate (`0x00`).
 *   **Bits 16-63:** The 48-bit Metadata Presence Mask.
 
 The decoder reads this mask to determine exactly which metadata payloads follow. Payloads are written in bit-sequential order, heavily padded to 8-byte boundaries:
 
-*   **Bit 0 (`META_AF_MODE`):** If `1`, indicates an AlphaFold/Predicted model. Occupancy is statically assumed to be `1.00` and Charge `0`, bypassing all related metadata evaluation. (No payload bytes).
+*   **Bit 0 (`META_AF_MODE`):** If `1`, indicates an AlphaFold/Predicted model. Occupancy is statically assumed to be `1.00` and Charge `0`.
 *   **Bit 1 (`RESOLUTION`):** `float` (4 bytes) + `0x00` pad (4 bytes).
 *   **Bit 2 (`TITLE`):** `uint64_t` length + payload string + 8-byte alignment padding.
 *   **Bit 3 (`EXPDTA`):** `uint64_t` length + payload string + 8-byte alignment padding.
@@ -56,18 +56,13 @@ Coordinates are organized into sequential "Chains." Each chain declares its topo
 | `+6`   | `int16`  | **start_resSeq & TER flag**: Signed starting Residue Sequence Number shifted left (`resSeq << 1`). **Bit 0 is the `TER` flag**. |
 
 ### 3.2 Sequence Track (Bytecode Machine)
-A 1-dimensional array of `uint8_t` immediately following the Chain Header. The dictionary memory map natively defines terminal bounds based on the chain header flags.
+A 1-dimensional array of `uint8_t` immediately following the Chain Header.
 *   **`0x00` (GAP):** Indicates a missing residue. Increments `resSeq` by 1. Parses no atoms.
 *   **Bits 0-6 (Type ID):** Encodes Valid Residues mapped directly to the internal 256-element dictionary array:
-
-    *   **`0x01-0x1F`: Standard Nucleic Acids**
-        * `0x01`: A, `0x02`: C, `0x03`: G, `0x04`: U, `0x05`: I, `0x06`: DA, `0x07`: DC, `0x08`: DG, `0x09`: DT, `0x0A`: DU, `0x0B`: DI, `0x0C`: N
-    *   **`0x20-0x5F`: Standard Amino Acids**
-        * `0x21`: ALA, `0x22`: ARG, `0x23`: ASN, `0x24`: ASP, `0x25`: CYS, `0x26`: GLN, `0x27`: GLU, `0x28`: GLY, `0x29`: HIS, `0x2A`: ILE, `0x2B`: LEU, `0x2C`: LYS, `0x2D`: MET, `0x2E`: PHE, `0x2F`: PRO, `0x30`: SER, `0x31`: THR, `0x32`: TRP, `0x33`: TYR, `0x34`: VAL, `0x35`: SEC, `0x36`: PYL, `0x37`: ASX, `0x38`: GLX, `0x39`: UNK
-    *   **`0x60-0x7F`: Solvents**
-        * `0x61`: HOH
+    *   **`0x01-0x1F`: Standard Nucleic Acids** (e.g., A, C, G, U, DA)
+    *   **`0x20-0x5F`: Standard Amino Acids** (e.g., ALA, ARG, SEC, PYL)
+    *   **`0x60-0x7F`: Solvents** (e.g., HOH)
     *   **`0x80+`:** Custom `HET_DICT` molecules.
-
 *   **Bit 7 (`0x80` - iCode Flag):** If set, the *immediately following byte* in the array is an ASCII Insertion Code character (e.g., `'A'`).
 
 *(The Sequence Track is padded with `0x00` to the nearest 8-byte boundary).*
@@ -87,26 +82,29 @@ A standard 8-byte block handles native intra-chain coordinate deltas up to **± 
 | `6-7` | `uint16` | Bits 3-15: $\Delta Z$ (13-bit). Bits 0-2: Charge (3-bit unsigned, evaluate as `val - 3`).                      |
 
 ### 4.2 Absolute New Anchors (`Control == 1`)
-If a spatial jump exceeds ± 4.095 Å (chain gaps, isolated HETATMs, waters), the stream emits a 16-byte absolute New Anchor.
+If a spatial jump exceeds ± 4.095 Å (chain gaps, isolated HETATMs, waters), the stream emits a 16-byte absolute New Anchor. The Anchor is **100% symmetric** with the standard atom block lane order (B, X, Y, Z), forming a precise 28-bit coordinate space.
 
-**The Anchor Block (16 Bytes, `Control == 1`)**
-*   **Word 0 (Bytes 0-3):** 30-bit absolute X-coordinate `<< 2` | `alt_flag` `<< 1` | `Control (1)`.
-*   **Word 1 (Bytes 4-7):** 32-bit absolute Y-coordinate.
-*   **Word 2 (Bytes 8-11):** 32-bit absolute Z-coordinate.
-*   **Word 3 (Bytes 12-15):** 22-bit absolute B-factor `<< 10` | Absolute Occupancy (7 bits) `<< 3` | Charge (3 bits).
+All explicit metadata (Occupancy, Charge, AltLoc) is offloaded entirely to the 13-bit LSB block.
+
+**1. The MSB Block (Bytes 0-7, `Control == 1`)**
+Contains the 15-bit Most Significant Bits of the absolute values.
+*   `+0-1`: 15-bit B-factor MSB `<< 1` | `1` (Control Flag).
+*   `+2-3`: 15-bit Absolute X MSB `<< 1` | `0`.
+*   `+4-5`: 15-bit Absolute Y MSB `<< 1` | `0`.
+*   `+6-7`: 15-bit Absolute Z MSB `<< 1` | `0`.
+
+**2. The LSB Block (Bytes 8-15, `Control == 0`)**
+Immediately follows the MSB block and exactly mimics the standard $\Delta$ block layout, carrying the 13-bit LSBs alongside the native metadata (Occupancy and Charge).
 
 ### 4.3 Implicit Alternate Location Engine
 Explicit alternate location characters (`0x7F DUP` flags) are completely removed from the format. The decoder relies strictly on topological grouping natively stored in the stream. The `AltLoc Presence Flag` temporarily pauses the decoder's sequence dictionary iterator while natively driving an implicit alphabetical state machine (`A -> B -> C`) for infinite overlapping conformers without overhead.
 
 ### 4.4 Split-Topology Dictionary & Hydrogen Stream
-The internal dictionary handles complex terminal variations intrinsically. Heavy atoms and hydrogen atoms are strictly partitioned into parallel data tracks (`h_atoms`, `hy_atoms`) with dedicated topological bounds (`start_norm`, `end_norm`, `end_cterm`).
-
-By referencing the `is_n_term` and `is_c_term` bits encoded directly into the Chain Header, the decoder effortlessly snaps its local dictionary iteration bounds to include or exclude terminal variants without requiring any explicit bytecodes in the sequence stream.
+Heavy atoms and hydrogen atoms are strictly partitioned into parallel data tracks (`h_atoms`, `hy_atoms`) with dedicated topological bounds (`start_norm`, `end_norm`, `end_cterm`). The decoder effortlessly snaps its local dictionary iteration bounds to include or exclude terminal variants based on the header flags.
 
 ## 5. End of File & Connectivity
 
 ### 5.1 Fragment Boundary & End of Model Markers
-The coordinate stream incorporates topological opcode boundaries injected directly into the `num_residues` parameter of the Chain Header:
 *   **Fragment Boundary (`0x3FFE`):** Indicates a seamless transition between split input files (e.g., AF-DB fragments).
 *   **End of Model (`0x3FFF`):** Indicates the absolute end of the spatial coordinate stream for the current model, triggering the decoder to break the coordinate loop.
 

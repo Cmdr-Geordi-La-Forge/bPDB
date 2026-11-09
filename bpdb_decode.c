@@ -24,16 +24,15 @@ typedef struct { int32_t b, x, y, z; } accum_t;
 #define GET_SIMD_Z(acc) ((acc).z)
 #endif
 
-// Unifies memory reads to prevent Partial Register Stalls
+// Unifies memory reads and creates a 100% symmetric SIMD phase
 #if defined(__AVX2__) || defined(__SSE4_1__)
 #define SIMD_DECODE_PHASE1(ptr, out_accum) do {                         \
     uint64_t ctrl = *(uint64_t*)(ptr);                                  \
     if ((uint32_t)ctrl & 0x01) {                                        \
-      int32_t w0 = (int32_t)ctrl;                                       \
-      int32_t w1 = *(int32_t*)(ptr + 4);                                \
-      int32_t w2 = *(int32_t*)(ptr + 8);                                \
-      int32_t w3 = *(int32_t*)(ptr + 12);                               \
-      out_accum = _mm_set_epi32(w2, w1, w0 >> 2, w3 >> 10);             \
+      __m128i msb = _mm_cvtepi16_epi32(_mm_cvtsi64_si128(ctrl));        \
+      out_accum = _mm_slli_epi32(_mm_srai_epi32(msb, 1), 13);           \
+      __m128i lsb = _mm_cvtepi16_epi32(_mm_cvtsi64_si128(*(uint64_t*)(ptr + 8))); \
+      out_accum = _mm_add_epi32(out_accum, _mm_srai_epi32(lsb, 3));     \
       ptr += 16;                                                        \
     } else {                                                            \
       __m128i loaded = _mm_cvtsi64_si128(ctrl);                         \
@@ -46,11 +45,10 @@ typedef struct { int32_t b, x, y, z; } accum_t;
 #define SIMD_DECODE_PHASE1(ptr, out_accum) do {                         \
     uint64_t ctrl = *(uint64_t*)(ptr);                                  \
     if ((uint32_t)ctrl & 0x01) {                                        \
-      int32_t w0 = (int32_t)ctrl;                                       \
-      int32_t w1 = *(int32_t*)(ptr + 4);                                \
-      int32_t w2 = *(int32_t*)(ptr + 8);                                \
-      int32_t w3 = *(int32_t*)(ptr + 12);                               \
-      out_accum = (int32x4_t){w3 >> 10, w0 >> 2, w1, w2};               \
+      int16x4_t msb = vreinterpret_s16_u8(vcreate_u8(ctrl));            \
+      int32x4_t msb_32 = vshlq_n_s32(vmovl_s16(vshr_n_s16(msb, 1)), 13);\
+      int16x4_t lsb = vreinterpret_s16_u8(vcreate_u8(*(uint64_t*)(ptr + 8))); \
+      out_accum = vaddq_s32(msb_32, vmovl_s16(vshr_n_s16(lsb, 3)));     \
       ptr += 16;                                                        \
     } else {                                                            \
       int16x4_t loaded = vreinterpret_s16_u8(vcreate_u8(ctrl));         \
@@ -63,14 +61,15 @@ typedef struct { int32_t b, x, y, z; } accum_t;
 #define SIMD_DECODE_PHASE1(ptr, out_accum) do {                         \
     uint64_t ctrl = *(uint64_t*)(ptr);                                  \
     if ((uint32_t)ctrl & 0x01) {                                        \
-      int32_t w0 = (int32_t)ctrl;                                       \
-      int32_t w1 = *(int32_t*)(ptr + 4);                                \
-      int32_t w2 = *(int32_t*)(ptr + 8);                                \
-      int32_t w3 = *(int32_t*)(ptr + 12);                               \
-      out_accum.b = w3 >> 10;                                           \
-      out_accum.x = w0 >> 2;                                            \
-      out_accum.y = w1;                                                 \
-      out_accum.z = w2;                                                 \
+      out_accum.b = (((int16_t)(uint16_t)ctrl) >> 1) << 13;             \
+      out_accum.x = (((int16_t)(uint16_t)(ctrl >> 16)) >> 1) << 13;     \
+      out_accum.y = (((int16_t)(uint16_t)(ctrl >> 32)) >> 1) << 13;     \
+      out_accum.z = (((int16_t)(uint16_t)(ctrl >> 48)) >> 1) << 13;     \
+      uint64_t lsb_ctrl = *(uint64_t*)(ptr + 8);                        \
+      out_accum.b += ((int16_t)(uint16_t)lsb_ctrl) >> 3;                \
+      out_accum.x += ((int16_t)(uint16_t)(lsb_ctrl >> 16)) >> 3;        \
+      out_accum.y += ((int16_t)(uint16_t)(lsb_ctrl >> 32)) >> 3;        \
+      out_accum.z += ((int16_t)(uint16_t)(lsb_ctrl >> 48)) >> 3;        \
       ptr += 16;                                                        \
     } else {                                                            \
       out_accum.b += ((int16_t)(uint16_t)ctrl) >> 3;                    \
@@ -86,14 +85,18 @@ typedef struct { int32_t b, x, y, z; } accum_t;
 #define SIMD_DECODE_MACRO(ptr, out_accum, c_occ, c_chg, alt_out) do {   \
     uint64_t ctrl = *(uint64_t*)(ptr);                                  \
     if ((uint32_t)ctrl & 0x01) {                                        \
-      int32_t w0 = (int32_t)ctrl;                                       \
-      int32_t w1 = *(int32_t*)(ptr + 4);                                \
-      int32_t w2 = *(int32_t*)(ptr + 8);                                \
-      int32_t w3 = *(int32_t*)(ptr + 12);                               \
-      alt_out = (w0 >> 1) & 1;                                          \
-      c_occ = (w3 >> 3) & 0x7F;                                         \
-      c_chg = (w3 & 7) - 3;                                             \
-      out_accum = _mm_set_epi32(w2, w1, w0 >> 2, w3 >> 10);             \
+      __m128i msb = _mm_cvtepi16_epi32(_mm_cvtsi64_si128(ctrl));        \
+      out_accum = _mm_slli_epi32(_mm_srai_epi32(msb, 1), 13);           \
+      uint64_t lsb_ctrl = *(uint64_t*)(ptr + 8);                        \
+      uint16_t b_lsb = (uint16_t)lsb_ctrl;                              \
+      uint16_t x_lsb = (uint16_t)(lsb_ctrl >> 16);                      \
+      uint16_t y_lsb = (uint16_t)(lsb_ctrl >> 32);                      \
+      uint16_t z_lsb = (uint16_t)(lsb_ctrl >> 48);                      \
+      alt_out = (b_lsb >> 1) & 1;                                       \
+      c_occ = ((b_lsb & 4) << 4) | ((x_lsb & 7) << 3) | (y_lsb & 7);    \
+      c_chg = (z_lsb & 7) - 3;                                          \
+      __m128i lsb = _mm_cvtepi16_epi32(_mm_cvtsi64_si128(lsb_ctrl));    \
+      out_accum = _mm_add_epi32(out_accum, _mm_srai_epi32(lsb, 3));     \
       ptr += 16;                                                        \
     } else {                                                            \
       uint16_t b_ctrl = (uint16_t)ctrl;                                 \
@@ -113,14 +116,18 @@ typedef struct { int32_t b, x, y, z; } accum_t;
 #define SIMD_DECODE_MACRO(ptr, out_accum, c_occ, c_chg, alt_out) do {   \
     uint64_t ctrl = *(uint64_t*)(ptr);                                  \
     if ((uint32_t)ctrl & 0x01) {                                        \
-      int32_t w0 = (int32_t)ctrl;                                       \
-      int32_t w1 = *(int32_t*)(ptr + 4);                                \
-      int32_t w2 = *(int32_t*)(ptr + 8);                                \
-      int32_t w3 = *(int32_t*)(ptr + 12);                               \
-      alt_out = (w0 >> 1) & 1;                                          \
-      c_occ = (w3 >> 3) & 0x7F;                                         \
-      c_chg = (w3 & 7) - 3;                                             \
-      out_accum = (int32x4_t){w3 >> 10, w0 >> 2, w1, w2};               \
+      int16x4_t msb = vreinterpret_s16_u8(vcreate_u8(ctrl));            \
+      int32x4_t msb_32 = vshlq_n_s32(vmovl_s16(vshr_n_s16(msb, 1)), 13);\
+      uint64_t lsb_ctrl = *(uint64_t*)(ptr + 8);                        \
+      uint16_t b_lsb = (uint16_t)lsb_ctrl;                              \
+      uint16_t x_lsb = (uint16_t)(lsb_ctrl >> 16);                      \
+      uint16_t y_lsb = (uint16_t)(lsb_ctrl >> 32);                      \
+      uint16_t z_lsb = (uint16_t)(lsb_ctrl >> 48);                      \
+      alt_out = (b_lsb >> 1) & 1;                                       \
+      c_occ = ((b_lsb & 4) << 4) | ((x_lsb & 7) << 3) | (y_lsb & 7);    \
+      c_chg = (z_lsb & 7) - 3;                                          \
+      int16x4_t lsb = vreinterpret_s16_u8(vcreate_u8(lsb_ctrl));        \
+      out_accum = vaddq_s32(msb_32, vmovl_s16(vshr_n_s16(lsb, 3)));     \
       ptr += 16;                                                        \
     } else {                                                            \
       uint16_t b_ctrl = (uint16_t)ctrl;                                 \
@@ -140,17 +147,22 @@ typedef struct { int32_t b, x, y, z; } accum_t;
 #define SIMD_DECODE_MACRO(ptr, out_accum, c_occ, c_chg, alt_out) do {   \
     uint64_t ctrl = *(uint64_t*)(ptr);                                  \
     if ((uint32_t)ctrl & 0x01) {                                        \
-      int32_t w0 = (int32_t)ctrl;                                       \
-      int32_t w1 = *(int32_t*)(ptr + 4);                                \
-      int32_t w2 = *(int32_t*)(ptr + 8);                                \
-      int32_t w3 = *(int32_t*)(ptr + 12);                               \
-      alt_out = (w0 >> 1) & 1;                                          \
-      c_occ = (w3 >> 3) & 0x7F;                                         \
-      c_chg = (w3 & 7) - 3;                                             \
-      out_accum.b = w3 >> 10;                                           \
-      out_accum.x = w0 >> 2;                                            \
-      out_accum.y = w1;                                                 \
-      out_accum.z = w2;                                                 \
+      out_accum.b = (((int16_t)(uint16_t)ctrl) >> 1) << 13;             \
+      out_accum.x = (((int16_t)(uint16_t)(ctrl >> 16)) >> 1) << 13;     \
+      out_accum.y = (((int16_t)(uint16_t)(ctrl >> 32)) >> 1) << 13;     \
+      out_accum.z = (((int16_t)(uint16_t)(ctrl >> 48)) >> 1) << 13;     \
+      uint64_t lsb_ctrl = *(uint64_t*)(ptr + 8);                        \
+      uint16_t b_lsb = (uint16_t)lsb_ctrl;                              \
+      uint16_t x_lsb = (uint16_t)(lsb_ctrl >> 16);                      \
+      uint16_t y_lsb = (uint16_t)(lsb_ctrl >> 32);                      \
+      uint16_t z_lsb = (uint16_t)(lsb_ctrl >> 48);                      \
+      alt_out = (b_lsb >> 1) & 1;                                       \
+      c_occ = ((b_lsb & 4) << 4) | ((x_lsb & 7) << 3) | (y_lsb & 7);    \
+      c_chg = (z_lsb & 7) - 3;                                          \
+      out_accum.b += ((int16_t)(uint16_t)lsb_ctrl) >> 3;                \
+      out_accum.x += ((int16_t)(uint16_t)(lsb_ctrl >> 16)) >> 3;        \
+      out_accum.y += ((int16_t)(uint16_t)(lsb_ctrl >> 32)) >> 3;        \
+      out_accum.z += ((int16_t)(uint16_t)(lsb_ctrl >> 48)) >> 3;        \
       ptr += 16;                                                        \
     } else {                                                            \
       uint16_t b_ctrl = (uint16_t)ctrl;                                 \
@@ -214,7 +226,6 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
       const uint8_t* search_ptr = seq_ptr;
       const uint8_t* end_ptr = seq_ptr + seq_bytes;
 
-      // Vectorized memory scanning skips scalar bottlenecks
       while (search_ptr < end_ptr) {
         const uint8_t* found = (const uint8_t*)memchr(search_ptr, 0x7C, end_ptr - search_ptr);
         if (!found) break;
@@ -234,7 +245,6 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
       accum.x = 0; accum.y = 0; accum.z = 0; accum.b = 0;
 #endif
 
-      // Removed the empty slot branch (adding 0 is harmless)
       for (uint32_t a = 0; a < num_atoms; a++) {
         SIMD_DECODE_PHASE1(atom_ptr, accum);
       }

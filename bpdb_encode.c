@@ -93,6 +93,12 @@ void flush_chain(ChainBuilder* cb, StreamBuffer* buf) {
   cb->has_ter = 0; cb->has_ter_raw = 0; cb->is_n_term = 0; cb->is_c_term = 0; cb->current_b = 0;
 }
 
+static inline void split_msb_lsb(int32_t val, int16_t* msb, int16_t* lsb) {
+  int32_t base = (val + 4096) >> 13;
+  *msb = (int16_t)base;
+  *lsb = (int16_t)(val - (base << 13));
+}
+
 static inline void encode_alt_array(ChainBuilder* cb, AltArray* arr, int force_jump) {
   for (int a = 0; a < arr->count; a++) {
     int32_t x = arr->x[a], y = arr->y[a], z = arr->z[a], b_int = arr->b[a];
@@ -117,15 +123,22 @@ static inline void encode_alt_array(ChainBuilder* cb, AltArray* arr, int force_j
 
     uint8_t* ptr = &cb->atom_track[cb->atom_bytes];
     if (needs_jump) {
-      int32_t w0 = (x << 2) | (alt_flag << 1) | 1;
-      int32_t w1 = y;
-      int32_t w2 = z;
-      int32_t w3 = (b_int << 10) | (occ_int << 3) | charge_u;
+      int16_t b_msb, b_lsb, x_msb, x_lsb, y_msb, y_lsb, z_msb, z_lsb;
+      split_msb_lsb(b_int, &b_msb, &b_lsb);
+      split_msb_lsb(x, &x_msb, &x_lsb);
+      split_msb_lsb(y, &y_msb, &y_lsb);
+      split_msb_lsb(z, &z_msb, &z_lsb);
 
-      *(int32_t*)(ptr)      = w0;
-      *(int32_t*)(ptr + 4)  = w1;
-      *(int32_t*)(ptr + 8)  = w2;
-      *(int32_t*)(ptr + 12) = w3;
+      *(uint16_t*)(ptr)     = (b_msb << 1) | 1;
+      *(uint16_t*)(ptr + 2) = (x_msb << 1) | 0;
+      *(uint16_t*)(ptr + 4) = (y_msb << 1) | 0;
+      *(uint16_t*)(ptr + 6) = (z_msb << 1) | 0;
+
+      *(uint16_t*)(ptr + 8)  = (b_lsb << 3) | (((occ_int >> 6) & 1) << 2) | (alt_flag << 1) | 0;
+      *(uint16_t*)(ptr + 10) = (x_lsb << 3) | ((occ_int >> 3) & 7);
+      *(uint16_t*)(ptr + 12) = (y_lsb << 3) | (occ_int & 7);
+      *(uint16_t*)(ptr + 14) = (z_lsb << 3) | charge_u;
+
       cb->atom_bytes += 16;
     } else {
       uint16_t b_ctrl = (db << 3) | (((occ_int >> 6) & 1) << 2) | (alt_flag << 1) | 0;

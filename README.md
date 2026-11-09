@@ -84,7 +84,7 @@ A standard 8-byte block handles native intra-chain coordinate deltas up to **± 
 ### 4.2 Absolute New Anchors (`Control == 1`)
 If a spatial jump exceeds ± 4.095 Å (chain gaps, isolated HETATMs, waters), the stream emits a 16-byte absolute New Anchor. The Anchor is **100% symmetric** with the standard atom block lane order (B, X, Y, Z), forming a precise 28-bit coordinate space.
 
-All explicit metadata (Occupancy, Charge, AltLoc) is offloaded entirely to the 13-bit LSB block.
+All explicit metadata (Occupancy, Charge, AltLoc) is offloaded entirely to the remaining 12 bits of the LSB block.
 
 **1. The MSB Block (Bytes 0-7, `Control == 1`)**
 Contains the 15-bit Most Significant Bits of the absolute values.

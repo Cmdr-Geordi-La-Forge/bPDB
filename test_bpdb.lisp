@@ -22,7 +22,7 @@
     (when (starts-with-p "HETATM" padded)
       (setf (subseq padded 0 6) "ATOM  "))
     
-    ;; [RESTORED] Ignores PDB atom serials missing in original gaps
+    ;; Ignores PDB atom serials missing in original gaps
     (when (>= (length padded) 11) (setf (subseq padded 6 11) "     "))
     
     (when (>= (length padded) 17) (setf (char padded 16) #\Space))
@@ -145,48 +145,50 @@
               (values nil diff)
               (values t nil)))))))
 
-;; --- 4. File Caching Utility ---
+;; --- 4. CSV File Parser ---
 
-(defun get-pdb-files (db-dir wildcard)
-  (let ((cache-file "pdb_files_cache.txt"))
-    (if (probe-file cache-file)
-        (progn
-          (format t "Reading file list from cache: ~A~%" cache-file)
-          (with-open-file (in cache-file :direction :input)
-            (loop for line = (read-line in nil nil)
-                  while line
-                  collect (parse-namestring line))))
-        (progn
-          (format t "Scanning ~A for .pdb files (this may take a while)...~%" db-dir)
-          (let ((files (directory wildcard)))
-            (format t "Caching ~D files to ~A~%" (length files) cache-file)
-            (with-open-file (out cache-file :direction :output :if-exists :supersede)
-              (dolist (f files)
-                (format out "~A~%" (namestring f))))
-            files)))))
+(defun get-pdb-files-from-csv (csv-path db-dir)
+  (let ((files '())
+        ;; Read the entire file into a string
+        (raw-text (uiop:read-file-string csv-path)))
+    (format t "Reading target IDs from CSV: ~A~%" csv-path)
+    ;; Convert all newlines and carriage returns to commas, then split by comma
+    (let* ((comma-text (substitute #\, #\Newline (substitute #\, #\Return raw-text)))
+           (parts (uiop:split-string comma-text :separator ",")))
+      (dolist (raw-id parts)
+        (let ((id (string-trim '(#\Space #\Tab) raw-id)))
+          ;; Ignore empty strings and common header names
+          (when (and (> (length id) 0)
+                     (not (string-equal id "af_id"))
+                     (not (string-equal id "id")))
+            (let* ((filename (format nil "~A.pdb" (string-downcase id)))
+                   (filepath (merge-pathnames filename (pathname db-dir))))
+              (if (probe-file filepath)
+                  ;; pushnew prevents duplicates if the CSV has trailing commas
+                  (pushnew filepath files :test #'equal)
+                  (format t "Warning: ~A not found in directory. Skipping.~%" filename)))))))
+    (nreverse files)))
 
 ;; --- 5. CLI Execution ---
 
 (defun main ()
   (let ((args (cdr sb-ext:*posix-argv*)))
-    (when (< (length args) 1)
-      (format t "Usage: ./test-suite.lisp <path-to-pdb-dir> [num-samples]~%")
+    (when (< (length args) 2)
+      (format t "Usage: ./test-suite.lisp <path-to-pdb-dir> <path-to-csv> [num-samples]~%")
       (uiop:quit 1))
 
     (let* ((db-dir (first args))
-           (num-samples (if (> (length args) 1) (parse-integer (second args)) 1000))
-           (bpdb-bin "./bpdb")
-           (wildcard (make-pathname :directory (append (pathname-directory (truename db-dir))
-                                                       (list :wild-inferiors))
-                                    :name :wild :type "pdb")))
+           (csv-path (second args))
+           (num-samples (if (> (length args) 2) (parse-integer (third args)) 1000))
+           (bpdb-bin "./bpdb"))
 
       (setf *random-state* (sb-ext:seed-random-state 1238))
 
       (with-open-file (log-stream "test_results.log" :direction :output
                                   :if-exists :supersede :if-does-not-exist :create)
-        (let ((all-files (get-pdb-files db-dir wildcard)))
+        (let ((all-files (get-pdb-files-from-csv csv-path db-dir)))
           (unless all-files
-            (format t "No .pdb files found.~%")
+            (format t "No valid .pdb files matched the CSV list.~%")
             (uiop:quit 1))
 
           (format t "Found ~D files. Selecting ~D with seed 42.~%" (length all-files) num-samples)

@@ -1,6 +1,56 @@
 #include "bpdb.h"
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+
+static const char* COMPND_KEYS[] = {"", "MOL_ID", "MOLECULE", "CHAIN", "FRAGMENT", "SYNONYM", "EC", "ENGINEERED", "MUTATION", "OTHER_DETAILS"};
+static const char* SOURCE_KEYS[] = {"", "MOL_ID", "SYNTHETIC", "FRAGMENT", "ORGANISM_SCIENTIFIC", "ORGANISM_COMMON", "ORGANISM_TAXID",
+                             "STRAIN", "VARIANT", "CELL_LINE", "ATCC", "ORGAN", "TISSUE", "CELL", "ORGANELLE", "SECRETION",
+                             "CELLULAR_LOCATION", "PLASMID", "GENE", "EXPRESSION_SYSTEM", "EXPRESSION_SYSTEM_COMMON",
+                             "EXPRESSION_SYSTEM_TAXID", "EXPRESSION_SYSTEM_STRAIN", "EXPRESSION_SYSTEM_VARIANT",
+                             "EXPRESSION_SYSTEM_CELL_LINE", "EXPRESSION_SYSTEM_ATCC_NUMBER", "EXPRESSION_SYSTEM_ORGAN",
+                             "EXPRESSION_SYSTEM_TISSUE", "EXPRESSION_SYSTEM_CELL", "EXPRESSION_SYSTEM_ORGANELLE",
+                             "EXPRESSION_SYSTEM_CELLULAR_LOCATION", "EXPRESSION_SYSTEM_VECTOR_TYPE", "EXPRESSION_SYSTEM_VECTOR",
+                             "EXPRESSION_SYSTEM_PLASMID", "EXPRESSION_SYSTEM_GENE", "OTHER_DETAILS"};
+
+static const char AFDB_REMARK_BLOCK[] =
+  "REMARK   1                                                                      \n"
+  "REMARK   1 REFERENCE 1                                                          \n"
+  "REMARK   1  AUTH   JOHN JUMPER, RICHARD EVANS, ALEXANDER PRITZEL, TIM GREEN,    \n"
+  "REMARK   1  AUTH 2 MICHAEL FIGURNOV, OLAF RONNEBERGER, KATHRYN TUNYASUVUNAKOOL, \n"
+  "REMARK   1  AUTH 3 RUSS BATES, AUGUSTIN ZIDEK, ANNA POTAPENKO, ALEX BRIDGLAND,  \n"
+  "REMARK   1  AUTH 4 CLEMENS MEYER, SIMON A A KOHL, ANDREW J BALLARD,             \n"
+  "REMARK   1  AUTH 5 ANDREW COWIE, BERNARDINO ROMERA-PAREDES, STANISLAV NIKOLOV,  \n"
+  "REMARK   1  AUTH 6 RISHUB JAIN, JONAS ADLER, TREVOR BACK, STIG PETERSEN,        \n"
+  "REMARK   1  AUTH 7 DAVID REIMAN, ELLEN CLANCY, MICHAL ZIELINSKI,                \n"
+  "REMARK   1  AUTH 8 MARTIN STEINEGGER, MICHALINA PACHOLSKA, TAMAS BERGHAMMER,    \n"
+  "REMARK   1  AUTH 9 DAVID SILVER, ORIOL VINYALS, ANDREW W SENIOR,                \n"
+  "REMARK   1  AUTH10 KORAY KAVUKCUOGLU, PUSHMEET KOHLI, DEMIS HASSABIS            \n"
+  "REMARK   1  TITL   HIGHLY ACCURATE PROTEIN STRUCTURE PREDICTION WITH ALPHAFOLD  \n"
+  "REMARK   1  REF    NATURE                        V. 596   583 2021              \n"
+  "REMARK   1  REFN                   ISSN 0028-0836                               \n"
+  "REMARK   1  PMID   34265844                                                     \n"
+  "REMARK   1  DOI    10.1038/s41586-021-03819-2                                   \n"
+  "REMARK   1                                                                      \n"
+  "REMARK   1 DISCLAIMERS                                                          \n"
+  "REMARK   1 ALPHAFOLD DATA, COPYRIGHT (2021) DEEPMIND TECHNOLOGIES LIMITED. THE  \n"
+  "REMARK   1 INFORMATION PROVIDED IS THEORETICAL MODELLING ONLY AND CAUTION SHOULD\n"
+  "REMARK   1 BE EXERCISED IN ITS USE. IT IS PROVIDED \"AS-IS\" WITHOUT ANY WARRANTY \n"
+  "REMARK   1 OF ANY KIND, WHETHER EXPRESSED OR IMPLIED. NO WARRANTY IS GIVEN THAT \n"
+  "REMARK   1 USE OF THE INFORMATION SHALL NOT INFRINGE THE RIGHTS OF ANY THIRD    \n"
+  "REMARK   1 PARTY. THE INFORMATION IS NOT INTENDED TO BE A SUBSTITUTE FOR        \n"
+  "REMARK   1 PROFESSIONAL MEDICAL ADVICE, DIAGNOSIS, OR TREATMENT, AND DOES NOT   \n"
+  "REMARK   1 CONSTITUTE MEDICAL OR OTHER PROFESSIONAL ADVICE. IT IS AVAILABLE FOR \n"
+  "REMARK   1 ACADEMIC AND COMMERCIAL PURPOSES, UNDER CC-BY 4.0 LICENCE.           \n";
+
+static const char AFDB_CRYST_BLOCK[] =
+  "CRYST1    1.000    1.000    1.000  90.00  90.00  90.00 P 1           1          \n"
+  "ORIGX1      1.000000  0.000000  0.000000        0.00000                         \n"
+  "ORIGX2      0.000000  1.000000  0.000000        0.00000                         \n"
+  "ORIGX3      0.000000  0.000000  1.000000        0.00000                         \n"
+  "SCALE1      1.000000  0.000000  0.000000        0.00000                         \n"
+  "SCALE2      0.000000  1.000000  0.000000        0.00000                         \n"
+  "SCALE3      0.000000  0.000000  1.000000        0.00000                         \n";
 
 #if defined(__AVX2__) || defined(__SSE4_1__)
 #include <immintrin.h>
@@ -183,29 +233,100 @@ typedef struct { int32_t b, x, y, z; } accum_t;
 
 volatile int32_t benchmark_sink = 0;
 
+static inline void unpack_ec_number(uint32_t packed, char* out_str) {
+  int class_val = (packed >> 29) & 0x07;
+  int sub = (packed >> 24) & 0x1F;
+  int8_t subsub = (int8_t)((packed >> 16) & 0xFF);
+  int16_t serial = (int16_t)(packed & 0xFFFF);
+
+  char s3[16], s4[16];
+  if (subsub == 0) strcpy(s3, "-"); else if (subsub < 0) snprintf(s3, sizeof(s3), "n%d", -subsub); else snprintf(s3, sizeof(s3), "%d", subsub);
+  if (serial == 0) strcpy(s4, "-"); else if (serial < 0) snprintf(s4, sizeof(s4), "n%d", -serial); else snprintf(s4, sizeof(s4), "%d", serial);
+
+  snprintf(out_str, 32, "%d.%d.%s.%s", class_val, sub, s3, s4);
+}
+
+void write_tlv_to_pdb(char** w_ptr, const uint8_t* tlv_buf, size_t tlv_len, int is_source, TaxDict* taxdict, int af_mode) {
+  size_t ptr = 0; char tbuf[128];
+  const char* pfx = is_source ? "SOURCE" : "COMPND";
+  const char** keys = is_source ? SOURCE_KEYS : COMPND_KEYS;
+  int cont_num = 1;
+
+  while (ptr < tlv_len) {
+    uint16_t mlen = *(uint16_t*)(tlv_buf + ptr); ptr += 2;
+    size_t m_end = ptr + mlen;
+
+    while (ptr < m_end) {
+      uint8_t token_id = tlv_buf[ptr++];
+      uint8_t vlen = tlv_buf[ptr++];
+      int is_last = (ptr + vlen == tlv_len);
+      const char* semi = is_last ? "" : ";";
+
+      if (!is_source && token_id == COMPND_EC) {
+        uint32_t packed = *(uint32_t*)(tlv_buf + ptr);
+        char ec_str[32]; unpack_ec_number(packed, ec_str);
+
+        char cont_str[8]; if (cont_num == 1) strcpy(cont_str, "    "); else snprintf(cont_str, 8, "%4d ", cont_num);
+        int len = snprintf(tbuf, 128, "%-6s%s%s: %s%s", pfx, cont_str, keys[token_id], ec_str, semi);
+        memcpy(*w_ptr, tbuf, len); *w_ptr += 81;
+        ptr += 4;
+        cont_num++;
+      } else if (is_source && (token_id == SOURCE_ORGANISM_TAXID || token_id == SOURCE_EXPRESSION_SYSTEM_TAXID)) {
+        uint32_t taxid = *(uint32_t*)(tlv_buf + ptr); ptr += 4;
+
+        if (af_mode) {
+          const char* sci = get_tax_name(taxdict, taxid, 0);
+          if (sci && strlen(sci) > 0) {
+            char cont_str[8]; if (cont_num == 1) strcpy(cont_str, "    "); else snprintf(cont_str, 8, "%4d ", cont_num);
+            int sci_tok = (token_id == SOURCE_ORGANISM_TAXID) ? SOURCE_ORGANISM_SCIENTIFIC : SOURCE_EXPRESSION_SYSTEM;
+            int len = snprintf(tbuf, 128, "%-6s%s%s: %s;", pfx, cont_str, keys[sci_tok], sci);
+            memcpy(*w_ptr, tbuf, len); *w_ptr += 81;
+            cont_num++;
+          }
+        }
+
+        char cont_str[8]; if (cont_num == 1) strcpy(cont_str, "    "); else snprintf(cont_str, 8, "%4d ", cont_num);
+        int len = snprintf(tbuf, 128, "%-6s%s%s: %u%s", pfx, cont_str, keys[token_id], taxid, semi);
+        memcpy(*w_ptr, tbuf, len); *w_ptr += 81;
+        cont_num++;
+      } else {
+        char cont_str[8]; if (cont_num == 1) strcpy(cont_str, "    "); else snprintf(cont_str, 8, "%4d ", cont_num);
+        int len = snprintf(tbuf, 128, "%-6s%s%s: %.*s%s", pfx, cont_str, keys[token_id], vlen, (char*)(tlv_buf + ptr), semi);
+        memcpy(*w_ptr, tbuf, len); *w_ptr += 81;
+        ptr += vlen;
+        cont_num++;
+      }
+    }
+  }
+}
+
 void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_model, int is_last_model) {
   if (size < 64) return;
 
   size_t offset = 64;
   uint64_t meta_header = *(uint64_t*)(buffer + offset); offset += 8;
   uint64_t mask = meta_header >> 16;
-  int af_mode = (mask & (1ULL << 0)) ? 1 : 0;
-  int has_hydrogens = (mask & (1ULL << 11)) ? 1 : 0;
+  int af_mode = (mask & (1ULL << META_AF_MODE)) ? 1 : 0;
+  int has_hydrogens = (mask & (1ULL << META_HYDROGENS)) ? 1 : 0;
 
   size_t dict_scan_off = offset;
-  if (mask & (1ULL << 1)) dict_scan_off += 8;
-  if (mask & (1ULL << 2)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
-  if (mask & (1ULL << 3)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
-  if (mask & (1ULL << 4)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
-  if (mask & (1ULL << 5)) {
+  if (mask & (1ULL << META_RESOLUTION)) dict_scan_off += 8;
+  if (mask & (1ULL << META_TITLE))   { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+  if (mask & (1ULL << META_EXPDTA))  { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+  if (mask & (1ULL << META_PROGRAM)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+  if (mask & (1ULL << META_HET_DICT)) {
     uint64_t dict_len = *(uint64_t*)(buffer + dict_scan_off);
     dict_scan_off += 8 + dict_len + ((8 - (dict_len % 8)) % 8);
   }
-  if (mask & (1ULL << 6)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
-  if (mask & (1ULL << 7)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
-  if (mask & (1ULL << 8)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
-  if (mask & (1ULL << 9)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
-  if (mask & (1ULL << 10)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+  if (mask & (1ULL << META_HELIX))   { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+  if (mask & (1ULL << META_SHEET))   { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+  if (mask & (1ULL << META_SSBOND))  { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+  if (mask & (1ULL << META_CISPEP))  { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+  if (mask & (1ULL << META_SITE))    { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+  if (mask & (1ULL << META_COMPND))  { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+  if (mask & (1ULL << META_SOURCE))  { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+  if (mask & (1ULL << META_DBREF))   { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+  if (mask & (1ULL << META_SEQRES))  { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
 
   offset = dict_scan_off;
 
@@ -267,21 +388,26 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
 
   offset = 64 + 8;
   float resolution = -1.0f;
-  const char* p_title = ""; uint64_t title_len = 0;
-  const char* p_expdta = ""; uint64_t expdta_len = 0;
+  const char* p_title   = "";      uint64_t title_len  = 0;
+  const char* p_expdta  = "";      uint64_t expdta_len = 0;
   const char* p_program = "";
 
   const uint8_t* p_ssbonds = NULL; uint64_t num_ssbonds = 0;
   const uint8_t* p_cispeps = NULL; uint64_t num_cispeps = 0;
   const uint8_t* p_helices = NULL; uint64_t num_helices = 0;
-  const uint8_t* p_sheets = NULL;  uint64_t num_sheets = 0;
-  const uint8_t* p_sites = NULL;   uint64_t len_sites = 0;
+  const uint8_t* p_sheets  = NULL; uint64_t num_sheets  = 0;
+  const uint8_t* p_sites   = NULL; uint64_t len_sites   = 0;
 
-  if (mask & (1ULL << 1)) { resolution = *(float*)(buffer + offset); offset += 8; }
-  if (mask & (1ULL << 2)) { title_len = *(uint64_t*)(buffer + offset); offset += 8; p_title = (const char*)(buffer + offset); offset += title_len; offset += (8 - (title_len % 8)) % 8; }
-  if (mask & (1ULL << 3)) { expdta_len = *(uint64_t*)(buffer + offset); offset += 8; p_expdta = (const char*)(buffer + offset); offset += expdta_len; offset += (8 - (expdta_len % 8)) % 8; }
-  if (mask & (1ULL << 4)) { uint64_t p_len = *(uint64_t*)(buffer + offset); offset += 8; p_program = (const char*)(buffer + offset); offset += p_len; offset += (8 - (p_len % 8)) % 8; }
-  if (mask & (1ULL << 5)) {
+  const uint8_t* p_compnd  = NULL; uint64_t compnd_len  = 0;
+  const uint8_t* p_source  = NULL; uint64_t source_len  = 0;
+  const uint8_t* p_dbrefs  = NULL; uint64_t num_dbrefs  = 0;
+  const uint8_t* p_seqres  = NULL; uint64_t seqres_len  = 0;
+
+  if (mask & (1ULL << META_RESOLUTION)) { resolution = *(float*)(buffer + offset); offset += 8; }
+  if (mask & (1ULL << META_TITLE)) { title_len = *(uint64_t*)(buffer + offset); offset += 8; p_title = (const char*)(buffer + offset); offset += title_len; offset += (8 - (title_len % 8)) % 8; }
+  if (mask & (1ULL << META_EXPDTA)) { expdta_len = *(uint64_t*)(buffer + offset); offset += 8; p_expdta = (const char*)(buffer + offset); offset += expdta_len; offset += (8 - (expdta_len % 8)) % 8; }
+  if (mask & (1ULL << META_PROGRAM)) { uint64_t p_len = *(uint64_t*)(buffer + offset); offset += 8; p_program = (const char*)(buffer + offset); offset += p_len; offset += (8 - (p_len % 8)) % 8; }
+  if (mask & (1ULL << META_HET_DICT)) {
     uint64_t dict_len = *(uint64_t*)(buffer + offset); offset += 8;
     const uint8_t* p_het_dict = buffer + offset;
     uint8_t custom_count = p_het_dict[0]; size_t ptr = 1;
@@ -295,17 +421,56 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
     }
     offset += dict_len; offset += (8 - (dict_len % 8)) % 8;
   }
-  if (mask & (1ULL << 6)) { uint64_t L = *(uint64_t*)(buffer + offset); offset += 8; p_helices = buffer + offset; num_helices = L / sizeof(MetaHelix); offset += L; offset += (8 - (L % 8)) % 8; }
-  if (mask & (1ULL << 7)) { uint64_t L = *(uint64_t*)(buffer + offset); offset += 8; p_sheets = buffer + offset; num_sheets = L / sizeof(MetaSheet); offset += L; offset += (8 - (L % 8)) % 8; }
-  if (mask & (1ULL << 8)) { uint64_t L = *(uint64_t*)(buffer + offset); offset += 8; p_ssbonds = buffer + offset; num_ssbonds = L / sizeof(MetaSSBond); offset += L; offset += (8 - (L % 8)) % 8; }
-  if (mask & (1ULL << 9)) { uint64_t L = *(uint64_t*)(buffer + offset); offset += 8; p_cispeps = buffer + offset; num_cispeps = L / sizeof(MetaCispep); offset += L; offset += (8 - (L % 8)) % 8; }
-  if (mask & (1ULL << 10)) { uint64_t L = *(uint64_t*)(buffer + offset); offset += 8; p_sites = buffer + offset; len_sites = L; offset += L; offset += (8 - (L % 8)) % 8; }
+  if (mask & (1ULL << META_HELIX)) { uint64_t L = *(uint64_t*)(buffer + offset); offset += 8; p_helices = buffer + offset; num_helices = L / sizeof(MetaHelix); offset += L; offset += (8 - (L % 8)) % 8; }
+  if (mask & (1ULL << META_SHEET)) { uint64_t L = *(uint64_t*)(buffer + offset); offset += 8; p_sheets = buffer + offset; num_sheets = L / sizeof(MetaSheet); offset += L; offset += (8 - (L % 8)) % 8; }
+  if (mask & (1ULL << META_SSBOND)) { uint64_t L = *(uint64_t*)(buffer + offset); offset += 8; p_ssbonds = buffer + offset; num_ssbonds = L / sizeof(MetaSSBond); offset += L; offset += (8 - (L % 8)) % 8; }
+  if (mask & (1ULL << META_CISPEP)) { uint64_t L = *(uint64_t*)(buffer + offset); offset += 8; p_cispeps = buffer + offset; num_cispeps = L / sizeof(MetaCispep); offset += L; offset += (8 - (L % 8)) % 8; }
+  if (mask & (1ULL << META_SITE)) { uint64_t L = *(uint64_t*)(buffer + offset); offset += 8; p_sites = buffer + offset; len_sites = L; offset += L; offset += (8 - (L % 8)) % 8; }
+  if (mask & (1ULL << META_COMPND)) { compnd_len = *(uint64_t*)(buffer + offset); offset += 8; p_compnd = buffer + offset; offset += compnd_len; offset += (8 - (compnd_len % 8)) % 8; }
+  if (mask & (1ULL << META_SOURCE)) { source_len = *(uint64_t*)(buffer + offset); offset += 8; p_source = buffer + offset; offset += source_len; offset += (8 - (source_len % 8)) % 8; }
+  if (mask & (1ULL << META_DBREF)) { uint64_t L = *(uint64_t*)(buffer + offset); offset += 8; p_dbrefs = buffer + offset; num_dbrefs = L / sizeof(MetaDBRef); offset += L; offset += (8 - (L % 8)) % 8; }
+  if (mask & (1ULL << META_SEQRES)) { seqres_len = *(uint64_t*)(buffer + offset); offset += 8; p_seqres = buffer + offset; offset += seqres_len; offset += (8 - (seqres_len % 8)) % 8; }
 
   size_t out_lines = 0;
 
   if (is_first_model) {
     out_lines += 1;
+    if (compnd_len > 0) {
+      size_t p = 0; while(p < compnd_len) { uint16_t mlen = *(uint16_t*)(p_compnd+p); p += 2; size_t mend = p + mlen; while(p < mend) { p += 2 + p_compnd[p+1]; out_lines++; } }
+    }
+    if (source_len > 0) {
+      TaxDict t = load_taxdict();
+      size_t p = 0; while(p < source_len) {
+        uint16_t mlen = *(uint16_t*)(p_source+p); p += 2; size_t mend = p + mlen;
+        while(p < mend) {
+          uint8_t tok = p_source[p]; uint8_t vlen = p_source[p+1]; p += 2;
+          if (tok == SOURCE_ORGANISM_TAXID || tok == SOURCE_EXPRESSION_SYSTEM_TAXID) {
+            uint32_t taxid = *(uint32_t*)(p_source+p); out_lines++; // +1 for the TAXID line itself
+            if (af_mode) {
+              const char* sci = get_tax_name(&t, taxid, 0);
+              if (sci && strlen(sci) > 0) out_lines++; // +1 dynamically generated Scientific Name
+            }
+            p += 4;
+          } else { p += vlen; out_lines++; }
+        }
+      }
+    }
     if (title_len > 0) out_lines += (title_len + 69) / 70;
+    if (mask & (1ULL << META_AFDB)) {
+      out_lines += 35;
+      uint32_t first_r_a = *(uint32_t*)(buffer + offset);
+      uint32_t af_res_count = first_r_a >> 18;
+      out_lines += (af_res_count + 12) / 13;
+    }
+    out_lines += num_dbrefs;
+    if (seqres_len > 0) {
+      size_t scan = 0;
+      while (scan < seqres_len) {
+        uint16_t num_res = *(uint16_t*)(p_seqres + scan + 1);
+        out_lines += (num_res + 12) / 13; // 13 residues per line
+        scan += 3 + num_res;
+      }
+    }
     if (expdta_len > 0) out_lines++;
     if (resolution > 0.0f) out_lines += 2;
     if (strlen(p_program) > 0) out_lines += 3;
@@ -318,9 +483,10 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
         s_ptr += 8 + num_res * sizeof(PdbResId);
       }
     }
+    out_lines += 1;
   }
 
-  if (total_models_minus_1 > 0) out_lines += 2;
+  if (total_models_minus_1 > 0 || (mask & (1ULL << META_AFDB))) out_lines += 2;
 
   size_t scan_off = offset, conect_offset = 0;
   while (scan_off < size) {
@@ -365,9 +531,9 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
   }
 
   if (out_lines == 0) { free(UDICT); return; }
-  size_t out_size = out_lines * 81;
+  size_t out_size = out_lines * 81 - (af_mode ? 1 : 0);
   char* out_data = (char*)malloc(out_size); memset(out_data, ' ', out_size);
-  for (size_t i = 0; i < out_lines; i++) out_data[i * 81 + 80] = '\n';
+  for (size_t i = 0; i < out_lines - (af_mode ? 1 : 0); i++) out_data[i * 81 + 80] = '\n';
 
   char* w_ptr = out_data; char tbuf[128];
 
@@ -375,13 +541,64 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
     memcpy(w_ptr, "HEADER    ", 10);
     size_t c_len = strlen(classification); if (c_len > 0) memcpy(w_ptr + 10, classification, c_len > 40 ? 40 : c_len);
     int dlen = snprintf(tbuf, 128, "%02d-%3s-%02d", day, MONTHS[month], year % 100); memcpy(w_ptr + 50, tbuf, dlen);
-    size_t id_len = strlen(pdbID); if (id_len > 0) memcpy(w_ptr + 62, pdbID, id_len > 18 ? 18 : id_len); w_ptr += 81;
+    size_t id_len = strlen(pdbID); if (id_len > 0 && !af_mode) memcpy(w_ptr + 62, pdbID, id_len > 18 ? 18 : id_len); w_ptr += 81;
 
     if (title_len > 0) {
       for (uint64_t i = 0; i < title_len; i += 70) {
         memcpy(w_ptr, "TITLE   ", 8); if (i > 0) { int ln = snprintf(tbuf, 128, "%2d", (int)(i/70)+1); memcpy(w_ptr + 8, tbuf, ln); }
         size_t copy_len = title_len - i; if (copy_len > 70) copy_len = 70;
         memcpy(w_ptr + 10, p_title + i, copy_len); w_ptr += 81;
+      }
+    }
+
+    TaxDict taxdict = load_taxdict();
+    if (compnd_len > 0) write_tlv_to_pdb(&w_ptr, p_compnd, compnd_len, 0, &taxdict, af_mode);
+    if (source_len > 0) write_tlv_to_pdb(&w_ptr, p_source, source_len, 1, &taxdict, af_mode);
+    if (mask & (1ULL << META_AFDB)) {
+      memcpy(w_ptr, AFDB_REMARK_BLOCK, 28 * 81); w_ptr += 28 * 81;
+    }
+
+    for (uint32_t i=0; i<num_dbrefs; i++) {
+      MetaDBRef* d = (MetaDBRef*)(p_dbrefs + i * sizeof(MetaDBRef));
+      int len = snprintf(tbuf, 128, "DBREF  %4s %c %4d%c %4d%c %-6s %-8s %-12s %5d%c %5d%c",
+                         (af_mode ? "XXXX" : pdbID), d->chain, d->seq_begin, d->iCode_begin, d->seq_end, d->iCode_end,
+                         d->db_name, d->db_accession, d->db_id_code, d->db_seq_begin, d->db_iCode_begin, d->db_seq_end, d->db_iCode_end);
+      memcpy(w_ptr, tbuf, len); w_ptr += 81;
+    }
+    if (mask & (1ULL << META_AFDB)) {
+      uint32_t first_r_a = *(uint32_t*)(buffer + offset);
+      uint32_t num_res = first_r_a >> 18;
+      const uint8_t* af_seq_ptr = buffer + offset + 8;
+
+      int row = 1;
+      for (uint32_t r = 0; r < num_res; r += 13) {
+        int printed = snprintf(tbuf, 128, "SEQRES %3d A %4d ", row++, num_res);
+        for (int t = 0; t < 13 && r + t < num_res; t++) {
+          uint8_t type_id = af_seq_ptr[r + t];
+          const char* rname = (type_id > 0) ? UDICT[type_id].resName : "UNK";
+          printed += snprintf(tbuf + printed, 128 - printed, " %3s", rname);
+        }
+        memcpy(w_ptr, tbuf, printed); w_ptr += 81;
+      }
+    }
+
+    if (seqres_len > 0) {
+      size_t scan = 0;
+      while (scan < seqres_len) {
+        char chain = (char)p_seqres[scan];
+        uint16_t num_res = *(uint16_t*)(p_seqres + scan + 1);
+        scan += 3;
+
+        int row = 1;
+        for (uint16_t r = 0; r < num_res; r += 13) {
+          int printed = snprintf(tbuf, 128, "SEQRES %3d %c %4d ", row++, chain, num_res);
+          for (int t = 0; t < 13 && r + t < num_res; t++) {
+            uint8_t type_id = p_seqres[scan++];
+            const char* rname = (type_id > 0) ? UDICT[type_id].resName : "UNK";
+            printed += snprintf(tbuf + printed, 128 - printed, " %3s", rname);
+          }
+          memcpy(w_ptr, tbuf, printed); w_ptr += 81;
+        }
       }
     }
     if (expdta_len > 0) { memcpy(w_ptr, "EXPDTA    ", 10); memcpy(w_ptr + 10, p_expdta, expdta_len > 70 ? 70 : expdta_len); w_ptr += 81; }
@@ -428,8 +645,13 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
     }
   }
 
+  if (mask & (1ULL << META_AFDB)) {
+    memcpy(w_ptr, AFDB_CRYST_BLOCK, 7 * 81);
+    w_ptr += 7 * 81;
+  }
+
   int atom_serial = 1;
-  if (total_models_minus_1 > 0) {
+  if (total_models_minus_1 > 0 || (mask & (1ULL << META_AFDB))) {
     int len = snprintf(tbuf, 128, "MODEL     %4d", current_model_minus_1 + 1);
     memcpy(w_ptr, tbuf, len); w_ptr += 81;
   }
@@ -565,7 +787,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
         int32_t v_b = GET_SIMD_B(accum);
 
         int anchor_idx = (last_valid_type >= 0x20 && last_valid_type < 0x60) ? 2 : 8;
-        if (last_valid_type < 0x80 && atom_dict_idx == anchor_idx && !processing_hydrogens) {
+        if (last_valid_type < 0x60 && atom_dict_idx == anchor_idx && !processing_hydrogens) {
           if (active_alt_char == 'A') {
             anchor_accum = accum;
             has_anchor = 1;
@@ -591,7 +813,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
             e_name = " X";
         }
 
-        const char* prefix = (last_valid_type < 0x80) ? "ATOM  " : "HETATM";
+        const char* prefix = (last_valid_type < 0x60) ? "ATOM  " : "HETATM";
 
         if (af_mode) {
           int len = snprintf(tbuf, 128, "%s%5d %-4s%c%3s%c%c%4d%c   %8.3f%8.3f%8.3f  1.00%6.2f          %2s  ",
@@ -634,7 +856,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
     offset = (size_t)(atom_ptr - buffer);
   }
 
-  if (total_models_minus_1 > 0) {
+  if (total_models_minus_1 > 0 || (mask & (1ULL << META_AFDB))) {
     memcpy(w_ptr, "ENDMDL                                                                          ", 80); w_ptr += 81;
   }
 
@@ -649,6 +871,6 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
       memcpy(w_ptr, tbuf, printed); w_ptr += 81;
     }
   }
-
+  memcpy(w_ptr, "END                                                                             ", 80);
   fwrite(out_data, 1, out_size, out); free(out_data); free(UDICT);
 }

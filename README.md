@@ -34,7 +34,7 @@ Immediately following the 64-byte fixed header is a single 8-byte (`uint64_t`) m
 
 The decoder reads this mask to determine exactly which metadata payloads follow. Payloads are written in bit-sequential order, heavily padded to 8-byte boundaries:
 
-*   **Bit 0 (`META_AF_MODE`):** If `1`, indicates an AlphaFold/Predicted model. Occupancy is statically assumed to be `1.00` and Charge `0`.
+*   **Bit 0 (`META_AF_MODE`):** If `1`, indicates an AlphaFold/Predicted model (via `--af`). Occupancy is statically assumed to be `1.00` and Charge `0`.
 *   **Bit 1 (`RESOLUTION`):** `float` (4 bytes) + `0x00` pad (4 bytes).
 *   **Bit 2 (`TITLE`):** `uint64_t` length + payload string + 8-byte alignment padding.
 *   **Bit 3 (`EXPDTA`):** `uint64_t` length + payload string + 8-byte alignment padding.
@@ -42,6 +42,11 @@ The decoder reads this mask to determine exactly which metadata payloads follow.
 *   **Bit 5 (`HET_DICT`):** `uint64_t` dict_length + `uint8_t` custom_count + inline dictionary definitions + padding.
 *   **Bits 6-10:** Binary arrays for `HELIX`, `SHEET`, `SSBOND`, `CISPEP`, and `SITE`. Each starts with an 8-byte `length` followed by raw `struct` dumps, aligned to 8 bytes.
 *   **Bit 11 (`HYDROGENS`):** If `1`, indicates the coordinate stream natively interleaves explicit hydrogen atoms.
+*   **Bit 12 (`COMPND`):** TLV-encoded COMPND blocks. EC numbers are aggressively packed into a single 32-bit integer.
+*   **Bit 13 (`SOURCE`):** TLV-encoded SOURCE blocks. Integrates zero-copy NCBI taxonomy IDs to dynamically reconstruct scientific/common names on decode.
+*   **Bit 14 (`DBREF`):** Binary array for Database References.
+*   **Bit 15 (`AFDB`):** If `1`, indicates an official AlphaFold Database file (via `--afdb`). Safely drops DeepMind `REMARK 1` copyright disclaimers and `CRYST1` tags during encoding, seamlessly injecting them at decode to save massive space.
+*   **Bit 16 (`SEQRES`):** Contains the exact sequence chain blocks. Suppressed completely for `--afdb` files, which natively reconstruct their `SEQRES` dynamically from the underlying coordinate tracks to eliminate redundancy.
 
 ## 3. The Chain Clusters
 
@@ -61,7 +66,7 @@ A 1-dimensional array of `uint8_t` immediately following the Chain Header.
 *   **Bits 0-6 (Type ID):** Encodes Valid Residues mapped directly to the internal 256-element dictionary array:
     *   **`0x01-0x1F`: Standard Nucleic Acids** (e.g., A, C, G, U, DA)
     *   **`0x20-0x5F`: Standard Amino Acids** (e.g., ALA, ARG, SEC, PYL)
-    *   **`0x60-0x7F`: Solvents** (e.g., HOH)
+    *   **`0x60-0x7F`: Solvents and Ligands** (e.g., HOH)
     *   **`0x80+`:** Custom `HET_DICT` molecules.
 *   **Bit 7 (`0x80` - iCode Flag):** If set, the *immediately following byte* in the array is an ASCII Insertion Code character (e.g., `'A'`).
 
@@ -114,4 +119,9 @@ Following the `0x3FFF` EOF marker is a flat array of 32-bit integers representin
 2. `int32_t source_atom_id`
 3. $N$ sequential `int32_t target_atom_ids`
 
-*(Padded with `0x00` to an 8-byte boundary at the physical End of File).*
+## 6. Command Line Interface
+
+*   **Encode:** `./bpdb encode [--af] [--afdb] [-h|--hydrogens] <in.pdb> <out.bpdb>`
+*   **Decode:** `./bpdb decode <in.bpdb> <out.pdb>`
+*   **Benchmark:** `./bpdb bench <in.bpdb>`
+*   **Statistics:** `./bpdb stat <in.bpdb>`

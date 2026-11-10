@@ -168,8 +168,8 @@ void stat_bpdb(const char* filepath) {
 
             int hy_start = 0, hy_end = 0;
             if (has_hydrogens) {
-                hy_start = is_first ? 0 : UDICT[last_valid_type].hy_start_norm;
-                hy_end   = is_last  ? UDICT[last_valid_type].hy_end_cterm : UDICT[last_valid_type].hy_end_norm;
+              hy_start = is_first ? 0 : UDICT[last_valid_type].hy_start_norm;
+              hy_end   = is_last  ? UDICT[last_valid_type].hy_end_cterm : UDICT[last_valid_type].hy_end_norm;
             }
 
             atoms_left = (h_end - h_start) + (hy_end - hy_start);
@@ -236,43 +236,54 @@ void stat_bpdb(const char* filepath) {
 
 int main(int argc, char** argv) {
   if (argc < 3) {
-    printf("Usage Encode: %s encode [-h|--hydrogens] <in1.pdb> [in2.pdb...] <out.bpdb>\n", argv[0]);
-    printf("Usage Test  : %s test <in1.bpdb> [in2.bpdb...] <out.pdb>\n", argv[0]);
+    printf("Usage Encode: %s encode [--af] [--afdb] [-h|--hydrogens] <in1.pdb> [in2.pdb...] <out.bpdb>\n", argv[0]);
+    printf("Usage Decode: %s decode <in1.bpdb> [in2.bpdb...] <out.pdb>\n", argv[0]);
+    printf("Usage Bench : %s bench <in1.bpdb> [in2.bpdb...]\n", argv[0]);
     printf("Usage Stat  : %s stat <in.bpdb>\n", argv[0]);
     return 1;
   }
 
   if (strcmp(argv[1], "encode") == 0) {
-    int include_hydrogens = 0;
+    int include_hydrogens = 0, af_mode = 0, afdb_mode = 0;
     int file_start = 2;
-    if (strcmp(argv[2], "-h") == 0 || strcmp(argv[2], "--hydrogens") == 0) {
-      include_hydrogens = 1;
-      file_start = 3;
+
+    // Parse dynamic flags
+    while (file_start < argc - 1) {
+      if (strcmp(argv[file_start], "-h") == 0 || strcmp(argv[file_start], "--hydrogens") == 0) {
+        include_hydrogens = 1; file_start++;
+      } else if (strcmp(argv[file_start], "--af") == 0) {
+        af_mode = 1; file_start++;
+      } else if (strcmp(argv[file_start], "--afdb") == 0) {
+        af_mode = 1; afdb_mode = 1; file_start++; // AFDB natively implies AF mode
+      } else {
+        break;
+      }
     }
+
     const char* out_bpdb = argv[argc - 1];
     int num_files = argc - file_start - 1;
+    if (num_files <= 0) { printf("Error: No input files specified.\n"); return 1; }
+
     const char** in_pdbs = (const char**)&argv[file_start];
-    encode_bpdb(num_files, in_pdbs, out_bpdb, include_hydrogens);
+    encode_bpdb(num_files, in_pdbs, out_bpdb, include_hydrogens, af_mode, afdb_mode);
+
     if (strcmp(out_bpdb, "-") != 0) {
       printf("[+] Encoded %d files to %s\n", num_files, out_bpdb);
     }
-  } else if (strcmp(argv[1], "test") == 0) {
-    const char* out_pdb = argv[argc - 1];
-    int num_files = argc - 3;
+
+  } else if (strcmp(argv[1], "decode") == 0 || strcmp(argv[1], "bench") == 0) {
+    int is_bench = (strcmp(argv[1], "bench") == 0);
+    const char* out_pdb = is_bench ? NULL : argv[argc - 1];
+    int num_files = is_bench ? (argc - 2) : (argc - 3);
     const char** in_bpdbs = (const char**)&argv[2];
 
     uint8_t** buffers = malloc(num_files * sizeof(uint8_t*));
     size_t* sizes = malloc(num_files * sizeof(size_t));
 
     for (int i = 0; i < num_files; i++) {
-      FILE* fb = NULL;
-      sizes[i] = 0;
-      buffers[i] = NULL;
-
+      FILE* fb = NULL; sizes[i] = 0; buffers[i] = NULL;
       if (strcmp(in_bpdbs[i], "-") == 0) {
-        fb = stdin;
-        size_t cap = 1024 * 1024;
-        buffers[i] = (uint8_t*)malloc(cap);
+        fb = stdin; size_t cap = 1024 * 1024; buffers[i] = (uint8_t*)malloc(cap);
         size_t bytes;
         while ((bytes = fread(buffers[i] + sizes[i], 1, cap - sizes[i], fb)) > 0) {
           sizes[i] += bytes;
@@ -286,20 +297,18 @@ int main(int argc, char** argv) {
       }
     }
 
-    FILE* fout = (strcmp(out_pdb, "-") == 0) ? stdout : fopen(out_pdb, "w");
-    if (!fout) { perror("Failed to open output"); return 1; }
-
-    for (int i = 0; i < num_files; i++) {
-      if (sizes[i] > 0) {
-        decode_bpdb(buffers[i], sizes[i], fout, (i == 0), (i == num_files - 1));
+    if (!is_bench) {
+      FILE* fout = (strcmp(out_pdb, "-") == 0) ? stdout : fopen(out_pdb, "w");
+      if (!fout) { perror("Failed to open output"); return 1; }
+      for (int i = 0; i < num_files; i++) {
+        if (sizes[i] > 0) decode_bpdb(buffers[i], sizes[i], fout, (i == 0), (i == num_files - 1));
       }
-    }
-
-    if (fout != stdout) {
-      fclose(fout);
-      printf("[+] Decoded %d files to %s for diffing.\n", num_files, out_pdb);
-      struct timespec start, end;
-      clock_gettime(CLOCK_MONOTONIC, &start);
+      if (fout != stdout) {
+        fclose(fout);
+        printf("[+] Decoded %d files to %s\n", num_files, out_pdb);
+      }
+    } else {
+      struct timespec start, end; clock_gettime(CLOCK_MONOTONIC, &start);
       int n = 100;
       for (int j = 0; j < n * 1000; j++) {
         for (int i = 0; i < num_files; i++) {
@@ -308,11 +317,12 @@ int main(int argc, char** argv) {
       }
       clock_gettime(CLOCK_MONOTONIC, &end);
       double t_taken = (end.tv_sec - start.tv_sec) * 1e3 + (end.tv_nsec - start.tv_nsec) / 1e6;
-      printf("[+] Parsing took %.2f s total (%i,000 files, %.3f us/run)\n", t_taken/1000, n, t_taken/n);
+      printf("[+] Benchmark took %.2f s total (%i,000 iterations, %.3f us/run)\n", t_taken/1000, n, t_taken/n);
     }
 
     for (int i = 0; i < num_files; i++) free(buffers[i]);
     free(buffers); free(sizes);
+
   } else if (strcmp(argv[1], "stat") == 0) {
     stat_bpdb(argv[2]);
   }

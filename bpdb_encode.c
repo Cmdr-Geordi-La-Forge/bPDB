@@ -4,17 +4,119 @@
 #include <math.h>
 #include <ctype.h>
 
+static const char* COMPND_KEYS[] = {"", "MOL_ID", "MOLECULE", "CHAIN", "FRAGMENT", "SYNONYM", "EC", "ENGINEERED", "MUTATION", "OTHER_DETAILS"};
+static const char* SOURCE_KEYS[] = {"", "MOL_ID", "SYNTHETIC", "FRAGMENT", "ORGANISM_SCIENTIFIC", "ORGANISM_COMMON", "ORGANISM_TAXID",
+                                    "STRAIN", "VARIANT", "CELL_LINE", "ATCC", "ORGAN", "TISSUE", "CELL", "ORGANELLE", "SECRETION",
+                                    "CELLULAR_LOCATION", "PLASMID", "GENE", "EXPRESSION_SYSTEM", "EXPRESSION_SYSTEM_COMMON",
+                                    "EXPRESSION_SYSTEM_TAXID", "EXPRESSION_SYSTEM_STRAIN", "EXPRESSION_SYSTEM_VARIANT",
+                                    "EXPRESSION_SYSTEM_CELL_LINE", "EXPRESSION_SYSTEM_ATCC_NUMBER", "EXPRESSION_SYSTEM_ORGAN",
+                                    "EXPRESSION_SYSTEM_TISSUE", "EXPRESSION_SYSTEM_CELL", "EXPRESSION_SYSTEM_ORGANELLE",
+                                    "EXPRESSION_SYSTEM_CELLULAR_LOCATION", "EXPRESSION_SYSTEM_VECTOR_TYPE", "EXPRESSION_SYSTEM_VECTOR",
+                                    "EXPRESSION_SYSTEM_PLASMID", "EXPRESSION_SYSTEM_GENE", "OTHER_DETAILS"};
+
 void stream_init(StreamBuffer* buf) {
   buf->cap = 1024 * 1024 * 16; buf->data = (uint8_t*)malloc(buf->cap); buf->len = 0;
 }
 void stream_write(StreamBuffer* buf, const void* src, size_t size) {
-  if (buf->len + size > buf->cap) { buf->cap *= 2; buf->data = (uint8_t*)realloc(buf->data, buf->cap); }
-  memcpy(buf->data + buf->len, src, size); buf->len += size;
+  if (buf->len + size > buf->cap) {
+    buf->cap = (buf->cap == 0) ? 1024 : (buf->cap * 2);
+    if (buf->len + size > buf->cap) buf->cap = buf->len + size;
+    buf->data = (uint8_t*)realloc(buf->data, buf->cap);
+  }
+  memcpy(buf->data + buf->len, src, size);
+  buf->len += size;
 }
 void stream_free(StreamBuffer* buf) { free(buf->data); }
 
 int parse_month(const char* m) { for (int i = 1; i <= 12; i++) if (strncmp(m, MONTHS[i], 3) == 0) return i; return 1; }
-void trim_string(char* str) { int i = strlen(str) - 1; while(i >= 0 && isspace(str[i])) { str[i] = '\0'; i--; } }
+
+void trim_string(char* str) {
+  if (!str) return;
+  int start = 0;
+  while (str[start] && isspace((unsigned char)str[start])) start++;
+  int end = strlen(str) - 1;
+  while (end >= start && isspace((unsigned char)str[end])) end--;
+  int len = end - start + 1;
+  if (len > 0) {
+    memmove(str, str + start, len);
+    str[len] = '\0';
+  } else {
+    str[0] = '\0';
+  }
+}
+
+static inline uint32_t pack_ec_number(const char* ec_str) {
+  int class_val = 0, sub = 0, subsub = 0, serial = 0;
+  char temp[32]; strncpy(temp, ec_str, 31); temp[31] = '\0';
+  char* t = temp; char* p = strchr(t, '.');
+  if (p) { *p = '\0'; class_val = atoi(t); t = p + 1; }
+  p = strchr(t, '.');
+  if (p) { *p = '\0'; sub = atoi(t); t = p + 1; }
+  p = strchr(t, '.');
+  if (p) {
+    *p = '\0';
+    if (t[0] == '-') subsub = 0; else if (t[0] == 'n') subsub = -atoi(t+1); else subsub = atoi(t);
+    t = p + 1;
+  }
+  if (t[0] == '-') serial = 0; else if (t[0] == 'n') serial = -atoi(t+1); else serial = atoi(t);
+
+  uint32_t packed = 0;
+  packed |= ((class_val & 0x07) << 29);
+  packed |= ((sub & 0x1F) << 24);
+  packed |= (((uint32_t)((int8_t)subsub) & 0xFF) << 16);
+  packed |= ((uint32_t)((int16_t)serial) & 0xFFFF);
+  return packed;
+}
+
+void extract_tlv(char* raw_text, StreamBuffer* out_buf, int is_source, int af_mode) {
+  char* tok = strtok(raw_text, ";");
+  StreamBuffer mol_buf; stream_init(&mol_buf);
+
+  while (tok) {
+    char* colon = strchr(tok, ':');
+    if (colon) {
+      *colon = '\0'; char* key = tok; char* val = colon + 1;
+      trim_string(key); trim_string(val);
+
+      uint8_t token_id = 0;
+      const char** keys = is_source ? SOURCE_KEYS : COMPND_KEYS;
+      int max_keys = is_source ? 36 : 10;
+      for (int i = 1; i < max_keys; i++) {
+        if (strcmp(key, keys[i]) == 0) { token_id = i; break; }
+      }
+
+      if (token_id == 1) { // MOL_ID boundary
+        if (mol_buf.len > 0) {
+          uint16_t mlen = mol_buf.len; stream_write(out_buf, &mlen, 2);
+          stream_write(out_buf, mol_buf.data, mol_buf.len); mol_buf.len = 0;
+        }
+        uint8_t vlen = strlen(val); stream_write(&mol_buf, &token_id, 1);
+        stream_write(&mol_buf, &vlen, 1); stream_write(&mol_buf, val, vlen);
+      } else if (token_id > 1) {
+        if (!is_source && token_id == COMPND_EC) {
+          uint32_t packed_ec = pack_ec_number(val); uint8_t vlen = 4;
+          stream_write(&mol_buf, &token_id, 1); stream_write(&mol_buf, &vlen, 1);
+          stream_write(&mol_buf, &packed_ec, 4);
+        } else if (is_source && af_mode && (token_id == SOURCE_ORGANISM_SCIENTIFIC || token_id == SOURCE_ORGANISM_COMMON || token_id == SOURCE_EXPRESSION_SYSTEM || token_id == SOURCE_EXPRESSION_SYSTEM_COMMON)) {
+          continue;
+        } else if (is_source && (token_id == SOURCE_ORGANISM_TAXID || token_id == SOURCE_EXPRESSION_SYSTEM_TAXID)) {
+          uint32_t taxid = atoi(val); uint8_t vlen = 4;
+          stream_write(&mol_buf, &token_id, 1); stream_write(&mol_buf, &vlen, 1);
+          stream_write(&mol_buf, &taxid, 4);
+        } else {
+          uint8_t vlen = strlen(val); stream_write(&mol_buf, &token_id, 1);
+          stream_write(&mol_buf, &vlen, 1); stream_write(&mol_buf, val, vlen);
+        }
+      }
+    }
+    tok = strtok(NULL, ";");
+  }
+  if (mol_buf.len > 0) {
+    uint16_t mlen = mol_buf.len; stream_write(out_buf, &mlen, 2);
+    stream_write(out_buf, mol_buf.data, mol_buf.len);
+  }
+  stream_free(&mol_buf);
+}
 
 typedef struct {
   int32_t *b, *x, *y, *z, *occ;
@@ -242,7 +344,7 @@ static void save_model_file(const char* base_out, uint16_t total_m1, uint16_t cu
   if (!fout) { perror("Failed to open output"); exit(1); }
 
   uint8_t header[64] = {0};
-  memcpy(header, "bPDB", 4); header[4] = 6; header[5] = (uint8_t)day; header[6] = (uint8_t)month;
+  memcpy(header, "bPDB", 4); header[4] = 0; header[5] = (uint8_t)day; header[6] = (uint8_t)month;
   header[7] = (year >= 1973 && year <= 2228) ? (uint8_t)(year - 1973) : 0;
   memcpy(header + 8, gid, strlen(gid) > 12 ? 12 : strlen(gid));
   *(uint16_t*)(header + 20) = total_m1;
@@ -263,23 +365,26 @@ static void save_model_file(const char* base_out, uint16_t total_m1, uint16_t cu
   }
 }
 
-void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int include_hydrogens) {
+void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int include_hydrogens, int af_mode, int afdb_mode) {
   ResidueDict* UDICT = (ResidueDict*)calloc(256, sizeof(ResidueDict));
   int custom_het_idx = 0x81;
   for (size_t i = 0; i < NUM_DICT_RES; i++) {
     UDICT[DICT[i].type_id] = DICT[i];
   }
 
+  StreamBuffer seqres_buf; stream_init(&seqres_buf);
+  char current_seqres_chain = '\0';
+  uint16_t current_seqres_count = 0;
+
   char global_title[4096] = {0}; char global_id[13] = {0}; char global_class[128] = {0};
   char global_expdta[128] = {0}; char global_program[56] = {0};
+  char raw_compnd[16384] = {0}; char raw_source[16384] = {0};
   float global_resolution = -1.0f; int day=1, month=1, year=1973, id_from_header = 0;
-
-  int af_mode = 0;
-  if (strstr(in_pdbs[0], "AF-") != NULL) af_mode = 1;
 
   StreamBuffer ssbonds; stream_init(&ssbonds); StreamBuffer cispeps; stream_init(&cispeps);
   StreamBuffer helices; stream_init(&helices); StreamBuffer sheets;  stream_init(&sheets);
   StreamBuffer sites;   stream_init(&sites); StreamBuffer conects; stream_init(&conects);
+  StreamBuffer dbrefs;  stream_init(&dbrefs);
 
   int parsed_num_models = 0;
   int counted_models = 0;
@@ -308,19 +413,74 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int 
         strcat(global_title, chunk);
         if (!id_from_header && !af_mode) { char *p1 = strchr(line, '('), *p2 = strchr(p1 ? p1 : line, ')'); if (p1 && p2 && (p2 > p1 + 4)) { size_t len = p2 - p1 - 1; memcpy(global_id, p1+1, len > 12 ? 12 : len); global_id[len > 12 ? 12 : len] = '\0'; } }
         if (strstr(global_title, "ALPHAFOLD") || strstr(global_title, "AlphaFold")) af_mode = 1;
+      } else if (f == 0 && strncmp(line, "COMPND", 6) == 0) {
+        char chunk[72] = {0}; int copy_len = strlen(line) - 10;
+        while(copy_len > 0 && (line[10+copy_len-1] == '\n' || line[10+copy_len-1] == '\r')) copy_len--;
+        memcpy(chunk, line+10, copy_len > 70 ? 70 : copy_len); trim_string(chunk);
+        if (strlen(raw_compnd) > 0) { strcat(raw_compnd, " "); }
+        strcat(raw_compnd, chunk);
+      } else if (f == 0 && strncmp(line, "SOURCE", 6) == 0) {
+        char chunk[72] = {0}; int copy_len = strlen(line) - 10;
+        while(copy_len > 0 && (line[10+copy_len-1] == '\n' || line[10+copy_len-1] == '\r')) copy_len--;
+        memcpy(chunk, line+10, copy_len > 70 ? 70 : copy_len); trim_string(chunk);
+        if (strlen(raw_source) > 0) { strcat(raw_source, " "); }
+        strcat(raw_source, chunk);
       } else if (f == 0 && strncmp(line, "EXPDTA", 6) == 0) { char chunk[71] = {0}; size_t c_len = strlen(line) - 10; memcpy(chunk, line+10, c_len > 70 ? 70 : c_len); trim_string(chunk); if (strlen(global_expdta) > 0) strcat(global_expdta, " "); strncat(global_expdta, chunk, 127 - strlen(global_expdta));
       } else if (f == 0 && strncmp(line, "REMARK   2 RESOLUTION.", 22) == 0) { float res = atof(line + 22); if (res > 0.0f) global_resolution = res;
       } else if (f == 0 && strncmp(line, "REMARK   3", 10) == 0) {
         char* prog = strstr(line, "PROGRAM"); char* ver = strstr(line, "VERSION"); char* colon = strchr(line, ':');
         if (prog && colon && strlen(global_program) == 0) { char temp[64] = {0}; char* start = colon + 1; while (*start == ' ' || *start == '\t') start++; memcpy(temp, start, strlen(start)); trim_string(temp); strncat(global_program, temp, 55); }
         else if (ver && colon && strlen(global_program) > 0 && !strstr(global_program, "v")) { char temp[64] = {0}; char* start = colon + 1; while (*start == ' ' || *start == '\t') start++; memcpy(temp, start, strlen(start)); trim_string(temp); strncat(global_program, " v", 55 - strlen(global_program)); strncat(global_program, temp, 55 - strlen(global_program)); }
+      } else if (f == 0 && strncmp(line, "DBREF ", 6) == 0) {
+        MetaDBRef db; memset(&db, ' ', sizeof(db)); db.chain = line[12];
+        memset(tbuf, 0, 16); memcpy(tbuf, line+14, 4); db.seq_begin = atoi(tbuf); db.iCode_begin = line[18] ? line[18] : ' ';
+        memset(tbuf, 0, 16); memcpy(tbuf, line+20, 4); db.seq_end = atoi(tbuf); db.iCode_end = line[24] ? line[24] : ' ';
+
+        char tmp_name[9] = {0}; memcpy(tmp_name, line+26, 5); trim_string(tmp_name); memcpy(db.db_name, tmp_name, 8);
+        char tmp_acc[13] = {0}; memcpy(tmp_acc, line+33, 8); trim_string(tmp_acc); memcpy(db.db_accession, tmp_acc, 12);
+        char tmp_id[13] = {0}; memcpy(tmp_id, line+42, 12); trim_string(tmp_id); memcpy(db.db_id_code, tmp_id, 12);
+
+        memset(tbuf, 0, 16); memcpy(tbuf, line+55, 5); db.db_seq_begin = atoi(tbuf); db.db_iCode_begin = line[60] ? line[60] : ' ';
+        memset(tbuf, 0, 16); memcpy(tbuf, line+62, 5); db.db_seq_end = atoi(tbuf); db.db_iCode_end = line[67] ? line[67] : ' ';
+        stream_write(&dbrefs, &db, sizeof(MetaDBRef));
+        if (f == 0 && !id_from_header && !af_mode && strncmp(db.db_name, "UNP", 3) == 0 && strlen(tmp_acc) > 3) {
+          strncpy(global_id, tmp_acc, 12); global_id[12] = '\0';
+        }
       } else if (f == 0 && strncmp(line, "NUMMDL", 6) == 0) {
         parsed_num_models = atoi(line + 10);
       } else if (f == 0 && strncmp(line, "MODEL ", 6) == 0) {
         counted_models++;
       } else if (f == 0 && strncmp(line, "SEQRES", 6) == 0) {
-        unsigned char c = line[11];
-        has_seqres_chain[c] = 1;
+        char chain = line[11];
+        has_seqres_chain[(unsigned char)chain] = 1;
+
+        if (chain != current_seqres_chain) {
+          if (current_seqres_count > 0) {
+            // Update the previous chain's residue count in the buffer
+            uint16_t* count_ptr = (uint16_t*)(seqres_buf.data + seqres_buf.len - current_seqres_count - 2);
+            *count_ptr = current_seqres_count;
+          }
+          current_seqres_chain = chain;
+          current_seqres_count = 0;
+          MetaSeqresHeader sh = {chain, 0};
+          stream_write(&seqres_buf, &sh, sizeof(MetaSeqresHeader));
+        }
+
+        for (int i = 0; i < 13; i++) {
+          int offset = 19 + i * 4;
+          if (offset + 2 >= (int)strlen(line)) break;
+          char res[4] = {0}; memcpy(res, line + offset, 3); trim_string(res);
+          if (strlen(res) == 0) continue;
+
+          uint8_t type_id = 0; // Default to UNK if not found
+          for (int t = 1; t < 256; t++) {
+            if ((UDICT[t].h_end_norm > 0 || UDICT[t].h_end_cterm > 0) && strncmp(UDICT[t].resName, res, 3) == 0) {
+              type_id = t; break;
+            }
+          }
+          stream_write(&seqres_buf, &type_id, 1);
+          current_seqres_count++;
+        }
       } else if (strncmp(line, "SSBOND", 6) == 0) { MetaSSBond b; memset(&b, 0, sizeof(b)); memcpy(b.res1.resName, line+11, 3); b.res1.chain = line[15]; memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+17, 4); b.res1.resSeq = atoi(tbuf); b.res1.iCode = line[21]; memcpy(b.res2.resName, line+25, 3); b.res2.chain = line[29]; memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+31, 4); b.res2.resSeq = atoi(tbuf); b.res2.iCode = line[35]; if (strlen(line) >= 65) { char tmp[8] = {0}; memcpy(tmp, line+59, 6); if (sscanf(tmp, "%s", b.sym1) != 1) b.sym1[0] = '\0'; } if (strlen(line) >= 72) { char tmp[8] = {0}; memcpy(tmp, line+66, 6); if (sscanf(tmp, "%s", b.sym2) != 1) b.sym2[0] = '\0'; } if (strlen(line) >= 78) { memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+73, 5); b.length = atof(tbuf); } stream_write(&ssbonds, &b, sizeof(MetaSSBond));
       } else if (strncmp(line, "CISPEP", 6) == 0) { MetaCispep c; memset(&c, 0, sizeof(c)); memcpy(c.res1.resName, line+11, 3); c.res1.chain = line[15]; memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+17, 4); c.res1.resSeq = atoi(tbuf); c.res1.iCode = line[21]; memcpy(c.res2.resName, line+25, 3); c.res2.chain = line[29]; memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+31, 4); c.res2.resSeq = atoi(tbuf); c.res2.iCode = line[35]; if (strlen(line) >= 46) { memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+43, 3); c.modNum = atoi(tbuf); } if (strlen(line) >= 59) { memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+53, 6); c.angle = atof(tbuf); } stream_write(&cispeps, &c, sizeof(MetaCispep));
       } else if (strncmp(line, "HELIX ", 6) == 0) { MetaHelix h; memset(&h, 0, sizeof(h)); memcpy(h.helixID, line+11, 3); trim_string(h.helixID); memcpy(h.start.resName, line+15, 3); h.start.chain = line[19]; memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+21, 4); h.start.resSeq = atoi(tbuf); h.start.iCode = line[25]; memcpy(h.end.resName, line+27, 3); h.end.chain = line[31]; memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+33, 4); h.end.resSeq = atoi(tbuf); h.end.iCode = line[37]; if (strlen(line) >= 40) { memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+38, 2); h.helix_class = atoi(tbuf); } if (strlen(line) >= 70) { memcpy(h.comment, line+40, 30); trim_string(h.comment); } if (strlen(line) >= 76) { memset(tbuf, 0, sizeof(tbuf)); memcpy(tbuf, line+71, 5); h.length = atoi(tbuf); } stream_write(&helices, &h, sizeof(MetaHelix));
@@ -345,7 +505,6 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int 
             stream_write(&sites, &r, sizeof(PdbResId));
           }
         }
-      } else if (strncmp(line, "DBREF ", 6) == 0) { char* unp = strstr(line, "UNP"); if (unp) { char dummy[16], uid[64]; if (sscanf(unp, "%s %s", dummy, uid) == 2 && strlen(uid) > 3 && f == 0 && !id_from_header && !af_mode) { size_t c = strlen(uid); memcpy(global_id, uid, c > 12 ? 12 : c); global_id[c > 12 ? 12 : c] = '\0'; } }
       } else if (strncmp(line, "CONECT", 6) == 0) {
         int len = strlen(line); int32_t vals[5] = {0}, targets = 0;
         for(int c=0; c<5; c++) { int start = 6 + c*5; if (start < len) { char buf[6] = {0}; int copy_len = len - start; if (copy_len > 5) copy_len = 5; memcpy(buf, line + start, copy_len); vals[c] = atoi(buf); if (c > 0 && vals[c] > 0) targets++; } }
@@ -384,6 +543,11 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int 
     fclose(fin);
   }
 
+  if (current_seqres_count > 0) {
+    uint16_t* count_ptr = (uint16_t*)(seqres_buf.data + seqres_buf.len - current_seqres_count - 2);
+    *count_ptr = current_seqres_count;
+  }
+
   if (af_mode && !id_from_header) {
     char temp[128]; strcpy(temp, in_pdbs[0]);
     char* base = strrchr(temp, '/'); base = base ? base + 1 : temp;
@@ -392,6 +556,12 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int 
     char* dot = strrchr(base, '.'); if (dot) *dot = '\0';
     strncpy(global_id, base, 12); global_id[12] = '\0';
   }
+
+  StreamBuffer compnd_tlv; stream_init(&compnd_tlv);
+  if (strlen(raw_compnd) > 0) extract_tlv(raw_compnd, &compnd_tlv, 0, af_mode);
+
+  StreamBuffer source_tlv; stream_init(&source_tlv);
+  if (strlen(raw_source) > 0) extract_tlv(raw_source, &source_tlv, 1, af_mode);
 
   uint32_t num_models = (parsed_num_models > 0) ? parsed_num_models : counted_models;
   if (num_models == 0) num_models = 1;
@@ -402,28 +572,33 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int 
   int has_res = (global_resolution > 0.0f), has_prog = (strlen(global_program) > 0);
 
   uint64_t meta_mask = 0; uint64_t zero = 0;
-  if (af_mode) meta_mask |= (1ULL << 0);
-  if (has_res) meta_mask |= (1ULL << 1);
-  if (has_title) meta_mask |= (1ULL << 2);
-  if (has_expdta) meta_mask |= (1ULL << 3);
-  if (has_prog) meta_mask |= (1ULL << 4);
-  if (has_het) meta_mask |= (1ULL << 5);
-  if (helices.len > 0) meta_mask |= (1ULL << 6);
-  if (sheets.len > 0) meta_mask |= (1ULL << 7);
-  if (ssbonds.len > 0) meta_mask |= (1ULL << 8);
-  if (cispeps.len > 0) meta_mask |= (1ULL << 9);
-  if (sites.len > 0) meta_mask |= (1ULL << 10);
-  if (include_hydrogens) meta_mask |= (1ULL << 11);
+  if (af_mode) meta_mask |= (1ULL << META_AF_MODE);
+  if (has_res) meta_mask |= (1ULL << META_RESOLUTION);
+  if (has_title) meta_mask |= (1ULL << META_TITLE);
+  if (has_expdta) meta_mask |= (1ULL << META_EXPDTA);
+  if (has_prog) meta_mask |= (1ULL << META_PROGRAM);
+  if (has_het) meta_mask |= (1ULL << META_HET_DICT);
+  if (helices.len > 0) meta_mask |= (1ULL << META_HELIX);
+  if (sheets.len > 0) meta_mask |= (1ULL << META_SHEET);
+  if (ssbonds.len > 0) meta_mask |= (1ULL << META_SSBOND);
+  if (cispeps.len > 0) meta_mask |= (1ULL << META_CISPEP);
+  if (sites.len > 0) meta_mask |= (1ULL << META_SITE);
+  if (include_hydrogens) meta_mask |= (1ULL << META_HYDROGENS);
+  if (compnd_tlv.len > 0) meta_mask |= (1ULL << META_COMPND);
+  if (source_tlv.len > 0) meta_mask |= (1ULL << META_SOURCE);
+  if (dbrefs.len > 0) meta_mask |= (1ULL << META_DBREF);
+  if (afdb_mode) meta_mask |= (1ULL << META_AFDB);
+  if (seqres_buf.len > 0 && !afdb_mode) meta_mask |= (1ULL << META_SEQRES);
 
   StreamBuffer meta_buffer; stream_init(&meta_buffer);
-  uint64_t meta_header = 6 | (meta_mask << 16);
+  uint64_t meta_header = 0 | (meta_mask << 16);
   stream_write(&meta_buffer, &meta_header, 8);
 
-  if (meta_mask & (1ULL << 1)) { uint32_t pad=0; stream_write(&meta_buffer, &global_resolution, 4); stream_write(&meta_buffer, &pad, 4); }
-  if (meta_mask & (1ULL << 2)) { stream_write(&meta_buffer, &title_len, 8); stream_write(&meta_buffer, global_title, title_len); size_t pad = (8 - (title_len % 8)) % 8; if (pad > 0) stream_write(&meta_buffer, &zero, pad); }
-  if (meta_mask & (1ULL << 3)) { stream_write(&meta_buffer, &expdta_len, 8); stream_write(&meta_buffer, global_expdta, expdta_len); size_t pad = (8 - (expdta_len % 8)) % 8; if (pad > 0) stream_write(&meta_buffer, &zero, pad); }
-  if (meta_mask & (1ULL << 4)) { uint64_t p_len = 56; stream_write(&meta_buffer, &p_len, 8); stream_write(&meta_buffer, global_program, 56); }
-  if (meta_mask & (1ULL << 5)) {
+  if (meta_mask & (1ULL << META_RESOLUTION)) { uint32_t pad=0; stream_write(&meta_buffer, &global_resolution, 4); stream_write(&meta_buffer, &pad, 4); }
+  if (meta_mask & (1ULL << META_TITLE)) { stream_write(&meta_buffer, &title_len, 8); stream_write(&meta_buffer, global_title, title_len); size_t pad = (8 - (title_len % 8)) % 8; if (pad > 0) stream_write(&meta_buffer, &zero, pad); }
+  if (meta_mask & (1ULL << META_EXPDTA)) { stream_write(&meta_buffer, &expdta_len, 8); stream_write(&meta_buffer, global_expdta, expdta_len); size_t pad = (8 - (expdta_len % 8)) % 8; if (pad > 0) stream_write(&meta_buffer, &zero, pad); }
+  if (meta_mask & (1ULL << META_PROGRAM)) { uint64_t p_len = 56; stream_write(&meta_buffer, &p_len, 8); stream_write(&meta_buffer, global_program, 56); }
+  if (meta_mask & (1ULL << META_HET_DICT)) {
     uint64_t dict_len = 1; for (int i = 0x81; i < custom_het_idx; i++) dict_len += 5 + UDICT[i].h_end_norm * 6;
     stream_write(&meta_buffer, &dict_len, 8);
     uint8_t custom_count = custom_het_idx - 0x81; stream_write(&meta_buffer, &custom_count, 1);
@@ -434,11 +609,15 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int 
     }
     size_t pad = (8 - (dict_len % 8)) % 8; if (pad > 0) stream_write(&meta_buffer, &zero, pad);
   }
-  if (meta_mask & (1ULL << 6)) { uint64_t L = helices.len; stream_write(&meta_buffer, &L, 8); stream_write(&meta_buffer, helices.data, L); size_t pad = (8 - (L % 8)) % 8; if (pad > 0) stream_write(&meta_buffer, &zero, pad); }
-  if (meta_mask & (1ULL << 7)) { uint64_t L = sheets.len; stream_write(&meta_buffer, &L, 8); stream_write(&meta_buffer, sheets.data, L); size_t pad = (8 - (L % 8)) % 8; if (pad > 0) stream_write(&meta_buffer, &zero, pad); }
-  if (meta_mask & (1ULL << 8)) { uint64_t L = ssbonds.len; stream_write(&meta_buffer, &L, 8); stream_write(&meta_buffer, ssbonds.data, L); size_t pad = (8 - (L % 8)) % 8; if (pad > 0) stream_write(&meta_buffer, &zero, pad); }
-  if (meta_mask & (1ULL << 9)) { uint64_t L = cispeps.len; stream_write(&meta_buffer, &L, 8); stream_write(&meta_buffer, cispeps.data, L); size_t pad = (8 - (L % 8)) % 8; if (pad > 0) stream_write(&meta_buffer, &zero, pad); }
-  if (meta_mask & (1ULL << 10)) { uint64_t L = sites.len; stream_write(&meta_buffer, &L, 8); stream_write(&meta_buffer, sites.data, L); size_t pad = (8 - (L % 8)) % 8; if (pad > 0) stream_write(&meta_buffer, &zero, pad); }
+  if (meta_mask & (1ULL << META_HELIX))  { uint64_t L = helices.len;    stream_write(&meta_buffer, &L, 8); stream_write(&meta_buffer, helices.data, L);    size_t pad = (8 - (L % 8)) % 8; if (pad > 0) stream_write(&meta_buffer, &zero, pad); }
+  if (meta_mask & (1ULL << META_SHEET))  { uint64_t L = sheets.len;     stream_write(&meta_buffer, &L, 8); stream_write(&meta_buffer, sheets.data, L);     size_t pad = (8 - (L % 8)) % 8; if (pad > 0) stream_write(&meta_buffer, &zero, pad); }
+  if (meta_mask & (1ULL << META_SSBOND)) { uint64_t L = ssbonds.len;    stream_write(&meta_buffer, &L, 8); stream_write(&meta_buffer, ssbonds.data, L);    size_t pad = (8 - (L % 8)) % 8; if (pad > 0) stream_write(&meta_buffer, &zero, pad); }
+  if (meta_mask & (1ULL << META_CISPEP)) { uint64_t L = cispeps.len;    stream_write(&meta_buffer, &L, 8); stream_write(&meta_buffer, cispeps.data, L);    size_t pad = (8 - (L % 8)) % 8; if (pad > 0) stream_write(&meta_buffer, &zero, pad); }
+  if (meta_mask & (1ULL << META_SITE))   { uint64_t L = sites.len;      stream_write(&meta_buffer, &L, 8); stream_write(&meta_buffer, sites.data, L);      size_t pad = (8 - (L % 8)) % 8; if (pad > 0) stream_write(&meta_buffer, &zero, pad); }
+  if (meta_mask & (1ULL << META_COMPND)) { uint64_t L = compnd_tlv.len; stream_write(&meta_buffer, &L, 8); stream_write(&meta_buffer, compnd_tlv.data, L); size_t pad = (8 - (L % 8)) % 8; if (pad > 0) stream_write(&meta_buffer, &zero, pad); }
+  if (meta_mask & (1ULL << META_SOURCE)) { uint64_t L = source_tlv.len; stream_write(&meta_buffer, &L, 8); stream_write(&meta_buffer, source_tlv.data, L); size_t pad = (8 - (L % 8)) % 8; if (pad > 0) stream_write(&meta_buffer, &zero, pad); }
+  if (meta_mask & (1ULL << META_DBREF))  { uint64_t L = dbrefs.len;     stream_write(&meta_buffer, &L, 8); stream_write(&meta_buffer, dbrefs.data, L);     size_t pad = (8 - (L % 8)) % 8; if (pad > 0) stream_write(&meta_buffer, &zero, pad); }
+  if (meta_mask & (1ULL << META_SEQRES)) { uint64_t L = seqres_buf.len; stream_write(&meta_buffer, &L, 8); stream_write(&meta_buffer, seqres_buf.data, L); size_t pad = (8 - (L % 8)) % 8; if (pad > 0) stream_write(&meta_buffer, &zero, pad); }
 
   StreamBuffer coords; stream_init(&coords);
   EncoderState st; memset(&st, 0, sizeof(st)); st.type = -1;
@@ -595,6 +774,8 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int 
   stream_free(&coords); stream_free(&conects); stream_free(&ssbonds);
   stream_free(&cispeps); stream_free(&helices); stream_free(&sheets);
   stream_free(&sites); stream_free(&meta_buffer);
+  stream_free(&compnd_tlv); stream_free(&source_tlv); stream_free(&dbrefs);
+  stream_free(&seqres_buf);
 
   for(int i=0; i<256; i++) { alt_free(&st.h_atoms[i]); alt_free(&st.hy_atoms[i]); }
   free(UDICT);

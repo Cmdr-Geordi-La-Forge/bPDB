@@ -170,6 +170,48 @@ typedef struct {
   size_t cap;
 } StreamBuffer;
 
+// --- Internal Contexts for Refactoring ---
+
+typedef struct {
+    uint64_t mask;
+    int af_mode;
+    int has_hydrogens;
+    float resolution;
+
+    const char* title;      uint64_t title_len;
+    const char* expdta;     uint64_t expdta_len;
+    const char* program;
+    
+    const uint8_t* compnd;  uint64_t compnd_len;
+    const uint8_t* source;  uint64_t source_len;
+    const uint8_t* seqres;  uint64_t seqres_len;
+    const uint8_t* dbrefs;  uint64_t num_dbrefs;
+    const uint8_t* ssbonds; uint64_t num_ssbonds;
+    const uint8_t* cispeps; uint64_t num_cispeps;
+    const uint8_t* helices; uint64_t num_helices;
+    const uint8_t* sheets;  uint64_t num_sheets;
+    const uint8_t* sites;   uint64_t len_sites;
+
+    size_t payload_start_offset;
+    size_t conect_offset;
+} DecodeMetadata;
+
+typedef struct {
+    const uint8_t* buffer;
+    size_t size;
+    FILE* out;
+    int is_first_model;
+    int is_last_model;
+
+    int day, month, year;
+    char pdbID[13];
+    char classification[41];
+    uint16_t total_models_minus_1;
+    uint16_t current_model_minus_1;
+    
+    size_t total_out_lines;
+} DecodeContext;
+
 void stream_init(StreamBuffer* buf);
 void stream_write(StreamBuffer* buf, const void* src, size_t size);
 void stream_free(StreamBuffer* buf);

@@ -75,9 +75,8 @@ typedef struct { int32_t b, x, y, z; } accum_t;
 #endif
 
 #if defined(__AVX2__) || defined(__SSE4_1__)
-#define SIMD_DECODE_PHASE1(ptr, out_accum, af_shift) do {               \
+#define SIMD_DECODE_PHASE1(ptr, out_accum, v_shift) do {                \
     uint64_t ctrl = *(uint64_t*)(ptr);                                  \
-    __m128i v_shift = _mm_cvtsi32_si128(af_shift);                      \
     if ((uint32_t)ctrl & 0x01) {                                        \
       __m128i msb = _mm_cvtepi16_epi32(_mm_cvtsi64_si128(ctrl));        \
       out_accum = _mm_slli_epi32(_mm_srai_epi32(msb, 1), 13);           \
@@ -91,11 +90,49 @@ typedef struct { int32_t b, x, y, z; } accum_t;
       ptr += 8;                                                         \
     }                                                                   \
   } while(0)
-#elif defined(__aarch64__) || defined(__ARM_NEON)
-#define SIMD_DECODE_PHASE1(ptr, out_accum, af_shift) do {               \
+
+#define SIMD_DECODE_MACRO(ptr, out_accum, c_occ, c_chg, alt_out, v_shift, af_mode) do { \
     uint64_t ctrl = *(uint64_t*)(ptr);                                  \
-    int32x4_t v_shift32 = vdupq_n_s32(-af_shift);                       \
-    int16x4_t v_shift16 = vdup_n_s16(-af_shift);                        \
+    if ((uint32_t)ctrl & 0x01) {                                        \
+      __m128i msb = _mm_cvtepi16_epi32(_mm_cvtsi64_si128(ctrl));        \
+      out_accum = _mm_slli_epi32(_mm_srai_epi32(msb, 1), 13);           \
+      uint64_t lsb_ctrl = *(uint64_t*)(ptr + 8);                        \
+      if (af_mode) {                                                    \
+        alt_out = 0; c_occ = 100; c_chg = 0;                            \
+      } else {                                                          \
+        uint16_t b_lsb = (uint16_t)lsb_ctrl;                            \
+        uint16_t x_lsb = (uint16_t)(lsb_ctrl >> 16);                    \
+        uint16_t y_lsb = (uint16_t)(lsb_ctrl >> 32);                    \
+        uint16_t z_lsb = (uint16_t)(lsb_ctrl >> 48);                    \
+        alt_out = (b_lsb >> 1) & 1;                                     \
+        c_occ = ((b_lsb & 4) << 4) | ((x_lsb & 6) << 3) | ((y_lsb & 6) << 1) | ((z_lsb & 6) >> 1); \
+        c_chg = (((x_lsb & 1) << 2) | ((y_lsb & 1) << 1) | (z_lsb & 1)) - 3; \
+      }                                                                 \
+      __m128i lsb = _mm_cvtepi16_epi32(_mm_cvtsi64_si128(lsb_ctrl));    \
+      out_accum = _mm_add_epi32(out_accum, _mm_sra_epi32(lsb, v_shift)); \
+      ptr += 16;                                                        \
+    } else {                                                            \
+      if (af_mode) {                                                    \
+        alt_out = 0; c_occ = 100; c_chg = 0;                            \
+      } else {                                                          \
+        uint16_t b_ctrl = (uint16_t)ctrl;                               \
+        uint16_t x_ctrl = (uint16_t)(ctrl >> 16);                       \
+        uint16_t y_ctrl = (uint16_t)(ctrl >> 32);                       \
+        uint16_t z_ctrl = (uint16_t)(ctrl >> 48);                       \
+        alt_out = (b_ctrl >> 1) & 1;                                    \
+        c_occ = ((b_ctrl & 4) << 4) | ((x_ctrl & 6) << 3) | ((y_ctrl & 6) << 1) | ((z_ctrl & 6) >> 1); \
+        c_chg = (((x_ctrl & 1) << 2) | ((y_ctrl & 1) << 1) | (z_ctrl & 1)) - 3; \
+      }                                                                 \
+      __m128i loaded = _mm_cvtsi64_si128(ctrl);                         \
+      __m128i deltas = _mm_sra_epi16(loaded, v_shift);                  \
+      out_accum = _mm_add_epi32(out_accum, _mm_cvtepi16_epi32(deltas)); \
+      ptr += 8;                                                         \
+    }                                                                   \
+  } while(0)
+
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+#define SIMD_DECODE_PHASE1(ptr, out_accum, v_shift32, v_shift16) do {   \
+    uint64_t ctrl = *(uint64_t*)(ptr);                                  \
     if ((uint32_t)ctrl & 0x01) {                                        \
       int16x4_t msb = vreinterpret_s16_u8(vcreate_u8(ctrl));            \
       int32x4_t msb_32 = vshlq_n_s32(vmovl_s16(vshr_n_s16(msb, 1)), 13); \
@@ -110,99 +147,49 @@ typedef struct { int32_t b, x, y, z; } accum_t;
       ptr += 8;                                                         \
     }                                                                   \
   } while(0)
-#else
-#define SIMD_DECODE_PHASE1(ptr, out_accum, af_shift) do {               \
-    uint64_t ctrl = *(uint64_t*)(ptr);                                  \
-    if ((uint32_t)ctrl & 0x01) {                                        \
-      out_accum.b = (((int16_t)(uint16_t)ctrl) >> 1) << 13;             \
-      out_accum.x = (((int16_t)(uint16_t)(ctrl >> 16)) >> 1) << 13;     \
-      out_accum.y = (((int16_t)(uint16_t)(ctrl >> 32)) >> 1) << 13;     \
-      out_accum.z = (((int16_t)(uint16_t)(ctrl >> 48)) >> 1) << 13;     \
-      uint64_t lsb_ctrl = *(uint64_t*)(ptr + 8);                        \
-      out_accum.b += ((int16_t)(uint16_t)lsb_ctrl) >> af_shift;         \
-      out_accum.x += ((int16_t)(uint16_t)(lsb_ctrl >> 16)) >> af_shift; \
-      out_accum.y += ((int16_t)(uint16_t)(lsb_ctrl >> 32)) >> af_shift; \
-      out_accum.z += ((int16_t)(uint16_t)(lsb_ctrl >> 48)) >> af_shift; \
-      ptr += 16;                                                        \
-    } else {                                                            \
-      out_accum.b += ((int16_t)(uint16_t)ctrl) >> af_shift;             \
-      out_accum.x += ((int16_t)(uint16_t)(ctrl >> 16)) >> af_shift;     \
-      out_accum.y += ((int16_t)(uint16_t)(ctrl >> 32)) >> af_shift;     \
-      out_accum.z += ((int16_t)(uint16_t)(ctrl >> 48)) >> af_shift;     \
-      ptr += 8;                                                         \
-    }                                                                   \
-  } while(0)
-#endif
 
-
-#if defined(__AVX2__) || defined(__SSE4_1__)
-#define SIMD_DECODE_MACRO(ptr, out_accum, c_occ, c_chg, alt_out, af_shift) do { \
+#define SIMD_DECODE_MACRO(ptr, out_accum, c_occ, c_chg, alt_out, v_shift32, v_shift16, af_mode) do { \
     uint64_t ctrl = *(uint64_t*)(ptr);                                  \
-    __m128i v_shift = _mm_cvtsi32_si128(af_shift);                      \
-    if ((uint32_t)ctrl & 0x01) {                                        \
-      __m128i msb = _mm_cvtepi16_epi32(_mm_cvtsi64_si128(ctrl));        \
-      out_accum = _mm_slli_epi32(_mm_srai_epi32(msb, 1), 13);           \
-      uint64_t lsb_ctrl = *(uint64_t*)(ptr + 8);                        \
-      uint16_t b_lsb = (uint16_t)lsb_ctrl;                              \
-      uint16_t x_lsb = (uint16_t)(lsb_ctrl >> 16);                      \
-      uint16_t y_lsb = (uint16_t)(lsb_ctrl >> 32);                      \
-      uint16_t z_lsb = (uint16_t)(lsb_ctrl >> 48);                      \
-      alt_out = (b_lsb >> 1) & 1;                                       \
-      c_occ = ((b_lsb & 4) << 4) | ((x_lsb & 6) << 3) | ((y_lsb & 6) << 1) | ((z_lsb & 6) >> 1); \
-      c_chg = (((x_lsb & 1) << 2) | ((y_lsb & 1) << 1) | (z_lsb & 1)) - 3; \
-      __m128i lsb = _mm_cvtepi16_epi32(_mm_cvtsi64_si128(lsb_ctrl));    \
-      out_accum = _mm_add_epi32(out_accum, _mm_sra_epi32(lsb, v_shift)); \
-      ptr += 16;                                                        \
-    } else {                                                            \
-      uint16_t b_ctrl = (uint16_t)ctrl;                                 \
-      uint16_t x_ctrl = (uint16_t)(ctrl >> 16);                         \
-      uint16_t y_ctrl = (uint16_t)(ctrl >> 32);                         \
-      uint16_t z_ctrl = (uint16_t)(ctrl >> 48);                         \
-      alt_out = (b_ctrl >> 1) & 1;                                      \
-      c_occ = ((b_ctrl & 4) << 4) | ((x_ctrl & 6) << 3) | ((y_ctrl & 6) << 1) | ((z_ctrl & 6) >> 1); \
-      c_chg = (((x_ctrl & 1) << 2) | ((y_ctrl & 1) << 1) | (z_ctrl & 1)) - 3; \
-      __m128i loaded = _mm_cvtsi64_si128(ctrl);                         \
-      __m128i deltas = _mm_sra_epi16(loaded, v_shift);                  \
-      out_accum = _mm_add_epi32(out_accum, _mm_cvtepi16_epi32(deltas)); \
-      ptr += 8;                                                         \
-    }                                                                   \
-  } while(0)
-#elif defined(__aarch64__) || defined(__ARM_NEON)
-#define SIMD_DECODE_MACRO(ptr, out_accum, c_occ, c_chg, alt_out, af_shift) do { \
-    uint64_t ctrl = *(uint64_t*)(ptr);                                  \
-    int32x4_t v_shift32 = vdupq_n_s32(-af_shift);                       \
-    int16x4_t v_shift16 = vdup_n_s16(-af_shift);                        \
     if ((uint32_t)ctrl & 0x01) {                                        \
       int16x4_t msb = vreinterpret_s16_u8(vcreate_u8(ctrl));            \
       int32x4_t msb_32 = vshlq_n_s32(vmovl_s16(vshr_n_s16(msb, 1)), 13); \
       uint64_t lsb_ctrl = *(uint64_t*)(ptr + 8);                        \
-      uint16_t b_lsb = (uint16_t)lsb_ctrl;                              \
-      uint16_t x_lsb = (uint16_t)(lsb_ctrl >> 16);                      \
-      uint16_t y_lsb = (uint16_t)(lsb_ctrl >> 32);                      \
-      uint16_t z_lsb = (uint16_t)(lsb_ctrl >> 48);                      \
-      alt_out = (b_lsb >> 1) & 1;                                       \
-      c_occ = ((b_lsb & 4) << 4) | ((x_lsb & 6) << 3) | ((y_lsb & 6) << 1) | ((z_lsb & 6) >> 1); \
-      c_chg = (((x_lsb & 1) << 2) | ((y_lsb & 1) << 1) | (z_lsb & 1)) - 3; \
+      if (af_mode) {                                                    \
+        alt_out = 0; c_occ = 100; c_chg = 0;                            \
+      } else {                                                          \
+        uint16_t b_lsb = (uint16_t)lsb_ctrl;                            \
+        uint16_t x_lsb = (uint16_t)(lsb_ctrl >> 16);                    \
+        uint16_t y_lsb = (uint16_t)(lsb_ctrl >> 32);                    \
+        uint16_t z_lsb = (uint16_t)(lsb_ctrl >> 48);                    \
+        alt_out = (b_lsb >> 1) & 1;                                     \
+        c_occ = ((b_lsb & 4) << 4) | ((x_lsb & 6) << 3) | ((y_lsb & 6) << 1) | ((z_lsb & 6) >> 1); \
+        c_chg = (((x_lsb & 1) << 2) | ((y_lsb & 1) << 1) | (z_lsb & 1)) - 3; \
+      }                                                                 \
       int16x4_t lsb = vreinterpret_s16_u8(vcreate_u8(lsb_ctrl));        \
       int32x4_t lsb_32 = vshlq_s32(vmovl_s16(lsb), v_shift32);          \
       out_accum = vaddq_s32(msb_32, lsb_32);                            \
       ptr += 16;                                                        \
     } else {                                                            \
-      uint16_t b_ctrl = (uint16_t)ctrl;                                 \
-      uint16_t x_ctrl = (uint16_t)(ctrl >> 16);                         \
-      uint16_t y_ctrl = (uint16_t)(ctrl >> 32);                         \
-      uint16_t z_ctrl = (uint16_t)(ctrl >> 48);                         \
-      alt_out = (b_ctrl >> 1) & 1;                                      \
-      c_occ = ((b_ctrl & 4) << 4) | ((x_ctrl & 6) << 3) | ((y_ctrl & 6) << 1) | ((z_ctrl & 6) >> 1); \
-      c_chg = (((x_ctrl & 1) << 2) | ((y_ctrl & 1) << 1) | (z_ctrl & 1)) - 3; \
+      if (af_mode) {                                                    \
+        alt_out = 0; c_occ = 100; c_chg = 0;                            \
+      } else {                                                          \
+        uint16_t b_ctrl = (uint16_t)ctrl;                               \
+        uint16_t x_ctrl = (uint16_t)(ctrl >> 16);                       \
+        uint16_t y_ctrl = (uint16_t)(ctrl >> 32);                       \
+        uint16_t z_ctrl = (uint16_t)(ctrl >> 48);                       \
+        alt_out = (b_ctrl >> 1) & 1;                                    \
+        c_occ = ((b_ctrl & 4) << 4) | ((x_ctrl & 6) << 3) | ((y_ctrl & 6) << 1) | ((z_ctrl & 6) >> 1); \
+        c_chg = (((x_ctrl & 1) << 2) | ((y_ctrl & 1) << 1) | (z_ctrl & 1)) - 3; \
+      }                                                                 \
       int16x4_t loaded = vreinterpret_s16_u8(vcreate_u8(ctrl));         \
       int16x4_t deltas = vshl_s16(loaded, v_shift16);                   \
       out_accum = vaddq_s32(out_accum, vmovl_s16(deltas));              \
       ptr += 8;                                                         \
     }                                                                   \
   } while(0)
+
 #else
-#define SIMD_DECODE_MACRO(ptr, out_accum, c_occ, c_chg, alt_out, af_shift) do { \
+#define SIMD_DECODE_PHASE1(ptr, out_accum, v_shift) do {                \
     uint64_t ctrl = *(uint64_t*)(ptr);                                  \
     if ((uint32_t)ctrl & 0x01) {                                        \
       out_accum.b = (((int16_t)(uint16_t)ctrl) >> 1) << 13;             \
@@ -210,34 +197,97 @@ typedef struct { int32_t b, x, y, z; } accum_t;
       out_accum.y = (((int16_t)(uint16_t)(ctrl >> 32)) >> 1) << 13;     \
       out_accum.z = (((int16_t)(uint16_t)(ctrl >> 48)) >> 1) << 13;     \
       uint64_t lsb_ctrl = *(uint64_t*)(ptr + 8);                        \
-      uint16_t b_lsb = (uint16_t)lsb_ctrl;                              \
-      uint16_t x_lsb = (uint16_t)(lsb_ctrl >> 16);                      \
-      uint16_t y_lsb = (uint16_t)(lsb_ctrl >> 32);                      \
-      uint16_t z_lsb = (uint16_t)(lsb_ctrl >> 48);                      \
-      alt_out = (b_lsb >> 1) & 1;                                       \
-      c_occ = ((b_lsb & 4) << 4) | ((x_lsb & 6) << 3) | ((y_lsb & 6) << 1) | ((z_lsb & 6) >> 1); \
-      c_chg = (((x_lsb & 1) << 2) | ((y_lsb & 1) << 1) | (z_lsb & 1)) - 3; \
-      out_accum.b += ((int16_t)b_lsb) >> af_shift;                      \
-      out_accum.x += ((int16_t)x_lsb) >> af_shift;                      \
-      out_accum.y += ((int16_t)y_lsb) >> af_shift;                      \
-      out_accum.z += ((int16_t)z_lsb) >> af_shift;                      \
+      out_accum.b += ((int16_t)(uint16_t)lsb_ctrl) >> v_shift;          \
+      out_accum.x += ((int16_t)(uint16_t)(lsb_ctrl >> 16)) >> v_shift;  \
+      out_accum.y += ((int16_t)(uint16_t)(lsb_ctrl >> 32)) >> v_shift;  \
+      out_accum.z += ((int16_t)(uint16_t)(lsb_ctrl >> 48)) >> v_shift;  \
       ptr += 16;                                                        \
     } else {                                                            \
-      uint16_t b_ctrl = (uint16_t)ctrl;                                 \
-      uint16_t x_ctrl = (uint16_t)(ctrl >> 16);                         \
-      uint16_t y_ctrl = (uint16_t)(ctrl >> 32);                         \
-      uint16_t z_ctrl = (uint16_t)(ctrl >> 48);                         \
-      alt_out = (b_ctrl >> 1) & 1;                                      \
-      c_occ = ((b_ctrl & 4) << 4) | ((x_ctrl & 6) << 3) | ((y_ctrl & 6) << 1) | ((z_ctrl & 6) >> 1); \
-      c_chg = (((x_ctrl & 1) << 2) | ((y_ctrl & 1) << 1) | (z_ctrl & 1)) - 3; \
-      out_accum.b += ((int16_t)b_ctrl) >> af_shift;                     \
-      out_accum.x += ((int16_t)x_ctrl) >> af_shift;                     \
-      out_accum.y += ((int16_t)y_ctrl) >> af_shift;                     \
-      out_accum.z += ((int16_t)z_ctrl) >> af_shift;                     \
+      out_accum.b += ((int16_t)(uint16_t)ctrl) >> v_shift;              \
+      out_accum.x += ((int16_t)(uint16_t)(ctrl >> 16)) >> v_shift;      \
+      out_accum.y += ((int16_t)(uint16_t)(ctrl >> 32)) >> v_shift;      \
+      out_accum.z += ((int16_t)(uint16_t)(ctrl >> 48)) >> v_shift;      \
+      ptr += 8;                                                         \
+    }                                                                   \
+  } while(0)
+
+#define SIMD_DECODE_MACRO(ptr, out_accum, c_occ, c_chg, alt_out, v_shift, af_mode) do { \
+    uint64_t ctrl = *(uint64_t*)(ptr);                                  \
+    if ((uint32_t)ctrl & 0x01) {                                        \
+      out_accum.b = (((int16_t)(uint16_t)ctrl) >> 1) << 13;             \
+      out_accum.x = (((int16_t)(uint16_t)(ctrl >> 16)) >> 1) << 13;     \
+      out_accum.y = (((int16_t)(uint16_t)(ctrl >> 32)) >> 1) << 13;     \
+      out_accum.z = (((int16_t)(uint16_t)(ctrl >> 48)) >> 1) << 13;     \
+      uint64_t lsb_ctrl = *(uint64_t*)(ptr + 8);                        \
+      if (af_mode) {                                                    \
+        alt_out = 0; c_occ = 100; c_chg = 0;                            \
+      } else {                                                          \
+        uint16_t b_lsb = (uint16_t)lsb_ctrl;                            \
+        uint16_t x_lsb = (uint16_t)(lsb_ctrl >> 16);                    \
+        uint16_t y_lsb = (uint16_t)(lsb_ctrl >> 32);                    \
+        uint16_t z_lsb = (uint16_t)(lsb_ctrl >> 48);                    \
+        alt_out = (b_lsb >> 1) & 1;                                     \
+        c_occ = ((b_lsb & 4) << 4) | ((x_lsb & 6) << 3) | ((y_lsb & 6) << 1) | ((z_lsb & 6) >> 1); \
+        c_chg = (((x_lsb & 1) << 2) | ((y_lsb & 1) << 1) | (z_lsb & 1)) - 3; \
+      }                                                                 \
+      out_accum.b += ((int16_t)(uint16_t)lsb_ctrl) >> v_shift;          \
+      out_accum.x += ((int16_t)(uint16_t)(lsb_ctrl >> 16)) >> v_shift;  \
+      out_accum.y += ((int16_t)(uint16_t)(lsb_ctrl >> 32)) >> v_shift;  \
+      out_accum.z += ((int16_t)(uint16_t)(lsb_ctrl >> 48)) >> v_shift;  \
+      ptr += 16;                                                        \
+    } else {                                                            \
+      if (af_mode) {                                                    \
+        alt_out = 0; c_occ = 100; c_chg = 0;                            \
+      } else {                                                          \
+        uint16_t b_ctrl = (uint16_t)ctrl;                               \
+        uint16_t x_ctrl = (uint16_t)(ctrl >> 16);                       \
+        uint16_t y_ctrl = (uint16_t)(ctrl >> 32);                       \
+        uint16_t z_ctrl = (uint16_t)(ctrl >> 48);                       \
+        alt_out = (b_ctrl >> 1) & 1;                                    \
+        c_occ = ((b_ctrl & 4) << 4) | ((x_ctrl & 6) << 3) | ((y_ctrl & 6) << 1) | ((z_ctrl & 6) >> 1); \
+        c_chg = (((x_ctrl & 1) << 2) | ((y_ctrl & 1) << 1) | (z_ctrl & 1)) - 3; \
+      }                                                                 \
+      out_accum.b += ((int16_t)ctrl) >> v_shift;                        \
+      out_accum.x += ((int16_t)(ctrl >> 16)) >> v_shift;                \
+      out_accum.y += ((int16_t)(ctrl >> 32)) >> v_shift;                \
+      out_accum.z += ((int16_t)(ctrl >> 48)) >> v_shift;                \
       ptr += 8;                                                         \
     }                                                                   \
   } while(0)
 #endif
+
+typedef struct {
+  int atom_serial;
+  int32_t current_resSeq;
+  char iCode;
+  uint8_t last_valid_type;
+  char c1, c2;
+  int is_n_term, is_c_term;
+  int has_ter;
+
+  int atoms_left;
+  uint32_t parsed_base_atoms;
+  uint32_t expected_atoms;
+  int atom_dict_idx;
+    
+  int s_idx;
+  const uint8_t* seq_ptr;
+  int seq_bytes;
+    
+  int first_res;
+  int no_inc;
+  int first_decoded;
+    
+  int processing_hydrogens;
+  int h_start, h_end;
+  int hy_start, hy_end;
+
+  int has_anchor;
+  char active_alt_char;
+    
+  accum_t accum;
+  accum_t anchor_accum;
+} DecodeState;
 
 volatile int32_t benchmark_sink = 0;
 
@@ -386,7 +436,23 @@ static void count_required_lines(DecodeContext* ctx, DecodeMetadata* meta) {
         }
       }
     }
-    if (meta->title_len > 0) ctx->total_out_lines += (meta->title_len + 69) / 70;
+    if (meta->title_len > 0) {
+      uint64_t i = 0;
+      while (i < meta->title_len) {
+        uint64_t copy_len = meta->title_len - i;
+        if (copy_len > 70) {
+          copy_len = 70;
+          while (copy_len > 0 && meta->title[i + copy_len - 1] != ' ') copy_len--;
+          if (copy_len == 0) {
+            copy_len = 70;
+          } else {
+            copy_len--;
+          }
+        }
+        ctx->total_out_lines++;
+        i += copy_len;
+      }
+    }
     if (meta->mask & (1ULL << META_AFDB)) {
       ctx->total_out_lines += 35;
       uint32_t first_r_a = *(uint32_t*)(ctx->buffer + meta->payload_start_offset);
@@ -468,15 +534,33 @@ static void write_headers_to_buffer(char** w_ptr, DecodeContext* ctx, DecodeMeta
   size_t c_len = strlen(ctx->classification); if (c_len > 0) memcpy(*w_ptr + 10, ctx->classification, c_len > 40 ? 40 : c_len);
   int dlen = snprintf(tbuf, 128, "%02d-%3s-%02d", ctx->day, MONTHS[ctx->month], ctx->year % 100); memcpy(*w_ptr + 50, tbuf, dlen);
   size_t id_len = strlen(ctx->pdbID); if (id_len > 0 && !meta->af_mode) memcpy(*w_ptr + 62, ctx->pdbID, id_len > 18 ? 18 : id_len); *w_ptr += 81;
-
   if (meta->title_len > 0) {
-    for (uint64_t i = 0; i < meta->title_len; i += 70) {
-      memcpy(*w_ptr, "TITLE   ", 8); if (i > 0) { int ln = snprintf(tbuf, 128, "%2d", (int)(i/70)+1); memcpy(*w_ptr + 8, tbuf, ln); }
-      size_t copy_len = meta->title_len - i; if (copy_len > 70) copy_len = 70;
-      memcpy(*w_ptr + 10, meta->title + i, copy_len); *w_ptr += 81;
+    uint64_t i = 0;
+    int line_num = 1;
+    while (i < meta->title_len) {
+      uint64_t copy_len = meta->title_len - i;
+      if (copy_len > 70) {
+        copy_len = 70;
+        while (copy_len > 0 && meta->title[i + copy_len - 1] != ' ') {
+          copy_len--;
+        }
+        if (copy_len == 0) {
+          copy_len = 70; 
+        } else {
+          copy_len--;
+        }
+      }
+      memcpy(*w_ptr, "TITLE   ", 8); 
+      if (line_num > 1) { 
+        int ln = snprintf(tbuf, 128, "%2d", line_num); 
+        memcpy(*w_ptr + 8, tbuf, ln); 
+      }
+      memcpy(*w_ptr + 10, meta->title + i, copy_len); 
+      *w_ptr += 81;
+      i += copy_len;
+      line_num++;
     }
   }
-
   TaxDict taxdict = load_taxdict();
   if (meta->compnd_len > 0) write_tlv_to_pdb(w_ptr, meta->compnd, meta->compnd_len, 0, &taxdict, meta->af_mode);
   if (meta->source_len > 0) write_tlv_to_pdb(w_ptr, meta->source, meta->source_len, 1, &taxdict, meta->af_mode);
@@ -487,14 +571,20 @@ static void write_headers_to_buffer(char** w_ptr, DecodeContext* ctx, DecodeMeta
   for (uint32_t i=0; i<meta->num_dbrefs; i++) {
     MetaDBRef* d = (MetaDBRef*)(meta->dbrefs + i * sizeof(MetaDBRef));
         
-    // FIX: Extract packed buffers into null-terminated arrays to safely pass to snprintf
     char db_name[9] = {0}; memcpy(db_name, d->db_name, 8); trim_string(db_name);
     char db_acc[13] = {0}; memcpy(db_acc, d->db_accession, 12); trim_string(db_acc);
     char db_id[13] = {0};  memcpy(db_id, d->db_id_code, 12); trim_string(db_id);
 
-    int len = snprintf(tbuf, 128, "DBREF  %4s %c %4d%c %4d%c %-6s %-8s %-12s %5d%c %5d%c",
-                       (meta->af_mode ? "XXXX" : ctx->pdbID), d->chain, d->seq_begin, d->iCode_begin, d->seq_end, d->iCode_end,
-                       db_name, db_acc, db_id, d->db_seq_begin, d->db_iCode_begin, d->db_seq_end, d->db_iCode_end);
+    int len = 0;
+    if (meta->af_mode) {
+      len = snprintf(tbuf, 128, "DBREF  XXXX %c %4d%c %4d%c %-6s %-10s %-12s %5d%c %5d%c",
+                     d->chain, d->seq_begin, d->iCode_begin, d->seq_end, d->iCode_end,
+                     db_name, db_acc, db_id, d->db_seq_begin, d->db_iCode_begin, d->db_seq_end, d->db_iCode_end);
+    } else {
+      len = snprintf(tbuf, 128, "DBREF  %4s %c %4d%c %4d%c %-6s %-8s %-12s %5d%c %5d%c",
+                     ctx->pdbID, d->chain, d->seq_begin, d->iCode_begin, d->seq_end, d->iCode_end,
+                     db_name, db_acc, db_id, d->db_seq_begin, d->db_iCode_begin, d->db_seq_end, d->db_iCode_end);
+    }
     memcpy(*w_ptr, tbuf, len); *w_ptr += 81;
   }
     
@@ -583,9 +673,172 @@ static void write_headers_to_buffer(char** w_ptr, DecodeContext* ctx, DecodeMeta
   }
 }
 
+static inline void parse_sequence_header(const uint8_t* buffer, size_t* offset_ptr, uint32_t num_residues, DecodeState* ds, DecodeMetadata* meta, ResidueDict* UDICT) {
+  uint8_t c1_raw = buffer[*offset_ptr + 4];
+  uint8_t c2_raw = buffer[*offset_ptr + 5];
+  int16_t seq_raw = *(int16_t*)(buffer + *offset_ptr + 6);
+
+  ds->c1 = c1_raw & 0x7F; if (ds->c1 == 0) ds->c1 = ' ';
+  ds->c2 = c2_raw & 0x7F; if (ds->c2 == 0) ds->c2 = ' ';
+
+  ds->is_n_term = (c1_raw & 0x80) != 0;
+  ds->is_c_term = (c2_raw & 0x80) != 0;
+  ds->has_ter = seq_raw & 1;
+  ds->current_resSeq = seq_raw >> 1;
+
+  *offset_ptr += 8;
+
+  ds->seq_ptr = buffer + *offset_ptr;
+  ds->seq_bytes = 0; ds->expected_atoms = 0;
+  int first_seen = 0;
+
+  for (uint32_t r = 0; r < num_residues; r++) {
+    uint8_t type = ds->seq_ptr[ds->seq_bytes++];
+    if (type == 0x7C) {
+      ds->seq_bytes++;
+    } else if (type != 0x00 && type != 0x7F) {
+      int is_first = (!first_seen) && ds->is_n_term;
+      int is_last  = (r == (uint32_t)(num_residues - 1)) && ds->is_c_term;
+      first_seen = 1;
+
+      ds->expected_atoms += (is_last ? UDICT[type].h_end_cterm : UDICT[type].h_end_norm) - (is_first ? 0 : UDICT[type].h_start_norm);
+      if (meta->has_hydrogens) {
+        ds->expected_atoms += (is_last ? UDICT[type].hy_end_cterm : UDICT[type].hy_end_norm) - (is_first ? 0 : UDICT[type].hy_start_norm);
+      }
+    }
+  }
+  *offset_ptr += ds->seq_bytes + ((8 - (ds->seq_bytes & 7)) & 7);
+
+  ds->first_res = 1; ds->first_decoded = 0; ds->no_inc = 0; ds->s_idx = 0; 
+  ds->parsed_base_atoms = 0; ds->atoms_left = 0; ds->processing_hydrogens = 0; ds->has_anchor = 0;
+}
+
+static inline void update_residue_state(DecodeState* ds, DecodeMetadata* meta, ResidueDict* UDICT) {
+  if (ds->has_anchor) { ds->accum = ds->anchor_accum; ds->has_anchor = 0; }
+  if (ds->parsed_base_atoms < ds->expected_atoms) {
+    uint8_t m_type = 0;
+    ds->iCode = ' ';
+    do {
+      if (ds->s_idx >= ds->seq_bytes) break;
+      m_type = ds->seq_ptr[ds->s_idx++];
+      if (m_type == 0x00) { ds->current_resSeq++; ds->first_res = 0; ds->no_inc = 0;}
+      else if (m_type == 0x7F) { ds->no_inc = 1; }
+      else if (m_type == 0x7C) { ds->iCode = ds->seq_ptr[ds->s_idx++]; }
+    } while (m_type == 0x00 || m_type == 0x7F || m_type == 0x7C);
+        
+    if (ds->s_idx <= ds->seq_bytes) {
+      ds->last_valid_type = m_type & 0xFF;
+      if (!ds->first_res && !ds->no_inc) { ds->current_resSeq++; }
+      ds->first_res = 0; ds->no_inc = 0;
+
+      int is_first = (!ds->first_decoded) && ds->is_n_term;
+      int is_last  = (ds->s_idx == ds->seq_bytes) && ds->is_c_term;
+      ds->first_decoded = 1;
+
+      ds->h_start = is_first ? 0 : UDICT[ds->last_valid_type].h_start_norm;
+      ds->h_end   = is_last  ? UDICT[ds->last_valid_type].h_end_cterm : UDICT[ds->last_valid_type].h_end_norm;
+
+      ds->hy_start = 0; ds->hy_end = 0;
+      if (meta->has_hydrogens) {
+        ds->hy_start = is_first ? 0 : UDICT[ds->last_valid_type].hy_start_norm;
+        ds->hy_end   = is_last  ? UDICT[ds->last_valid_type].hy_end_cterm : UDICT[ds->last_valid_type].hy_end_norm;
+      }
+
+      ds->atoms_left = (ds->h_end - ds->h_start) + (ds->hy_end - ds->hy_start);
+      ds->atom_dict_idx = ds->h_start;
+      ds->processing_hydrogens = 0;
+    } else {
+      ds->atoms_left = 1;
+    }
+  } else {
+    ds->atoms_left = 1;
+  }
+  ds->active_alt_char = 'A';
+}
+
+static inline void write_formatted_atom(char** w_ptr, DecodeState* ds, DecodeMetadata* meta, ResidueDict* UDICT, int32_t current_occ, int8_t current_charge, int alt_flag, int32_t v_b) {
+  char tbuf[128];
+  char altLoc = ' ';
+  if (alt_flag || ds->active_alt_char > 'A') { altLoc = ds->active_alt_char++; }
+
+  const char* a_name; const char* e_name;
+  if (!ds->processing_hydrogens && ds->atom_dict_idx >= ds->h_start && ds->atom_dict_idx < ds->h_end) {
+    a_name = UDICT[ds->last_valid_type].h_atoms[ds->atom_dict_idx];
+    e_name = UDICT[ds->last_valid_type].h_elements[ds->atom_dict_idx];
+  } else if (ds->processing_hydrogens && ds->atom_dict_idx >= ds->hy_start && ds->atom_dict_idx < ds->hy_end) {
+    a_name = UDICT[ds->last_valid_type].hy_atoms[ds->atom_dict_idx];
+    e_name = UDICT[ds->last_valid_type].hy_elements[ds->atom_dict_idx];
+  } else {
+    a_name = " UNK"; e_name = " X";
+  }
+
+  const char* prefix = (ds->last_valid_type < 0x60) ? "ATOM  " : "HETATM";
+
+  if (meta->af_mode) {
+    int len = snprintf(tbuf, 128, "%s%5d %-4s%c%3s%c%c%4d%c   %8.3f%8.3f%8.3f  1.00%6.2f           %2s  ",
+                       prefix, ds->atom_serial++, a_name, altLoc, UDICT[ds->last_valid_type].resName,
+                       ds->c1, ds->c2, ds->current_resSeq, ds->iCode, GET_SIMD_X(ds->accum) / 1000.0f, GET_SIMD_Y(ds->accum) / 1000.0f, GET_SIMD_Z(ds->accum) / 1000.0f, v_b / 100.0f, e_name);
+    if (len > 80) len = 80;
+    memcpy(*w_ptr, tbuf, len); *w_ptr += 81;
+  } else {
+    char chg_str[3] = "  ";
+    if (current_charge > 0) { chg_str[0] = '0' + current_charge; chg_str[1] = '+'; }
+    else if (current_charge < 0) { chg_str[0] = '0' - current_charge; chg_str[1] = '-'; }
+
+    int len = snprintf(tbuf, 128, "%s%5d %-4s%c%3s%c%c%4d%c   %8.3f%8.3f%8.3f%6.2f%6.2f           %2s%2s",
+                       prefix, ds->atom_serial++, a_name, altLoc, UDICT[ds->last_valid_type].resName,
+                       ds->c1, ds->c2, ds->current_resSeq, ds->iCode, GET_SIMD_X(ds->accum) / 1000.0f, GET_SIMD_Y(ds->accum) / 1000.0f, GET_SIMD_Z(ds->accum) / 1000.0f, current_occ / 100.0f, v_b / 100.0f, e_name, chg_str);
+    if (len > 80) len = 80;
+    memcpy(*w_ptr, tbuf, len); *w_ptr += 81;
+  }
+}
+
+static inline void decode_atom_chunk(char** w_ptr, const uint8_t** ptr_ref, uint32_t num_atoms, DecodeState* ds, DecodeMetadata* meta, ResidueDict* UDICT) {
+  const uint8_t* atom_ptr = *ptr_ref;
+  
+  int af_shift = meta->af_mode ? 1 : 3;
+#if defined(__AVX2__) || defined(__SSE4_1__)
+  __m128i v_shift = _mm_cvtsi32_si128(af_shift);
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+  int32x4_t v_shift32 = vdupq_n_s32(-af_shift);
+  int16x4_t v_shift16 = vdup_n_s16(-af_shift);
+#else
+  int v_shift = af_shift;
+#endif
+
+  // A single collapsed loop restores instruction cache efficiency
+  for (uint32_t block_idx = 0; block_idx < num_atoms; block_idx++) {
+    if (ds->atom_serial > 99999) ds->atom_serial = 0;
+    if (ds->atoms_left == 0) update_residue_state(ds, meta, UDICT);
+
+    int alt_flag = 0; int32_t current_occ = 100; int8_t current_charge = 0;
+    if (*(uint64_t*)atom_ptr != 0) {
+#if defined(__aarch64__) || defined(__ARM_NEON)
+      SIMD_DECODE_MACRO(atom_ptr, ds->accum, current_occ, current_charge, alt_flag, v_shift32, v_shift16, meta->af_mode);
+#else
+      SIMD_DECODE_MACRO(atom_ptr, ds->accum, current_occ, current_charge, alt_flag, v_shift, meta->af_mode);
+#endif
+      int32_t v_b = GET_SIMD_B(ds->accum);
+      int anchor_idx = (ds->last_valid_type >= 0x20 && ds->last_valid_type < 0x60) ? 2 : 8;
+      if (ds->last_valid_type < 0x60 && ds->atom_dict_idx == anchor_idx && !ds->processing_hydrogens) {
+        if (ds->active_alt_char == 'A') { ds->anchor_accum = ds->accum; ds->has_anchor = 1; }
+      }
+      write_formatted_atom(w_ptr, ds, meta, UDICT, current_occ, current_charge, alt_flag, v_b);
+    } else {
+      atom_ptr += 8;
+    }
+    if (alt_flag == 0) {
+      ds->atoms_left--; ds->parsed_base_atoms++; ds->atom_dict_idx++; ds->active_alt_char = 'A';
+      if (!ds->processing_hydrogens && ds->atom_dict_idx == ds->h_end) {
+        ds->processing_hydrogens = 1; ds->atom_dict_idx = ds->hy_start;
+      }
+    }
+  }
+  *ptr_ref = atom_ptr;
+}
+
 static void write_coordinates_to_buffer(char** w_ptr, DecodeContext* ctx, DecodeMetadata* meta, ResidueDict* UDICT) {
   size_t offset = meta->payload_start_offset;
-  int atom_serial = 1;
   char tbuf[128];
 
   if (ctx->total_models_minus_1 > 0 || (meta->mask & (1ULL << META_AFDB))) {
@@ -593,206 +846,39 @@ static void write_coordinates_to_buffer(char** w_ptr, DecodeContext* ctx, Decode
     memcpy(*w_ptr, tbuf, len); *w_ptr += 81;
   }
 
-  int has_anchor = 0;
+  DecodeState ds;
+  memset(&ds, 0, sizeof(DecodeState));
+  ds.atom_serial = 1;
+    
+#if defined(__AVX2__) || defined(__SSE4_1__)
+  ds.accum = _mm_setzero_si128();
+  ds.anchor_accum = _mm_setzero_si128();
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+  ds.accum = vdupq_n_s32(0);
+  ds.anchor_accum = vdupq_n_s32(0);
+#else
+  ds.accum.x = 0; ds.accum.y = 0; ds.accum.z = 0; ds.accum.b = 0;
+  ds.anchor_accum.x = 0; ds.anchor_accum.y = 0; ds.anchor_accum.z = 0; ds.anchor_accum.b = 0;
+#endif
+
   while (offset < ctx->size) {
     uint32_t r_a = *(uint32_t*)(ctx->buffer + offset);
     uint32_t num_residues = r_a >> 18;
     uint32_t num_atoms = r_a & 0x3FFFF;
+        
     if (num_residues == 0x3FFE) { offset += 8; continue; }
     if (num_residues == 0x3FFF) { break; }
 
-    uint8_t c1_raw = ctx->buffer[offset + 4];
-    uint8_t c2_raw = ctx->buffer[offset + 5];
-    int16_t seq_raw = *(int16_t*)(ctx->buffer + offset + 6);
-
-    char c1 = c1_raw & 0x7F; if (c1 == 0) c1 = ' ';
-    char c2 = c2_raw & 0x7F; if (c2 == 0) c2 = ' ';
-
-    int is_n_term = (c1_raw & 0x80) != 0;
-    int is_c_term = (c2_raw & 0x80) != 0;
-    int has_ter = seq_raw & 1;
-    int16_t start_resSeq = seq_raw >> 1;
-
-    offset += 8;
-
-    const uint8_t* seq_ptr = ctx->buffer + offset;
-    int seq_bytes = 0; uint32_t expected_atoms = 0;
-    int first_seen = 0;
-
-    for (uint32_t r = 0; r < num_residues; r++) {
-      uint8_t type = seq_ptr[seq_bytes++];
-      if (type == 0x7C) {
-        seq_bytes++;
-      } else if (type != 0x00 && type != 0x7F) {
-        int is_first = (!first_seen) && is_n_term;
-        int is_last  = (r == (uint32_t)(num_residues - 1)) && is_c_term;
-        first_seen = 1;
-
-        expected_atoms += (is_last ? UDICT[type].h_end_cterm : UDICT[type].h_end_norm) - (is_first ? 0 : UDICT[type].h_start_norm);
-        if (meta->has_hydrogens) {
-          expected_atoms += (is_last ? UDICT[type].hy_end_cterm : UDICT[type].hy_end_norm) - (is_first ? 0 : UDICT[type].hy_start_norm);
-        }
-      }
-    }
-    offset += seq_bytes + ((8 - (seq_bytes & 7)) & 7);
+    parse_sequence_header(ctx->buffer, &offset, num_residues, &ds, meta, UDICT);
+        
     const uint8_t* atom_ptr = ctx->buffer + offset;
+    decode_atom_chunk(w_ptr, &atom_ptr, num_atoms, &ds, meta, UDICT);
+    offset = (size_t)(atom_ptr - ctx->buffer);
 
-    int32_t current_resSeq = start_resSeq; int first_res = 1;
-    uint8_t last_valid_type = 0; char iCode = ' ';
-
-    int32_t current_occ = 100;
-    int8_t current_charge = 0;
-    char active_alt_char = 'A';
-    int first_decoded = 0;
-
-    accum_t accum;
-    accum_t anchor_accum;
-    has_anchor = 0;
-#if defined(__AVX2__) || defined(__SSE4_1__)
-    accum = _mm_setzero_si128();
-    anchor_accum = _mm_setzero_si128();
-#elif defined(__aarch64__) || defined(__ARM_NEON)
-    accum = vdupq_n_s32(0);
-    anchor_accum = vdupq_n_s32(0);
-#else
-    accum.x = 0; accum.y = 0; accum.z = 0; accum.b = 0;
-    anchor_accum.x = 0; anchor_accum.y = 0; anchor_accum.z = 0; anchor_accum.b = 0;
-#endif
-
-    int atoms_left = 0;
-    int atom_dict_idx = 0;
-    uint32_t parsed_base_atoms = 0;
-    int s_idx = 0;
-    int no_inc = 0;
-
-    int processing_hydrogens = 0;
-    int h_start = 0, h_end = 0;
-    int hy_start = 0, hy_end = 0;
-
-    int af_shift = meta->af_mode ? 1 : 3;
-
-    for (uint32_t block_idx = 0; block_idx < num_atoms; block_idx++) {
-      if (atom_serial > 99999) atom_serial = 0;
-
-      if (atoms_left == 0) {
-        if (has_anchor) {
-          accum = anchor_accum;
-          has_anchor = 0;
-        }
-        if (parsed_base_atoms < expected_atoms) {
-          uint8_t m_type;
-          iCode = ' ';
-          do {
-            if (s_idx >= seq_bytes) break;
-            m_type = seq_ptr[s_idx++];
-            if (m_type == 0x00) { current_resSeq++; first_res = 0; no_inc = 0;}
-            else if (m_type == 0x7F) { no_inc = 1; }
-            else if (m_type == 0x7C) { iCode = seq_ptr[s_idx++]; }
-          } while (m_type == 0x00 || m_type == 0x7F || m_type == 0x7C);
-          if (s_idx <= seq_bytes) {
-            last_valid_type = m_type & 0xFF;
-            if (!first_res && !no_inc) { current_resSeq++; }
-            first_res = 0; no_inc = 0;
-
-            int is_first = (!first_decoded) && is_n_term;
-            int is_last  = (s_idx == seq_bytes) && is_c_term;
-            first_decoded = 1;
-
-            h_start = is_first ? 0 : UDICT[last_valid_type].h_start_norm;
-            h_end   = is_last  ? UDICT[last_valid_type].h_end_cterm : UDICT[last_valid_type].h_end_norm;
-
-            hy_start = 0; hy_end = 0;
-            if (meta->has_hydrogens) {
-              hy_start = is_first ? 0 : UDICT[last_valid_type].hy_start_norm;
-              hy_end   = is_last  ? UDICT[last_valid_type].hy_end_cterm : UDICT[last_valid_type].hy_end_norm;
-            }
-
-            atoms_left = (h_end - h_start) + (hy_end - hy_start);
-            atom_dict_idx = h_start;
-            processing_hydrogens = 0;
-          } else {
-            atoms_left = 1;
-          }
-        } else {
-          atoms_left = 1;
-        }
-        active_alt_char = 'A';
-      }
-
-      int alt_flag = 0;
-
-      if (*(uint64_t*)atom_ptr != 0) {
-        SIMD_DECODE_MACRO(atom_ptr, accum, current_occ, current_charge, alt_flag, af_shift);
-        int32_t v_b = GET_SIMD_B(accum);
-
-        int anchor_idx = (last_valid_type >= 0x20 && last_valid_type < 0x60) ? 2 : 8;
-        if (last_valid_type < 0x60 && atom_dict_idx == anchor_idx && !processing_hydrogens) {
-          if (active_alt_char == 'A') {
-            anchor_accum = accum;
-            has_anchor = 1;
-          }
-        }
-
-        char altLoc = ' ';
-        if (alt_flag || active_alt_char > 'A') {
-          altLoc = active_alt_char++;
-        }
-
-        const char* a_name;
-        const char* e_name;
-
-        if (!processing_hydrogens && atom_dict_idx >= h_start && atom_dict_idx < h_end) {
-          a_name = UDICT[last_valid_type].h_atoms[atom_dict_idx];
-          e_name = UDICT[last_valid_type].h_elements[atom_dict_idx];
-        } else if (processing_hydrogens && atom_dict_idx >= hy_start && atom_dict_idx < hy_end) {
-          a_name = UDICT[last_valid_type].hy_atoms[atom_dict_idx];
-          e_name = UDICT[last_valid_type].hy_elements[atom_dict_idx];
-        } else {
-          a_name = " UNK";
-          e_name = " X";
-        }
-
-        const char* prefix = (last_valid_type < 0x60) ? "ATOM  " : "HETATM";
-
-        if (meta->af_mode) {
-          int len = snprintf(tbuf, 128, "%s%5d %-4s%c%3s%c%c%4d%c   %8.3f%8.3f%8.3f  1.00%6.2f          %2s  ",
-                             prefix, atom_serial++, a_name, altLoc, UDICT[last_valid_type].resName,
-                             c1, c2, current_resSeq, iCode, GET_SIMD_X(accum) / 1000.0f, GET_SIMD_Y(accum) / 1000.0f, GET_SIMD_Z(accum) / 1000.0f, v_b / 100.0f, e_name);
-          if (len > 80) len = 80;
-          memcpy(*w_ptr, tbuf, len); *w_ptr += 81;
-        } else {
-          char chg_str[3] = "  ";
-          if (current_charge > 0) { chg_str[0] = '0' + current_charge; chg_str[1] = '+'; }
-          else if (current_charge < 0) { chg_str[0] = '0' - current_charge; chg_str[1] = '-'; }
-
-          int len = snprintf(tbuf, 128, "%s%5d %-4s%c%3s%c%c%4d%c   %8.3f%8.3f%8.3f%6.2f%6.2f          %2s%2s",
-                             prefix, atom_serial++, a_name, altLoc, UDICT[last_valid_type].resName,
-                             c1, c2, current_resSeq, iCode, GET_SIMD_X(accum) / 1000.0f, GET_SIMD_Y(accum) / 1000.0f, GET_SIMD_Z(accum) / 1000.0f, current_occ / 100.0f, v_b / 100.0f, e_name, chg_str);
-          if (len > 80) len = 80;
-          memcpy(*w_ptr, tbuf, len); *w_ptr += 81;
-        }
-      } else {
-        atom_ptr += 8;
-      }
-
-      if (alt_flag == 0) {
-        atoms_left--;
-        parsed_base_atoms++;
-        atom_dict_idx++;
-        active_alt_char = 'A';
-
-        if (!processing_hydrogens && atom_dict_idx == h_end) {
-          processing_hydrogens = 1;
-          atom_dict_idx = hy_start;
-        }
-      }
-    }
-
-    if (has_ter) {
-      int len = snprintf(tbuf, 128, "TER   %5d      %3s%c%c%4d%c", atom_serial++, UDICT[last_valid_type].resName, c1, c2, current_resSeq, iCode);
+    if (ds.has_ter) {
+      int len = snprintf(tbuf, 128, "TER   %5d      %3s%c%c%4d%c", ds.atom_serial++, UDICT[ds.last_valid_type].resName, ds.c1, ds.c2, ds.current_resSeq, ds.iCode);
       memcpy(*w_ptr, tbuf, len); *w_ptr += 81;
     }
-    offset = (size_t)(atom_ptr - ctx->buffer);
   }
 
   if (ctx->total_models_minus_1 > 0 || (meta->mask & (1ULL << META_AFDB))) {
@@ -817,47 +903,61 @@ static void write_footer_to_buffer(char** w_ptr, DecodeContext* ctx, DecodeMetad
 }
 
 static void run_benchmark_sink(const uint8_t* buffer, size_t size, size_t offset, int af_mode) {
-    int32_t local_sink = 0;
-    int af_shift = af_mode ? 1 : 3; // 1 for AFDB (15-bit), 3 for standard (13-bit)
-
-    while (offset < size) {
-        uint32_t r_a = *(uint32_t*)(buffer + offset);
-        uint32_t num_residues = r_a >> 18;
-        uint32_t num_atoms = r_a & 0x3FFFF;
-
-        if (num_residues == 0x3FFE) { offset += 8; continue; }
-        if (num_residues == 0x3FFF) { break; }
-
-        offset += 8;
-        const uint8_t* seq_ptr = buffer + offset;
-        int seq_bytes = num_residues;
-        const uint8_t* search_ptr = seq_ptr;
-        const uint8_t* end_ptr = seq_ptr + seq_bytes;
-
-        while (search_ptr < end_ptr) {
-            const uint8_t* found = (const uint8_t*)memchr(search_ptr, 0x7C, end_ptr - search_ptr);
-            if (!found) break;
-            seq_bytes++; end_ptr++;
-            search_ptr = found + 2;
-        }
-
-        offset += seq_bytes + ((8 - (seq_bytes & 7)) & 7);
-        const uint8_t* atom_ptr = buffer + offset;
-
-        accum_t accum;
+  int32_t local_sink = 0;
+  int af_shift = af_mode ? 1 : 3;
 #if defined(__AVX2__) || defined(__SSE4_1__)
-        accum = _mm_setzero_si128();
+  __m128i v_shift = _mm_cvtsi32_si128(af_shift);
 #elif defined(__aarch64__) || defined(__ARM_NEON)
-        accum = vdupq_n_s32(0);
+  int32x4_t v_shift32 = vdupq_n_s32(-af_shift);
+  int16x4_t v_shift16 = vdup_n_s16(-af_shift);
 #else
-        accum.x = 0; accum.y = 0; accum.z = 0; accum.b = 0;
+  int v_shift = af_shift;
 #endif
-        for (uint32_t a = 0; a < num_atoms; a++) {
-            SIMD_DECODE_PHASE1(atom_ptr, accum, af_shift);
-        }
-        local_sink += GET_SIMD_X(accum); offset = (size_t)(atom_ptr - buffer);
+
+  while (offset < size) {
+    uint32_t r_a = *(uint32_t*)(buffer + offset);
+    uint32_t num_residues = r_a >> 18;
+    uint32_t num_atoms = r_a & 0x3FFFF;
+
+    if (num_residues == 0x3FFE) { offset += 8; continue; }
+    if (num_residues == 0x3FFF) { break; }
+
+    offset += 8;
+    const uint8_t* seq_ptr = buffer + offset;
+    int seq_bytes = num_residues;
+    const uint8_t* search_ptr = seq_ptr;
+    const uint8_t* end_ptr = seq_ptr + seq_bytes;
+
+    while (search_ptr < end_ptr) {
+      const uint8_t* found = (const uint8_t*)memchr(search_ptr, 0x7C, end_ptr - search_ptr);
+      if (!found) break;
+      seq_bytes++; end_ptr++;
+      search_ptr = found + 2;
     }
-    benchmark_sink += local_sink;
+
+    offset += seq_bytes + ((8 - (seq_bytes & 7)) & 7);
+    const uint8_t* atom_ptr = buffer + offset;
+
+    accum_t accum;
+#if defined(__AVX2__) || defined(__SSE4_1__)
+    accum = _mm_setzero_si128();
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+    accum = vdupq_n_s32(0);
+#else
+    accum.x = 0; accum.y = 0; accum.z = 0; accum.b = 0;
+#endif
+
+    // A single collapsed loop
+    for (uint32_t a = 0; a < num_atoms; a++) {
+#if defined(__aarch64__) || defined(__ARM_NEON)
+      SIMD_DECODE_PHASE1(atom_ptr, accum, v_shift32, v_shift16);
+#else
+      SIMD_DECODE_PHASE1(atom_ptr, accum, v_shift);
+#endif
+    }
+    local_sink += GET_SIMD_X(accum); offset = (size_t)(atom_ptr - buffer);
+  }
+  benchmark_sink += local_sink;
 }
 
 void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_model, int is_last_model) {

@@ -1,6 +1,8 @@
 # Binary PDB (bPDB) Format Specification (V0)
 
-The bPDB V0 architecture utilizes a Data-Oriented (SoA), completely unmasked coordinate atom stream. It achieves extreme compression and zero-shift SIMD parsing speeds by employing native 13-bit integer deltas and completely symmetric 16-byte absolute Anchor blocks. The geometric running sum is perfectly unbroken across the entire chain. Models are isolated into independent files to support concurrent streaming.
+The bPDB V0 architecture utilizes a Data-Oriented (SoA), completely unmasked coordinate atom stream. It achieves extreme compression and dynamic, branchless SIMD parsing speeds by employing native **13-bit** integer deltas for standard files (or **15-bit** for AlphaFold DB files) and completely symmetric 16-byte absolute Anchor blocks. 
+
+The format eliminates floating-point and string-matching bottlenecks entirely, relying on 1-cycle 32-bit integer lookups and dynamic vector shifts (`_mm_sra_epi16`, `vshl_s16`) for blistering fast deserialization directly into RAM. The geometric running sum is perfectly unbroken across the entire chain. Models are isolated into independent files to support concurrent streaming.
 
 Every structure and section in the format is strictly **8-byte aligned**.
 
@@ -34,9 +36,9 @@ Immediately following the 64-byte fixed header is a single 8-byte (`uint64_t`) m
 
 The decoder reads this mask to determine exactly which metadata payloads follow. Payloads are written in bit-sequential order, heavily padded to 8-byte boundaries:
 
-*   **Bit 0 (`META_AF_MODE`):** If `1`, indicates an AlphaFold/Predicted model (via `--af`). Occupancy is statically assumed to be `1.00` and Charge `0`.
+*   **Bit 0 (`META_AF_MODE`):** If `1`, indicates an AlphaFold/Predicted model (via `--af`). Occupancy is statically assumed to be `1.00` and Charge `0`. Atom block deltas expand to 15-bit precision, completely dropping inline metadata.
 *   **Bit 1 (`RESOLUTION`):** `float` (4 bytes) + `0x00` pad (4 bytes).
-*   **Bit 2 (`TITLE`):** `uint64_t` length + payload string + 8-byte alignment padding.
+*   **Bit 2 (`TITLE`):** `uint64_t` length + payload string + 8-byte alignment padding. Uses 8-byte padded string representations optimized for direct RAM deserialization.
 *   **Bit 3 (`EXPDTA`):** `uint64_t` length + payload string + 8-byte alignment padding.
 *   **Bit 4 (`PROGRAM`):** `uint64_t` length + payload string + 8-byte alignment padding.
 *   **Bit 5 (`HET_DICT`):** `uint64_t` dict_length + `uint8_t` custom_count + inline dictionary definitions + padding.
@@ -44,7 +46,7 @@ The decoder reads this mask to determine exactly which metadata payloads follow.
 *   **Bit 11 (`HYDROGENS`):** If `1`, indicates the coordinate stream natively interleaves explicit hydrogen atoms.
 *   **Bit 12 (`COMPND`):** TLV-encoded COMPND blocks. EC numbers are aggressively packed into a single 32-bit integer.
 *   **Bit 13 (`SOURCE`):** TLV-encoded SOURCE blocks. Integrates zero-copy NCBI taxonomy IDs to dynamically reconstruct scientific/common names on decode.
-*   **Bit 14 (`DBREF`):** Binary array for Database References.
+*   **Bit 14 (`DBREF`):** Binary array for Database References. Natively handles standard wwPDB boundaries as well as AlphaFold DB's extended 10-character UNP accessions.
 *   **Bit 15 (`AFDB`):** If `1`, indicates an official AlphaFold Database file (via `--afdb`). Safely drops DeepMind `REMARK 1` copyright disclaimers and `CRYST1` tags during encoding, seamlessly injecting them at decode to save massive space.
 *   **Bit 16 (`SEQRES`):** Contains the exact sequence chain blocks. Suppressed completely for `--afdb` files, which natively reconstruct their `SEQRES` dynamically from the underlying coordinate tracks to eliminate redundancy.
 
@@ -72,13 +74,14 @@ A 1-dimensional array of `uint8_t` immediately following the Chain Header.
 
 *(The Sequence Track is padded with `0x00` to the nearest 8-byte boundary).*
 
-## 4. Coordinate Atom Track (Zero-Shift SIMD Array)
+## 4. Coordinate Atom Track (Dynamic SIMD Array)
 
-Math operations execute natively on perfectly aligned blocks. Properties like Occupancy, Charge, and Alternate Locations are evaluated natively within the 8-byte atom lanes, dropping state-tracking requirements.
+Math operations execute natively on perfectly aligned blocks using dynamic bit-shifts passed directly into the SIMD macros, preventing instruction cache misses and branch prediction failures.
 
 ### 4.1 Unbroken Difference Accumulation (`Control == 0`)
-A standard 8-byte block handles native intra-chain coordinate deltas up to **± 4.095 Å** (scaled by 1000). The accumulator is a pure unbroken running sum, ignoring residue boundaries entirely.
+A standard 8-byte block handles native intra-chain coordinate deltas. The accumulator is a pure unbroken running sum, ignoring residue boundaries entirely. The bit layout shifts depending on whether the file is a standard wwPDB or an AlphaFold model.
 
+**Standard Mode (13-bit precision, max jump ± 4.095 Å):**
 | Bytes | Type     | Description                                                                                                    |
 |:------|:---------|:---------------------------------------------------------------------------------------------------------------|
 | `0-1` | `uint16` | Bits 3-15: $\Delta B$ (13-bit). Bit 2: Occupancy bit 6. Bit 1: AltLoc Presence Flag. **Bit 0: Control (`0`)**. |
@@ -86,10 +89,16 @@ A standard 8-byte block handles native intra-chain coordinate deltas up to **± 
 | `4-5` | `uint16` | Bits 3-15: $\Delta Y$ (13-bit). Bits 0-2: Occupancy bits 0-2.                                                  |
 | `6-7` | `uint16` | Bits 3-15: $\Delta Z$ (13-bit). Bits 0-2: Charge (3-bit unsigned, evaluate as `val - 3`).                      |
 
-### 4.2 Absolute New Anchors (`Control == 1`)
-If a spatial jump exceeds ± 4.095 Å (chain gaps, isolated HETATMs, waters), the stream emits a 16-byte absolute New Anchor. The Anchor is **100% symmetric** with the standard atom block lane order (B, X, Y, Z), forming a precise 28-bit coordinate space.
+**AFDB Mode (15-bit precision, max jump ± 16.383 Å):**
+| Bytes | Type     | Description                                                                                                    |
+|:------|:---------|:---------------------------------------------------------------------------------------------------------------|
+| `0-1` | `uint16` | Bits 1-15: $\Delta B$ (15-bit). **Bit 0: Control (`0`)**.                                                      |
+| `2-3` | `uint16` | Bits 1-15: $\Delta X$ (15-bit). **Bit 0: Reserved (`0`)**.                                                     |
+| `4-5` | `uint16` | Bits 1-15: $\Delta Y$ (15-bit). **Bit 0: Reserved (`0`)**.                                                     |
+| `6-7` | `uint16` | Bits 1-15: $\Delta Z$ (15-bit). **Bit 0: Reserved (`0`)**.                                                     |
 
-All explicit metadata (Occupancy, Charge, AltLoc) is offloaded entirely to the remaining 12 bits of the LSB block.
+### 4.2 Absolute New Anchors (`Control == 1`)
+If a spatial jump exceeds the native delta bounds (chain gaps, isolated HETATMs, waters), the stream emits a 16-byte absolute New Anchor. The Anchor is **100% symmetric** with the standard atom block lane order (B, X, Y, Z), forming a precise 28-bit coordinate space (or 30-bit for AFDB mode).
 
 **1. The MSB Block (Bytes 0-7, `Control == 1`)**
 Contains the 15-bit Most Significant Bits of the absolute values.
@@ -99,7 +108,7 @@ Contains the 15-bit Most Significant Bits of the absolute values.
 *   `+6-7`: 15-bit Absolute Z MSB `<< 1` | `0`.
 
 **2. The LSB Block (Bytes 8-15, `Control == 0`)**
-Immediately follows the MSB block and exactly mimics the standard $\Delta$ block layout, carrying the 13-bit LSBs alongside the native metadata (Occupancy and Charge).
+Immediately follows the MSB block and exactly mimics the standard $\Delta$ block layout. For standard models, it carries the 13-bit LSBs alongside the native metadata (Occupancy and Charge). For AFDB models, it carries the full 15-bit LSBs.
 
 ### 4.3 Implicit Alternate Location Engine
 Explicit alternate location characters (`0x7F DUP` flags) are completely removed from the format. The decoder relies strictly on topological grouping natively stored in the stream. The `AltLoc Presence Flag` temporarily pauses the decoder's sequence dictionary iterator while natively driving an implicit alphabetical state machine (`A -> B -> C`) for infinite overlapping conformers without overhead.

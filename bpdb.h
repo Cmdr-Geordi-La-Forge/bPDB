@@ -5,23 +5,36 @@
 #include <stdio.h>
 
 // --- Metadata Bitmask Indices ---
+// Engine & Format Flags (Bits 0-15 reserved for bPDB core)
 #define META_AF_MODE    0
-#define META_RESOLUTION 1
-#define META_TITLE      2
-#define META_EXPDTA     3
-#define META_PROGRAM    4
-#define META_HET_DICT   5
-#define META_HELIX      6
-#define META_SHEET      7
-#define META_SSBOND     8
-#define META_CISPEP     9
-#define META_SITE       10
-#define META_HYDROGENS  11
-#define META_COMPND     12
-#define META_SOURCE     13
-#define META_DBREF      14
-#define META_AFDB       15
-#define META_SEQRES     16
+#define META_AFDB       1
+#define META_HYDROGENS  2
+
+// Section 2: Title Section (Bits 16-31)
+#define META_TITLE      16
+#define META_COMPND     17
+#define META_SOURCE     18
+#define META_EXPDTA     19
+#define META_RESOLUTION 20
+#define META_PROGRAM    21
+
+// Section 3: Primary Structure Section (Bits 32-35)
+#define META_DBREF      32
+#define META_SEQRES     33
+
+// Section 4: Heterogen Section (Bits 36-39)
+#define META_HET_DICT   36
+
+// Section 5: Secondary Structure Section (Bits 40-43)
+#define META_HELIX      40
+#define META_SHEET      41
+
+// Section 6: Connectivity Annotation Section (Bits 44-47)
+#define META_SSBOND     44
+#define META_CISPEP     45
+
+// Section 7: Miscellaneous Features Section (Bits 48-51)
+#define META_SITE       48
 
 // --- Metadata Enums ---
 enum CompndToken { 

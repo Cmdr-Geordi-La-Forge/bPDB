@@ -56,11 +56,21 @@ void stat_bpdb(const char* filepath) {
   }
 
   size_t dict_scan_off = offset;
-  if (mask & (1ULL << 1)) dict_scan_off += 8;
-  if (mask & (1ULL << 2)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
-  if (mask & (1ULL << 3)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
-  if (mask & (1ULL << 4)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
-  if (mask & (1ULL << 5)) {
+
+  // Section 2: Title Section (16-21)
+  if (mask & (1ULL << META_TITLE)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+  if (mask & (1ULL << META_COMPND)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+  if (mask & (1ULL << META_SOURCE)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+  if (mask & (1ULL << META_EXPDTA)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+  if (mask & (1ULL << META_RESOLUTION)) { dict_scan_off += 8; }
+  if (mask & (1ULL << META_PROGRAM)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+
+  // Section 3: Primary Structure Section (32-33)
+  if (mask & (1ULL << META_DBREF)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+  if (mask & (1ULL << META_SEQRES)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+
+  // Section 4: Heterogen Section (36)
+  if (mask & (1ULL << META_HET_DICT)) {
     uint64_t dict_len = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8;
     const uint8_t* p_het_dict = buffer + dict_scan_off;
     uint8_t custom_count = p_het_dict[0];
@@ -73,11 +83,17 @@ void stat_bpdb(const char* filepath) {
     }
     dict_scan_off += dict_len + ((8 - (dict_len % 8)) % 8);
   }
-  if (mask & (1ULL << 6)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
-  if (mask & (1ULL << 7)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
-  if (mask & (1ULL << 8)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
-  if (mask & (1ULL << 9)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
-  if (mask & (1ULL << 10)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+
+  // Section 5: Secondary Structure Section (40-41)
+  if (mask & (1ULL << META_HELIX)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+  if (mask & (1ULL << META_SHEET)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+
+  // Section 6: Connectivity Annotation Section (44-45)
+  if (mask & (1ULL << META_SSBOND)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+  if (mask & (1ULL << META_CISPEP)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
+
+  // Section 7: Miscellaneous Features Section (48)
+  if (mask & (1ULL << META_SITE)) { uint64_t L = *(uint64_t*)(buffer + dict_scan_off); dict_scan_off += 8 + L + ((8 - (L % 8)) % 8); }
 
   printf("Metadata Block (TLV) : %zu bytes (Sections: %d)\n", dict_scan_off - offset + 8, num_meta);
   offset = dict_scan_off;

@@ -369,21 +369,28 @@ static void init_decode_context(DecodeContext* ctx, const uint8_t* buffer, size_
 static DecodeMetadata parse_metadata_headers(const uint8_t* buffer, ResidueDict* UDICT) {
   DecodeMetadata meta; memset(&meta, 0, sizeof(meta));
   size_t offset = 64;
-  uint64_t meta_header = *(uint64_t*)(buffer + offset); offset += 8;
     
-  meta.mask = meta_header >> 16;
+  meta.mask = *(uint64_t*)(buffer + offset); offset += 8; // No shift
   meta.af_mode = (meta.mask & (1ULL << META_AF_MODE)) ? 1 : 0;
   meta.has_hydrogens = (meta.mask & (1ULL << META_HYDROGENS)) ? 1 : 0;
   meta.program = "";
 
-  if (meta.mask & (1ULL << META_RESOLUTION)) { meta.resolution = *(float*)(buffer + offset); offset += 8; }
+  // Section 2: Title Section (16-21)
   if (meta.mask & (1ULL << META_TITLE)) { meta.title_len = *(uint64_t*)(buffer + offset); offset += 8; meta.title = (const char*)(buffer + offset); offset += meta.title_len; offset += (8 - (meta.title_len % 8)) % 8; }
+  if (meta.mask & (1ULL << META_COMPND)) { meta.compnd_len = *(uint64_t*)(buffer + offset); offset += 8; meta.compnd = buffer + offset; offset += meta.compnd_len; offset += (8 - (meta.compnd_len % 8)) % 8; }
+  if (meta.mask & (1ULL << META_SOURCE)) { meta.source_len = *(uint64_t*)(buffer + offset); offset += 8; meta.source = buffer + offset; offset += meta.source_len; offset += (8 - (meta.source_len % 8)) % 8; }
   if (meta.mask & (1ULL << META_EXPDTA)) { meta.expdta_len = *(uint64_t*)(buffer + offset); offset += 8; meta.expdta = (const char*)(buffer + offset); offset += meta.expdta_len; offset += (8 - (meta.expdta_len % 8)) % 8; }
+  if (meta.mask & (1ULL << META_RESOLUTION)) { meta.resolution = *(float*)(buffer + offset); offset += 8; }
   if (meta.mask & (1ULL << META_PROGRAM)) { uint64_t p_len = *(uint64_t*)(buffer + offset); offset += 8; meta.program = (const char*)(buffer + offset); offset += p_len; offset += (8 - (p_len % 8)) % 8; }
-    
+
+  // Section 3: Primary Structure Section (32-33)
+  if (meta.mask & (1ULL << META_DBREF)) { uint64_t L = *(uint64_t*)(buffer + offset); offset += 8; meta.dbrefs = buffer + offset; meta.num_dbrefs = L / sizeof(MetaDBRef); offset += L; offset += (8 - (L % 8)) % 8; }
+  if (meta.mask & (1ULL << META_SEQRES)) { meta.seqres_len = *(uint64_t*)(buffer + offset); offset += 8; meta.seqres = buffer + offset; offset += meta.seqres_len; offset += (8 - (meta.seqres_len % 8)) % 8; }
+
+  // Section 4: Heterogen Section (36)
   if (meta.mask & (1ULL << META_HET_DICT)) {
     uint64_t dict_len = *(uint64_t*)(buffer + offset); offset += 8;
-    if (UDICT) { // Guard the memory writes
+    if (UDICT) { 
       const uint8_t* p_het = buffer + offset; uint8_t count = p_het[0]; size_t ptr = 1;
       for (int c = 0; c < count; c++) {
         int u = 0x81 + c; memcpy(UDICT[u].resName, p_het + ptr, 3); UDICT[u].resName[3] = '\0'; ptr += 4;
@@ -396,16 +403,17 @@ static DecodeMetadata parse_metadata_headers(const uint8_t* buffer, ResidueDict*
     }
     offset += dict_len; offset += (8 - (dict_len % 8)) % 8;
   }
-    
+
+  // Section 5: Secondary Structure Section (40-41)
   if (meta.mask & (1ULL << META_HELIX)) { uint64_t L = *(uint64_t*)(buffer + offset); offset += 8; meta.helices = buffer + offset; meta.num_helices = L / sizeof(MetaHelix); offset += L; offset += (8 - (L % 8)) % 8; }
   if (meta.mask & (1ULL << META_SHEET)) { uint64_t L = *(uint64_t*)(buffer + offset); offset += 8; meta.sheets = buffer + offset; meta.num_sheets = L / sizeof(MetaSheet); offset += L; offset += (8 - (L % 8)) % 8; }
+
+  // Section 6: Connectivity Annotation Section (44-45)
   if (meta.mask & (1ULL << META_SSBOND)) { uint64_t L = *(uint64_t*)(buffer + offset); offset += 8; meta.ssbonds = buffer + offset; meta.num_ssbonds = L / sizeof(MetaSSBond); offset += L; offset += (8 - (L % 8)) % 8; }
   if (meta.mask & (1ULL << META_CISPEP)) { uint64_t L = *(uint64_t*)(buffer + offset); offset += 8; meta.cispeps = buffer + offset; meta.num_cispeps = L / sizeof(MetaCispep); offset += L; offset += (8 - (L % 8)) % 8; }
+
+  // Section 7: Miscellaneous Features Section (48)
   if (meta.mask & (1ULL << META_SITE)) { uint64_t L = *(uint64_t*)(buffer + offset); offset += 8; meta.sites = buffer + offset; meta.len_sites = L; offset += L; offset += (8 - (L % 8)) % 8; }
-  if (meta.mask & (1ULL << META_COMPND)) { meta.compnd_len = *(uint64_t*)(buffer + offset); offset += 8; meta.compnd = buffer + offset; offset += meta.compnd_len; offset += (8 - (meta.compnd_len % 8)) % 8; }
-  if (meta.mask & (1ULL << META_SOURCE)) { meta.source_len = *(uint64_t*)(buffer + offset); offset += 8; meta.source = buffer + offset; offset += meta.source_len; offset += (8 - (meta.source_len % 8)) % 8; }
-  if (meta.mask & (1ULL << META_DBREF)) { uint64_t L = *(uint64_t*)(buffer + offset); offset += 8; meta.dbrefs = buffer + offset; meta.num_dbrefs = L / sizeof(MetaDBRef); offset += L; offset += (8 - (L % 8)) % 8; }
-  if (meta.mask & (1ULL << META_SEQRES)) { meta.seqres_len = *(uint64_t*)(buffer + offset); offset += 8; meta.seqres = buffer + offset; offset += meta.seqres_len; offset += (8 - (meta.seqres_len % 8)) % 8; }
 
   meta.payload_start_offset = offset;
   return meta;
@@ -775,22 +783,21 @@ static inline void write_formatted_atom(char** w_ptr, DecodeState* ds, DecodeMet
   const char* prefix = (ds->last_valid_type < 0x60) ? "ATOM  " : "HETATM";
 
   if (meta->af_mode) {
-    int len = snprintf(tbuf, 128, "%s%5d %-4s%c%3s%c%c%4d%c   %8.3f%8.3f%8.3f  1.00%6.2f           %2s  ",
-                       prefix, ds->atom_serial++, a_name, altLoc, UDICT[ds->last_valid_type].resName,
-                       ds->c1, ds->c2, ds->current_resSeq, ds->iCode, GET_SIMD_X(ds->accum) / 1000.0f, GET_SIMD_Y(ds->accum) / 1000.0f, GET_SIMD_Z(ds->accum) / 1000.0f, v_b / 100.0f, e_name);
-    if (len > 80) len = 80;
-    memcpy(*w_ptr, tbuf, len); *w_ptr += 81;
-  } else {
-    char chg_str[3] = "  ";
-    if (current_charge > 0) { chg_str[0] = '0' + current_charge; chg_str[1] = '+'; }
-    else if (current_charge < 0) { chg_str[0] = '0' - current_charge; chg_str[1] = '-'; }
-
-    int len = snprintf(tbuf, 128, "%s%5d %-4s%c%3s%c%c%4d%c   %8.3f%8.3f%8.3f%6.2f%6.2f           %2s%2s",
-                       prefix, ds->atom_serial++, a_name, altLoc, UDICT[ds->last_valid_type].resName,
-                       ds->c1, ds->c2, ds->current_resSeq, ds->iCode, GET_SIMD_X(ds->accum) / 1000.0f, GET_SIMD_Y(ds->accum) / 1000.0f, GET_SIMD_Z(ds->accum) / 1000.0f, current_occ / 100.0f, v_b / 100.0f, e_name, chg_str);
-    if (len > 80) len = 80;
-    memcpy(*w_ptr, tbuf, len); *w_ptr += 81;
-  }
+        int len = snprintf(tbuf, 128, "%s%5d %-4s%c%3s%c%c%4d%c   %8.3f%8.3f%8.3f  1.00%6.2f          %2s  ",
+                           prefix, ds->atom_serial++, a_name, altLoc, UDICT[ds->last_valid_type].resName,
+                           ds->c1, ds->c2, ds->current_resSeq, ds->iCode, GET_SIMD_X(ds->accum) / 1000.0f, GET_SIMD_Y(ds->accum) / 1000.0f, GET_SIMD_Z(ds->accum) / 1000.0f, v_b / 100.0f, e_name);
+        if (len > 80) len = 80;
+        memcpy(*w_ptr, tbuf, len); *w_ptr += 81;
+    } else {
+        char chg_str[3] = "  ";
+        if (current_charge > 0) { chg_str[0] = '0' + current_charge; chg_str[1] = '+'; }
+        else if (current_charge < 0) { chg_str[0] = '0' - current_charge; chg_str[1] = '-'; }
+        int len = snprintf(tbuf, 128, "%s%5d %-4s%c%3s%c%c%4d%c   %8.3f%8.3f%8.3f%6.2f%6.2f          %2s%2s",
+                           prefix, ds->atom_serial++, a_name, altLoc, UDICT[ds->last_valid_type].resName,
+                           ds->c1, ds->c2, ds->current_resSeq, ds->iCode, GET_SIMD_X(ds->accum) / 1000.0f, GET_SIMD_Y(ds->accum) / 1000.0f, GET_SIMD_Z(ds->accum) / 1000.0f, current_occ / 100.0f, v_b / 100.0f, e_name, chg_str);
+        if (len > 80) len = 80;
+        memcpy(*w_ptr, tbuf, len); *w_ptr += 81;
+    }
 }
 
 static inline void decode_atom_chunk(char** w_ptr, const uint8_t** ptr_ref, uint32_t num_atoms, DecodeState* ds, DecodeMetadata* meta, ResidueDict* UDICT) {

@@ -67,6 +67,7 @@ typedef struct {
 typedef struct {
   uint8_t type_id;
   char resName[4];
+  char one_letter;
   
   // Heavy Atom Topology
   uint8_t h_start_norm;

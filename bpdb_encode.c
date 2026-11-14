@@ -20,11 +20,11 @@ static const char* SOURCE_KEYS[] = {"", "MOL_ID", "SYNTHETIC", "FRAGMENT", "ORGA
 
 // --- StreamBuffer: Reusable 64KB dynamic buffers ---
 void stream_init(StreamBuffer* buf) {
-  buf->cap = 65536; 
+  buf->cap = 65536;
   buf->data = (uint8_t*)malloc(buf->cap);
   buf->len = 0;
 }
-void stream_reset(StreamBuffer* buf) { buf->len = 0; } 
+void stream_reset(StreamBuffer* buf) { buf->len = 0; }
 void stream_write(StreamBuffer* buf, const void* src, size_t size) {
   if (buf->len + size > buf->cap) {
     buf->cap = (buf->cap == 0) ? 65536 : (buf->cap * 2);
@@ -231,10 +231,10 @@ static inline void split_msb_lsb(int32_t val, int16_t* msb, int16_t* lsb) {
 static inline void encode_alt_array(ChainBuilder* cb, AltArray* arr, int force_jump, int af_mode) {
   for (int a = 0; a < arr->count; a++) {
     int32_t x = arr->x[a], y = arr->y[a], z = arr->z[a], b_int = arr->b[a];
-    
+
     if (b_int > 4194303) b_int = 4194303;
     if (b_int < 0) b_int = 0;
-    
+
     if (cb->num_atoms == 0) { cb->current_x = x; cb->current_y = y; cb->current_z = z; cb->current_b = b_int; }
     int32_t dx = x - cb->current_x, dy = y - cb->current_y, dz = z - cb->current_z, db = b_int - cb->current_b;
     int alt_flag = (a < arr->count - 1) ? 1 : 0;
@@ -282,19 +282,45 @@ void flush_residue(ChainBuilder* cb, EncoderState* st, ResidueDict* UDICT, int i
 
   if (cb->num_residues > 0) {
     int diff = st->resSeq - cb->last_resSeq;
-    if (diff == 0) { cb->seq_track[cb->seq_bytes++] = 0x7F; cb->num_residues++; }
-    else if (diff > 1 && diff <= 100) { for (int g = 1; g < diff; g++) { cb->seq_track[cb->seq_bytes++] = 0x00; cb->num_residues++; } }
+
+    // Normal residues implicitly increment resSeq. Residues with iCodes do not.
+    // Calculate the number of explicit 0x00 gaps needed to align the decoder.
+    int auto_inc = (st->iCode == ' ' || st->iCode == 0) ? 1 : 0;
+    int gaps = diff - auto_inc;
+
+    for (int g = 0; g < gaps; g++) {
+      cb->seq_track[cb->seq_bytes++] = 0x00;
+      cb->num_residues++;
+    }
   }
 
-  if (st->iCode != ' ' && st->iCode != 0) { cb->seq_track[cb->seq_bytes++] = 0x7C; cb->seq_track[cb->seq_bytes++] = st->iCode; cb->num_residues++; }
-  cb->seq_track[cb->seq_bytes++] = st->type; cb->last_type = st->type; cb->num_residues++;
-  
+  // Set bit 0x40. For valid standard AA types (1-26), this cleanly shifts the byte into ASCII ('A'-'Z').
+  uint8_t enc_type = st->type | 0x40;
+
+  if (st->iCode != ' ' && st->iCode != 0) {
+    enc_type &= ~0x40; // Clear the bit flag to denote the following iCode byte
+    cb->seq_track[cb->seq_bytes++] = enc_type;
+    cb->seq_track[cb->seq_bytes++] = st->iCode;
+    cb->num_residues += 2;
+  } else {
+    cb->seq_track[cb->seq_bytes++] = enc_type;
+    cb->num_residues++;
+  }
+
+  cb->last_type = st->type;
+
+  // Since AAs are 1-26 and NAs are 0x21-0x2C, this 0x60 cutoff for Heterogens is preserved perfectly.
   int is_hetatm = (st->type >= 0x60);
   int h_start = is_first ? 0 : UDICT[st->type].h_start_norm;
   int h_end   = is_last  ? UDICT[st->type].h_end_cterm : UDICT[st->type].h_end_norm;
 
   for (int i = h_start; i < h_end; i++) {
-    if (!st->h_present[i] || st->h_atoms[i].count == 0) { memset(&cb->atom_track[cb->atom_bytes], 0, 8); cb->atom_bytes += 8; cb->num_atoms++; continue; }
+    if (!st->h_present[i] || st->h_atoms[i].count == 0) {
+      memset(&cb->atom_track[cb->atom_bytes], 0, 8);
+      cb->atom_bytes += 8;
+      cb->num_atoms++;
+      continue;
+    }
     encode_alt_array(cb, &st->h_atoms[i], (is_hetatm && i == h_start), af_mode);
   }
 
@@ -302,19 +328,28 @@ void flush_residue(ChainBuilder* cb, EncoderState* st, ResidueDict* UDICT, int i
     int hy_start = is_first ? 0 : UDICT[st->type].hy_start_norm;
     int hy_end   = is_last  ? UDICT[st->type].hy_end_cterm : UDICT[st->type].hy_end_norm;
     for (int i = hy_start; i < hy_end; i++) {
-      if (!st->hy_present[i] || st->hy_atoms[i].count == 0) { memset(&cb->atom_track[cb->atom_bytes], 0, 8); cb->atom_bytes += 8; cb->num_atoms++; continue; }
+      if (!st->hy_present[i] || st->hy_atoms[i].count == 0) {
+        memset(&cb->atom_track[cb->atom_bytes], 0, 8);
+        cb->atom_bytes += 8;
+        cb->num_atoms++;
+        continue;
+      }
       encode_alt_array(cb, &st->hy_atoms[i], 0, af_mode);
     }
   }
 
   if (!is_hetatm) {
-    int anchor_idx = (st->type >= 0x20 && st->type < 0x60) ? 2 : 8;
+    int anchor_idx = (st->type < 0x20) ? 2 : 8;
     if (anchor_idx >= h_start && anchor_idx < h_end && st->h_present[anchor_idx]) {
-      cb->current_x = st->h_atoms[anchor_idx].x[0]; cb->current_y = st->h_atoms[anchor_idx].y[0];
-      cb->current_z = st->h_atoms[anchor_idx].z[0]; cb->current_b = st->h_atoms[anchor_idx].b[0];
+      cb->current_x = st->h_atoms[anchor_idx].x[0];
+      cb->current_y = st->h_atoms[anchor_idx].y[0];
+      cb->current_z = st->h_atoms[anchor_idx].z[0];
+      cb->current_b = st->h_atoms[anchor_idx].b[0];
     }
   }
-  cb->last_resSeq = st->resSeq; cb->last_iCode = st->iCode;
+
+  cb->last_resSeq = st->resSeq;
+  cb->last_iCode = st->iCode;
 }
 
 // --- Pre-allocated Global Encoder Context ---
@@ -388,8 +423,8 @@ static void init_gctx() {
   }
   stream_init(&gctx.m.seqres_buf); stream_init(&gctx.m.ssbonds); stream_init(&gctx.m.cispeps);
   stream_init(&gctx.m.helices); stream_init(&gctx.m.sheets); stream_init(&gctx.m.sites);
-  stream_init(&gctx.m.conects); stream_init(&gctx.m.dbrefs); 
-  
+  stream_init(&gctx.m.conects); stream_init(&gctx.m.dbrefs);
+
   stream_init(&gctx.meta_buffer);
   stream_init(&gctx.cctx.coords);
   cb_init(&gctx.cctx.cb);
@@ -399,20 +434,20 @@ static void init_gctx() {
 static void reset_gctx_for_file() {
   stream_reset(&gctx.m.seqres_buf); stream_reset(&gctx.m.ssbonds); stream_reset(&gctx.m.cispeps);
   stream_reset(&gctx.m.helices); stream_reset(&gctx.m.sheets); stream_reset(&gctx.m.sites);
-  stream_reset(&gctx.m.conects); stream_reset(&gctx.m.dbrefs); 
-  
+  stream_reset(&gctx.m.conects); stream_reset(&gctx.m.dbrefs);
+
   stream_reset(&gctx.meta_buffer);
   stream_reset(&gctx.cctx.coords);
   cb_reset(&gctx.cctx.cb);
-  
+
   memset(&gctx.m, 0, sizeof(EncodeMetadata));
   gctx.m.day = 1; gctx.m.month = 1; gctx.m.year = 1973;
   gctx.m.custom_het_idx = 0x81; gctx.m.resolution = -1.0f;
-  
+
   gctx.cctx.current_model_idx = 0;
   gctx.cctx.total_models_minus_1 = 0;
   gctx.cctx.current_c1 = 0; gctx.cctx.current_c2 = 0;
-  
+
   gctx.cctx.st.type = -1;
   memset(gctx.cctx.st.h_present, 0, sizeof(gctx.cctx.st.h_present));
   memset(gctx.cctx.st.hy_present, 0, sizeof(gctx.cctx.st.hy_present));
@@ -469,7 +504,7 @@ static uint64_t build_binary_headers(EncodeMetadata* m, StreamBuffer* meta_buffe
   int has_title = (title_len > 0), has_het = (m->custom_het_idx > 0x81), has_expdta = (expdta_len > 0);
   int has_res = (m->resolution > 0.0f), has_prog = (strlen(m->program) > 0);
 
-  uint64_t meta_mask = format_flags; 
+  uint64_t meta_mask = format_flags;
   uint64_t zero = 0;
   int afdb_mode = (format_flags & (1 << META_AFDB)) != 0;
 
@@ -525,7 +560,7 @@ static uint64_t build_binary_headers(EncodeMetadata* m, StreamBuffer* meta_buffe
 
   // Section 7: Miscellaneous Features Section (48)
   if (meta_mask & (1ULL << META_SITE))   { uint64_t L = m->sites.len;      stream_write(meta_buffer, &L, 8); stream_write(meta_buffer, m->sites.data, L);      size_t pad = (8 - (L % 8)) % 8; if (pad > 0) stream_write(meta_buffer, &zero, pad); }
-  
+
   stream_free(&compnd_tlv); stream_free(&source_tlv);
   return meta_mask;
 }
@@ -535,13 +570,13 @@ static void process_ter(CoordinateContext* ctx, EncodeMetadata* m, uint16_t form
   ctx->cb.has_ter_raw = 1;
   if (ctx->st.type > 0) flush_residue(&ctx->cb, &ctx->st, gctx.UDICT, (ctx->cb.num_residues == 0), 1, format_flags);
   if (ctx->cb.num_atoms > 0) {
-    unsigned char ch = (unsigned char)ctx->cb.c1; 
+    unsigned char ch = (unsigned char)ctx->cb.c1;
     ctx->cb.has_ter = (ctx->cb.has_ter_raw || (m->has_seqres_chain[ch] && ctx->cb.last_type < 0x60)) ? 1 : 0;
     ctx->cb.is_n_term = 1; ctx->cb.is_c_term = 1;
     flush_chain(&ctx->cb, &ctx->coords);
   } else { ctx->cb.has_ter_raw = 0; }
-    
-  ctx->st.type = -1; 
+
+  ctx->st.type = -1;
   memset(ctx->st.h_present, 0, sizeof(ctx->st.h_present)); memset(ctx->st.hy_present, 0, sizeof(ctx->st.hy_present));
   for (int k = 0; k < 256; k++) { alt_init(&ctx->st.h_atoms[k]); alt_init(&ctx->st.hy_atoms[k]); }
 }
@@ -580,25 +615,25 @@ static void save_model_file(const char* base_out, uint16_t total_m1, uint16_t cu
 static void flush_final_to_disk(CoordinateContext* ctx, const char* out_bpdb, EncodeMetadata* m, uint16_t format_flags) {
   stream_reset(&gctx.meta_buffer);
   build_binary_headers(m, &gctx.meta_buffer, format_flags, gctx.UDICT);
-  save_model_file(out_bpdb, ctx->total_models_minus_1, ctx->current_model_idx, 
-                  m->pdbID, m->classification, m->day, m->month, m->year, 
+  save_model_file(out_bpdb, ctx->total_models_minus_1, ctx->current_model_idx,
+                  m->pdbID, m->classification, m->day, m->month, m->year,
                   &gctx.meta_buffer, &ctx->coords, &gctx.m.conects);
 }
 
 static void process_endmdl(CoordinateContext* ctx, const char* out_bpdb, EncodeMetadata* m, uint16_t format_flags) {
   if (ctx->st.type > 0) flush_residue(&ctx->cb, &ctx->st, gctx.UDICT, (ctx->cb.num_residues == 0), 1, format_flags);
   if (ctx->cb.num_atoms > 0) {
-    unsigned char ch = (unsigned char)ctx->cb.c1; 
+    unsigned char ch = (unsigned char)ctx->cb.c1;
     ctx->cb.has_ter = (ctx->cb.has_ter_raw || (m->has_seqres_chain[ch] && ctx->cb.last_type < 0x60)) ? 1 : 0;
     ctx->cb.is_n_term = 1; ctx->cb.is_c_term = 1;
     flush_chain(&ctx->cb, &ctx->coords);
   }
   uint64_t end_stream = (0x3FFFULL << 18); stream_write(&ctx->coords, &end_stream, 8);
   flush_final_to_disk(ctx, out_bpdb, m, format_flags);
-    
+
   stream_reset(&ctx->coords);
   ctx->current_model_idx++;
-  ctx->st.type = -1; 
+  ctx->st.type = -1;
   memset(ctx->st.h_present, 0, sizeof(ctx->st.h_present)); memset(ctx->st.hy_present, 0, sizeof(ctx->st.hy_present));
   for (int k = 0; k < 256; k++) { alt_init(&ctx->st.h_atoms[k]); alt_init(&ctx->st.hy_atoms[k]); }
 }
@@ -606,13 +641,13 @@ static void process_endmdl(CoordinateContext* ctx, const char* out_bpdb, EncodeM
 static void process_file_boundary(CoordinateContext* ctx, EncodeMetadata* m, uint16_t format_flags) {
   if (ctx->st.type > 0) flush_residue(&ctx->cb, &ctx->st, gctx.UDICT, (ctx->cb.num_residues == 0), 1, format_flags);
   if (ctx->cb.num_atoms > 0) {
-    unsigned char ch = (unsigned char)ctx->cb.c1; 
+    unsigned char ch = (unsigned char)ctx->cb.c1;
     ctx->cb.has_ter = (ctx->cb.has_ter_raw || (m->has_seqres_chain[ch] && ctx->cb.last_type < 0x60)) ? 1 : 0;
     ctx->cb.is_n_term = 1; ctx->cb.is_c_term = 1;
     flush_chain(&ctx->cb, &ctx->coords);
   }
   uint64_t frag_stream = (0x3FFEULL << 18); stream_write(&ctx->coords, &frag_stream, 8);
-  ctx->st.type = -1; 
+  ctx->st.type = -1;
   memset(ctx->st.h_present, 0, sizeof(ctx->st.h_present)); memset(ctx->st.hy_present, 0, sizeof(ctx->st.hy_present));
   for (int k = 0; k < 256; k++) { alt_init(&ctx->st.h_atoms[k]); alt_init(&ctx->st.hy_atoms[k]); }
 }
@@ -620,7 +655,7 @@ static void process_file_boundary(CoordinateContext* ctx, EncodeMetadata* m, uin
 static void process_eof_flush(CoordinateContext* ctx, const char* out_bpdb, EncodeMetadata* m, uint16_t format_flags) {
   if (ctx->st.type > 0) flush_residue(&ctx->cb, &ctx->st, gctx.UDICT, (ctx->cb.num_residues == 0), 1, format_flags);
   if (ctx->cb.num_atoms > 0) {
-    unsigned char ch = (unsigned char)ctx->cb.c1; 
+    unsigned char ch = (unsigned char)ctx->cb.c1;
     ctx->cb.has_ter = (ctx->cb.has_ter_raw || (m->has_seqres_chain[ch] && ctx->cb.last_type < 0x60)) ? 1 : 0;
     ctx->cb.is_n_term = 1; ctx->cb.is_c_term = 1;
     flush_chain(&ctx->cb, &ctx->coords);
@@ -649,25 +684,25 @@ typedef struct {
 static void process_af_cif_atom(const char* line, int line_len, CoordinateContext* ctx, EncodeMetadata* m, uint16_t format_flags, CifOffsets* offs) {
   // Fix chain ID column placement (c1 is space, c2 is chain)
   char c1 = ' ', c2 = line[offs->chain_idx];
-  
-  int resSeq = 0; 
+
+  int resSeq = 0;
   int r_idx = offs->res_id_start;
   while (r_idx < line_len && (unsigned)(line[r_idx] - '0') <= 9) {
-      resSeq = resSeq * 10 + (line[r_idx] - '0');
-      r_idx++;
+    resSeq = resSeq * 10 + (line[r_idx] - '0');
+    r_idx++;
   }
 
   uint32_t res_hash_val = res_hash(line + offs->res_name_idx);
   int type = gctx.res_lut[res_hash_val];
-  if (type == 0) return; 
+  if (type == 0) return;
 
   char standard_atom[4] = {' ', ' ', ' ', ' '};
   int a_idx = offs->atom_name_idx;
   int atom_len = 0;
   while (atom_len < 4 && a_idx + atom_len < line_len && line[a_idx + atom_len] != ' ') {
-      atom_len++;
+    atom_len++;
   }
-  
+
   if (atom_len == 1) { standard_atom[1] = line[a_idx]; }
   else if (atom_len == 2) { standard_atom[1] = line[a_idx]; standard_atom[2] = line[a_idx+1]; }
   else if (atom_len == 3) { standard_atom[1] = line[a_idx]; standard_atom[2] = line[a_idx+1]; standard_atom[3] = line[a_idx+2]; }
@@ -682,28 +717,28 @@ static void process_af_cif_atom(const char* line, int line_len, CoordinateContex
   if (h_idx == -1) return;
 
   int new_chain = (c1 != ctx->current_c1 || c2 != ctx->current_c2);
-  
+
   int32_t x_int = fast_parse_cif_coord((const uint8_t*)(line + offs->x_idx));
   int32_t y_int = fast_parse_cif_coord((const uint8_t*)(line + offs->y_idx));
   int32_t z_int = fast_parse_cif_coord((const uint8_t*)(line + offs->z_idx));
   int32_t b_int = fast_parse_cif_f62((const uint8_t*)(line + offs->b_idx));
 
   if (resSeq != ctx->st.resSeq || new_chain || ctx->cb.atom_bytes >= 580000 || type != ctx->st.type) {
-      int has_oxt = (ctx->st.type > 0 && gctx.UDICT[ctx->st.type].h_end_cterm > gctx.UDICT[ctx->st.type].h_end_norm) && ctx->st.h_present[gctx.UDICT[ctx->st.type].h_end_cterm - 1];
-      if (ctx->st.type > 0) flush_residue(&ctx->cb, &ctx->st, gctx.UDICT, (ctx->cb.num_residues == 0), has_oxt, format_flags);
-      
-      if (new_chain || ctx->cb.atom_bytes >= 580000 || (resSeq < ctx->cb.last_resSeq) || (resSeq - ctx->cb.last_resSeq > 100) || has_oxt) {
-          if (ctx->cb.num_atoms > 0) {
-              ctx->cb.has_ter = (ctx->cb.has_ter_raw || (m->has_seqres_chain[(unsigned char)ctx->cb.c2] && ctx->cb.last_type < 0x60) || has_oxt) ? 1 : 0;
-              ctx->cb.is_n_term = 1; ctx->cb.is_c_term = has_oxt;
-              flush_chain(&ctx->cb, &ctx->coords);
-          }
-          if (new_chain) { ctx->current_c1 = c1; ctx->current_c2 = c2; }
-          ctx->cb.c1 = c1; ctx->cb.c2 = c2;
+    int has_oxt = (ctx->st.type > 0 && gctx.UDICT[ctx->st.type].h_end_cterm > gctx.UDICT[ctx->st.type].h_end_norm) && ctx->st.h_present[gctx.UDICT[ctx->st.type].h_end_cterm - 1];
+    if (ctx->st.type > 0) flush_residue(&ctx->cb, &ctx->st, gctx.UDICT, (ctx->cb.num_residues == 0), has_oxt, format_flags);
+
+    if (new_chain || ctx->cb.atom_bytes >= 580000 || (resSeq < ctx->cb.last_resSeq) || (resSeq - ctx->cb.last_resSeq > 100) || has_oxt) {
+      if (ctx->cb.num_atoms > 0) {
+        ctx->cb.has_ter = (ctx->cb.has_ter_raw || (m->has_seqres_chain[(unsigned char)ctx->cb.c2] && ctx->cb.last_type < 0x60) || has_oxt) ? 1 : 0;
+        ctx->cb.is_n_term = 1; ctx->cb.is_c_term = has_oxt;
+        flush_chain(&ctx->cb, &ctx->coords);
       }
-      ctx->st.resSeq = resSeq; ctx->st.iCode = ' '; ctx->st.type = type;
-      memset(ctx->st.h_present, 0, sizeof(ctx->st.h_present)); memset(ctx->st.hy_present, 0, sizeof(ctx->st.hy_present));
-      for (int k = 0; k < 256; k++) { alt_init(&ctx->st.h_atoms[k]); alt_init(&ctx->st.hy_atoms[k]); }
+      if (new_chain) { ctx->current_c1 = c1; ctx->current_c2 = c2; }
+      ctx->cb.c1 = c1; ctx->cb.c2 = c2;
+    }
+    ctx->st.resSeq = resSeq; ctx->st.iCode = ' '; ctx->st.type = type;
+    memset(ctx->st.h_present, 0, sizeof(ctx->st.h_present)); memset(ctx->st.hy_present, 0, sizeof(ctx->st.hy_present));
+    for (int k = 0; k < 256; k++) { alt_init(&ctx->st.h_atoms[k]); alt_init(&ctx->st.hy_atoms[k]); }
   }
 
   alt_push(&ctx->st.h_atoms[h_idx], b_int, x_int, y_int, z_int, 100, 0, ' ');
@@ -715,13 +750,13 @@ static void process_atom(const char* line, int line_len, CoordinateContext* ctx,
   if (line_len < 54) return;
   int include_hydrogens = (format_flags & (1 << META_HYDROGENS)) != 0;
   int af_mode = (format_flags & (1 << META_AF_MODE)) != 0;
-  
+
   char altLoc = line[16], iCode = line[26], c1 = line[20], c2 = line[21];
   int resSeq = ext_int(line, line_len, 23, 4);
 
   uint32_t res_hash_val = res_hash(line + 17);
   int type = gctx.res_lut[res_hash_val];
-    
+
   if (type == 0) {
     if (!include_hydrogens && line[13] == 'H') return;
     if (m->custom_het_idx < 192) {
@@ -778,7 +813,7 @@ static void process_atom(const char* line, int line_len, CoordinateContext* ctx,
     if (ctx->st.type > 0) flush_residue(&ctx->cb, &ctx->st, gctx.UDICT, (ctx->cb.num_residues == 0), has_oxt, format_flags);
     if (new_chain || ctx->cb.atom_bytes >= 580000 || (resSeq < ctx->cb.last_resSeq) || (resSeq - ctx->cb.last_resSeq > 100) || has_oxt) {
       if (ctx->cb.num_atoms > 0) {
-        unsigned char ch = ctx->cb.c1; 
+        unsigned char ch = ctx->cb.c1;
         ctx->cb.has_ter = (ctx->cb.has_ter_raw || (m->has_seqres_chain[ch] && ctx->cb.last_type < 0x60) || has_oxt) ? 1 : 0;
         ctx->cb.is_n_term = 1; ctx->cb.is_c_term = has_oxt;
         flush_chain(&ctx->cb, &ctx->coords);
@@ -858,12 +893,12 @@ static void parse_seqres(const char* line, int line_len, EncodeMetadata* m) {
   char chain = ext_char(line, line_len, 12);
   m->has_seqres_chain[(unsigned char)chain] = 1;
   if (chain != m->current_seqres_chain) {
-    if (m->current_seqres_count > 0) { 
-      uint16_t* count_ptr = (uint16_t*)(m->seqres_buf.data + m->seqres_buf.len - m->current_seqres_count - 2); 
-      *count_ptr = m->current_seqres_count; 
+    if (m->current_seqres_count > 0) {
+      uint16_t* count_ptr = (uint16_t*)(m->seqres_buf.data + m->seqres_buf.len - m->current_seqres_count - 2);
+      *count_ptr = m->current_seqres_count;
     }
     m->current_seqres_chain = chain; m->current_seqres_count = 0;
-    MetaSeqresHeader sh = {chain, 0}; 
+    MetaSeqresHeader sh = {chain, 0};
     stream_write(&m->seqres_buf, &sh, sizeof(MetaSeqresHeader));
   }
   for (int i = 0; i < 13; i++) {
@@ -885,10 +920,10 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int 
 
     int fd = open(in_pdbs[f], O_RDONLY);
     if (fd < 0) { perror("Input file error"); continue; }
-    
+
     struct stat st;
     if (fstat(fd, &st) < 0) { close(fd); continue; }
-    
+
     const char* map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (map == MAP_FAILED) { close(fd); continue; }
 
@@ -931,33 +966,33 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int 
           }
           if (strncmp(ptr, "ATOM", 4) == 0 || strncmp(ptr, "HETATM", 6) == 0) {
             if (atom_lines_seen == 0) {
-                // Find the exact start index of the first 15 columns
-                int tok_starts[20] = {0};
-                int tcnt = 0, scan = 0;
-                while (scan < line_len && tcnt < 20) {
-                    while (scan < line_len && ptr[scan] == ' ') scan++;
-                    if (scan >= line_len) break;
-                    tok_starts[tcnt++] = scan;
-                    while (scan < line_len && ptr[scan] != ' ' && ptr[scan] != '\n' && ptr[scan] != '\r') scan++;
-                }
+              // Find the exact start index of the first 15 columns
+              int tok_starts[20] = {0};
+              int tcnt = 0, scan = 0;
+              while (scan < line_len && tcnt < 20) {
+                while (scan < line_len && ptr[scan] == ' ') scan++;
+                if (scan >= line_len) break;
+                tok_starts[tcnt++] = scan;
+                while (scan < line_len && ptr[scan] != ' ' && ptr[scan] != '\n' && ptr[scan] != '\r') scan++;
+              }
 
-                // Map the fixed column start indices
-                cif_offs.atom_name_idx = tok_starts[3];
-                cif_offs.res_name_idx  = tok_starts[5];
-                cif_offs.chain_idx     = tok_starts[6];
-                cif_offs.res_id_start  = tok_starts[8];
-                cif_offs.x_idx         = tok_starts[10];
-                cif_offs.y_idx         = tok_starts[11];
-                cif_offs.z_idx         = tok_starts[12];
-                cif_offs.b_idx         = tok_starts[14];
-                
-                static int printed = 0;
-                if (!printed) {
-                    printf("[DEBUG] Mapped Offsets -> atom:%d res:%d chain:%d seq:%d X:%d Y:%d Z:%d B:%d\n",
-                           cif_offs.atom_name_idx, cif_offs.res_name_idx, cif_offs.chain_idx,
-                           cif_offs.res_id_start, cif_offs.x_idx, cif_offs.y_idx, cif_offs.z_idx, cif_offs.b_idx);
-                    printed = 1;
-                }
+              // Map the fixed column start indices
+              cif_offs.atom_name_idx = tok_starts[3];
+              cif_offs.res_name_idx  = tok_starts[5];
+              cif_offs.chain_idx     = tok_starts[6];
+              cif_offs.res_id_start  = tok_starts[8];
+              cif_offs.x_idx         = tok_starts[10];
+              cif_offs.y_idx         = tok_starts[11];
+              cif_offs.z_idx         = tok_starts[12];
+              cif_offs.b_idx         = tok_starts[14];
+
+              static int printed = 0;
+              if (!printed) {
+                printf("[DEBUG] Mapped Offsets -> atom:%d res:%d chain:%d seq:%d X:%d Y:%d Z:%d B:%d\n",
+                       cif_offs.atom_name_idx, cif_offs.res_name_idx, cif_offs.chain_idx,
+                       cif_offs.res_id_start, cif_offs.x_idx, cif_offs.y_idx, cif_offs.z_idx, cif_offs.b_idx);
+                printed = 1;
+              }
             }
             atom_lines_seen++;
             process_af_cif_atom(ptr, line_len, &gctx.cctx, &gctx.m, format_flags, &cif_offs);
@@ -971,7 +1006,7 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int 
         int line_len = nl ? (nl - ptr) : (end - ptr);
 
         if (line_len >= 6) {
-          uint64_t tag = (*(uint64_t*)ptr) & 0x0000FFFFFFFFFFFFULL; 
+          uint64_t tag = (*(uint64_t*)ptr) & 0x0000FFFFFFFFFFFFULL;
           switch (tag) {
           case 0x000020204d4f5441ULL: // "ATOM  "
           case 0x00004d5441544548ULL: // "HETATM"
@@ -999,10 +1034,10 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int 
           case 0x0000415444505845ULL: // "EXPDTA"
             { char chunk[70]; ext_str(chunk, ptr, line_len, 11, 69); if (strlen(gctx.m.expdta) > 0) strcat(gctx.m.expdta, " "); strncat(gctx.m.expdta, chunk, 127 - strlen(gctx.m.expdta)); } break;
           case 0x00004b52414d4552ULL: // "REMARK"
-            { 
+            {
               int rem_num = ext_int(ptr, line_len, 8, 3);
               if (rem_num == 2) { char t[12]; ext_str(t, ptr, line_len, 12, 11); if (strcmp(t, "RESOLUTION.") == 0) { float res = ext_float(ptr, line_len, 24, 7); if (res > 0.0f) gctx.m.resolution = res; } }
-              else if (rem_num == 3) { 
+              else if (rem_num == 3) {
                 char full[80]; ext_str(full, ptr, line_len, 12, 69); char* prog = strstr(full, "PROGRAM"); char* ver = strstr(full, "VERSION"); char* colon = strchr(full, ':');
                 if (prog && colon && strlen(gctx.m.program) == 0) { char temp[64] = {0}; char* start = colon + 1; while (*start == ' ' || *start == '\t') start++; strcpy(temp, start); trim_string(temp); strncat(gctx.m.program, temp, 55); }
                 else if (ver && colon && strlen(gctx.m.program) > 0 && !strstr(gctx.m.program, "v")) { char temp[64] = {0}; char* start = colon + 1; while (*start == ' ' || *start == '\t') start++; strcpy(temp, start); trim_string(temp); strncat(gctx.m.program, " v", 55 - strlen(gctx.m.program)); strncat(gctx.m.program, temp, 55 - strlen(gctx.m.program)); }
@@ -1026,11 +1061,11 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int 
       }
     }
 
-    if (gctx.m.current_seqres_count > 0) { 
-      uint16_t* count_ptr = (uint16_t*)(gctx.m.seqres_buf.data + gctx.m.seqres_buf.len - gctx.m.current_seqres_count - 2); 
-      *count_ptr = gctx.m.current_seqres_count; 
+    if (gctx.m.current_seqres_count > 0) {
+      uint16_t* count_ptr = (uint16_t*)(gctx.m.seqres_buf.data + gctx.m.seqres_buf.len - gctx.m.current_seqres_count - 2);
+      *count_ptr = gctx.m.current_seqres_count;
     }
-    
+
     uint32_t num_models = (gctx.m.parsed_num_models > 0) ? gctx.m.parsed_num_models : gctx.m.counted_models;
     if (num_models == 0) num_models = 1;
     gctx.cctx.total_models_minus_1 = num_models - 1;

@@ -269,22 +269,22 @@ typedef struct {
   uint32_t parsed_base_atoms;
   uint32_t expected_atoms;
   int atom_dict_idx;
-    
+
   int s_idx;
   const uint8_t* seq_ptr;
   int seq_bytes;
-    
+
   int first_res;
   int no_inc;
   int first_decoded;
-    
+
   int processing_hydrogens;
   int h_start, h_end;
   int hy_start, hy_end;
 
   int has_anchor;
   char active_alt_char;
-    
+
   accum_t accum;
   accum_t anchor_accum;
 } DecodeState;
@@ -369,7 +369,7 @@ static void init_decode_context(DecodeContext* ctx, const uint8_t* buffer, size_
 static DecodeMetadata parse_metadata_headers(const uint8_t* buffer, ResidueDict* UDICT) {
   DecodeMetadata meta; memset(&meta, 0, sizeof(meta));
   size_t offset = 64;
-    
+
   meta.mask = *(uint64_t*)(buffer + offset); offset += 8; // No shift
   meta.af_mode = (meta.mask & (1ULL << META_AF_MODE)) ? 1 : 0;
   meta.has_hydrogens = (meta.mask & (1ULL << META_HYDROGENS)) ? 1 : 0;
@@ -390,7 +390,7 @@ static DecodeMetadata parse_metadata_headers(const uint8_t* buffer, ResidueDict*
   // Section 4: Heterogen Section (36)
   if (meta.mask & (1ULL << META_HET_DICT)) {
     uint64_t dict_len = *(uint64_t*)(buffer + offset); offset += 8;
-    if (UDICT) { 
+    if (UDICT) {
       const uint8_t* p_het = buffer + offset; uint8_t count = p_het[0]; size_t ptr = 1;
       for (int c = 0; c < count; c++) {
         int u = 0x81 + c; memcpy(UDICT[u].resName, p_het + ptr, 3); UDICT[u].resName[3] = '\0'; ptr += 4;
@@ -421,7 +421,7 @@ static DecodeMetadata parse_metadata_headers(const uint8_t* buffer, ResidueDict*
 
 static void count_required_lines(DecodeContext* ctx, DecodeMetadata* meta) {
   ctx->total_out_lines = 0;
-    
+
   if (ctx->is_first_model) {
     ctx->total_out_lines += 1;
     if (meta->compnd_len > 0) {
@@ -553,17 +553,17 @@ static void write_headers_to_buffer(char** w_ptr, DecodeContext* ctx, DecodeMeta
           copy_len--;
         }
         if (copy_len == 0) {
-          copy_len = 70; 
+          copy_len = 70;
         } else {
           copy_len--;
         }
       }
-      memcpy(*w_ptr, "TITLE   ", 8); 
-      if (line_num > 1) { 
-        int ln = snprintf(tbuf, 128, "%2d", line_num); 
-        memcpy(*w_ptr + 8, tbuf, ln); 
+      memcpy(*w_ptr, "TITLE   ", 8);
+      if (line_num > 1) {
+        int ln = snprintf(tbuf, 128, "%2d", line_num);
+        memcpy(*w_ptr + 8, tbuf, ln);
       }
-      memcpy(*w_ptr + 10, meta->title + i, copy_len); 
+      memcpy(*w_ptr + 10, meta->title + i, copy_len);
       *w_ptr += 81;
       i += copy_len;
       line_num++;
@@ -578,7 +578,7 @@ static void write_headers_to_buffer(char** w_ptr, DecodeContext* ctx, DecodeMeta
 
   for (uint32_t i=0; i<meta->num_dbrefs; i++) {
     MetaDBRef* d = (MetaDBRef*)(meta->dbrefs + i * sizeof(MetaDBRef));
-        
+
     char db_name[9] = {0}; memcpy(db_name, d->db_name, 8); trim_string(db_name);
     char db_acc[13] = {0}; memcpy(db_acc, d->db_accession, 12); trim_string(db_acc);
     char db_id[13] = {0};  memcpy(db_id, d->db_id_code, 12); trim_string(db_id);
@@ -595,7 +595,7 @@ static void write_headers_to_buffer(char** w_ptr, DecodeContext* ctx, DecodeMeta
     }
     memcpy(*w_ptr, tbuf, len); *w_ptr += 81;
   }
-    
+
   if (meta->mask & (1ULL << META_AFDB)) {
     uint32_t first_r_a = *(uint32_t*)(ctx->buffer + meta->payload_start_offset);
     uint32_t num_res = first_r_a >> 18;
@@ -632,7 +632,7 @@ static void write_headers_to_buffer(char** w_ptr, DecodeContext* ctx, DecodeMeta
       }
     }
   }
-    
+
   if (meta->expdta_len > 0) { memcpy(*w_ptr, "EXPDTA    ", 10); memcpy(*w_ptr + 10, meta->expdta, meta->expdta_len > 70 ? 70 : meta->expdta_len); *w_ptr += 81; }
   if (meta->resolution > 0.0f) { memcpy(*w_ptr, "REMARK   2", 10); *w_ptr += 81; int len = snprintf(tbuf, 128, "REMARK   2 RESOLUTION. %7.2f ANGSTROMS.", meta->resolution); memcpy(*w_ptr, tbuf, len); *w_ptr += 81; }
   if (strlen(meta->program) > 0) { memcpy(*w_ptr, "REMARK   3", 10); *w_ptr += 81; memcpy(*w_ptr, "REMARK   3 REFINEMENT.", 22); *w_ptr += 81; int len = snprintf(tbuf, 128, "REMARK   3   PROGRAM     : %s", meta->program); memcpy(*w_ptr, tbuf, len); *w_ptr += 81; }
@@ -701,12 +701,18 @@ static inline void parse_sequence_header(const uint8_t* buffer, size_t* offset_p
   int first_seen = 0;
 
   for (uint32_t r = 0; r < num_residues; r++) {
-    uint8_t type = ds->seq_ptr[ds->seq_bytes++];
-    if (type == 0x7C) {
-      ds->seq_bytes++;
-    } else if (type != 0x00 && type != 0x7F) {
+    uint8_t raw_byte = ds->seq_ptr[ds->seq_bytes++];
+    if (raw_byte != 0x00 && raw_byte != 0x7F) {
+      if ((raw_byte & 0x40) == 0) {
+        // 0x40 is missing: next byte is an iCode
+        ds->seq_bytes++;
+        r++; // The iCode byte counts against num_residues in the encoder
+      }
+
+      uint8_t type = raw_byte & ~0x40; // Normalize back to dict ID
+
       int is_first = (!first_seen) && ds->is_n_term;
-      int is_last  = (r == (uint32_t)(num_residues - 1)) && ds->is_c_term;
+      int is_last  = (r >= num_residues - 2) && ds->is_c_term; // Catch end bounds
       first_seen = 1;
 
       ds->expected_atoms += (is_last ? UDICT[type].h_end_cterm : UDICT[type].h_end_norm) - (is_first ? 0 : UDICT[type].h_start_norm);
@@ -717,25 +723,25 @@ static inline void parse_sequence_header(const uint8_t* buffer, size_t* offset_p
   }
   *offset_ptr += ds->seq_bytes + ((8 - (ds->seq_bytes & 7)) & 7);
 
-  ds->first_res = 1; ds->first_decoded = 0; ds->no_inc = 0; ds->s_idx = 0; 
+  ds->first_res = 1; ds->first_decoded = 0; ds->no_inc = 0; ds->s_idx = 0;
   ds->parsed_base_atoms = 0; ds->atoms_left = 0; ds->processing_hydrogens = 0; ds->has_anchor = 0;
 }
 
 static inline void update_residue_state(DecodeState* ds, DecodeMetadata* meta, ResidueDict* UDICT) {
   if (ds->has_anchor) { ds->accum = ds->anchor_accum; ds->has_anchor = 0; }
   if (ds->parsed_base_atoms < ds->expected_atoms) {
-    uint8_t m_type = 0;
+    uint8_t raw_byte = 0;
     ds->iCode = ' ';
     do {
       if (ds->s_idx >= ds->seq_bytes) break;
-      m_type = ds->seq_ptr[ds->s_idx++];
-      if (m_type == 0x00) { ds->current_resSeq++; ds->first_res = 0; ds->no_inc = 0;}
-      else if (m_type == 0x7F) { ds->no_inc = 1; }
-      else if (m_type == 0x7C) { ds->iCode = ds->seq_ptr[ds->s_idx++]; }
-    } while (m_type == 0x00 || m_type == 0x7F || m_type == 0x7C);
-        
+      raw_byte = ds->seq_ptr[ds->s_idx++];
+      if (raw_byte == 0x00) { ds->current_resSeq++; ds->first_res = 0; ds->no_inc = 0;}
+      else if (raw_byte == 0x7F) { ds->no_inc = 1; }
+    } while (raw_byte == 0x00 || raw_byte == 0x7F);
+
     if (ds->s_idx <= ds->seq_bytes) {
-      ds->last_valid_type = m_type & 0xFF;
+      if ((raw_byte & 0x40) == 0) { ds->iCode = ds->seq_ptr[ds->s_idx++]; }
+      ds->last_valid_type = raw_byte & ~0x40; // Normalize back to dict ID
       if (!ds->first_res && !ds->no_inc) { ds->current_resSeq++; }
       ds->first_res = 0; ds->no_inc = 0;
 
@@ -783,26 +789,26 @@ static inline void write_formatted_atom(char** w_ptr, DecodeState* ds, DecodeMet
   const char* prefix = (ds->last_valid_type < 0x60) ? "ATOM  " : "HETATM";
 
   if (meta->af_mode) {
-        int len = snprintf(tbuf, 128, "%s%5d %-4s%c%3s%c%c%4d%c   %8.3f%8.3f%8.3f  1.00%6.2f          %2s  ",
-                           prefix, ds->atom_serial++, a_name, altLoc, UDICT[ds->last_valid_type].resName,
-                           ds->c1, ds->c2, ds->current_resSeq, ds->iCode, GET_SIMD_X(ds->accum) / 1000.0f, GET_SIMD_Y(ds->accum) / 1000.0f, GET_SIMD_Z(ds->accum) / 1000.0f, v_b / 100.0f, e_name);
-        if (len > 80) len = 80;
-        memcpy(*w_ptr, tbuf, len); *w_ptr += 81;
-    } else {
-        char chg_str[3] = "  ";
-        if (current_charge > 0) { chg_str[0] = '0' + current_charge; chg_str[1] = '+'; }
-        else if (current_charge < 0) { chg_str[0] = '0' - current_charge; chg_str[1] = '-'; }
-        int len = snprintf(tbuf, 128, "%s%5d %-4s%c%3s%c%c%4d%c   %8.3f%8.3f%8.3f%6.2f%6.2f          %2s%2s",
-                           prefix, ds->atom_serial++, a_name, altLoc, UDICT[ds->last_valid_type].resName,
-                           ds->c1, ds->c2, ds->current_resSeq, ds->iCode, GET_SIMD_X(ds->accum) / 1000.0f, GET_SIMD_Y(ds->accum) / 1000.0f, GET_SIMD_Z(ds->accum) / 1000.0f, current_occ / 100.0f, v_b / 100.0f, e_name, chg_str);
-        if (len > 80) len = 80;
-        memcpy(*w_ptr, tbuf, len); *w_ptr += 81;
-    }
+    int len = snprintf(tbuf, 128, "%s%5d %-4s%c%3s%c%c%4d%c   %8.3f%8.3f%8.3f  1.00%6.2f          %2s  ",
+                       prefix, ds->atom_serial++, a_name, altLoc, UDICT[ds->last_valid_type].resName,
+                       ds->c1, ds->c2, ds->current_resSeq, ds->iCode, GET_SIMD_X(ds->accum) / 1000.0f, GET_SIMD_Y(ds->accum) / 1000.0f, GET_SIMD_Z(ds->accum) / 1000.0f, v_b / 100.0f, e_name);
+    if (len > 80) len = 80;
+    memcpy(*w_ptr, tbuf, len); *w_ptr += 81;
+  } else {
+    char chg_str[3] = "  ";
+    if (current_charge > 0) { chg_str[0] = '0' + current_charge; chg_str[1] = '+'; }
+    else if (current_charge < 0) { chg_str[0] = '0' - current_charge; chg_str[1] = '-'; }
+    int len = snprintf(tbuf, 128, "%s%5d %-4s%c%3s%c%c%4d%c   %8.3f%8.3f%8.3f%6.2f%6.2f          %2s%2s",
+                       prefix, ds->atom_serial++, a_name, altLoc, UDICT[ds->last_valid_type].resName,
+                       ds->c1, ds->c2, ds->current_resSeq, ds->iCode, GET_SIMD_X(ds->accum) / 1000.0f, GET_SIMD_Y(ds->accum) / 1000.0f, GET_SIMD_Z(ds->accum) / 1000.0f, current_occ / 100.0f, v_b / 100.0f, e_name, chg_str);
+    if (len > 80) len = 80;
+    memcpy(*w_ptr, tbuf, len); *w_ptr += 81;
+  }
 }
 
 static inline void decode_atom_chunk(char** w_ptr, const uint8_t** ptr_ref, uint32_t num_atoms, DecodeState* ds, DecodeMetadata* meta, ResidueDict* UDICT) {
   const uint8_t* atom_ptr = *ptr_ref;
-  
+
   int af_shift = meta->af_mode ? 1 : 3;
 #if defined(__AVX2__) || defined(__SSE4_1__)
   __m128i v_shift = _mm_cvtsi32_si128(af_shift);
@@ -826,7 +832,7 @@ static inline void decode_atom_chunk(char** w_ptr, const uint8_t** ptr_ref, uint
       SIMD_DECODE_MACRO(atom_ptr, ds->accum, current_occ, current_charge, alt_flag, v_shift, meta->af_mode);
 #endif
       int32_t v_b = GET_SIMD_B(ds->accum);
-      int anchor_idx = (ds->last_valid_type >= 0x20 && ds->last_valid_type < 0x60) ? 2 : 8;
+      int anchor_idx = (ds->last_valid_type < 0x20) ? 2 : 8;
       if (ds->last_valid_type < 0x60 && ds->atom_dict_idx == anchor_idx && !ds->processing_hydrogens) {
         if (ds->active_alt_char == 'A') { ds->anchor_accum = ds->accum; ds->has_anchor = 1; }
       }
@@ -856,7 +862,7 @@ static void write_coordinates_to_buffer(char** w_ptr, DecodeContext* ctx, Decode
   DecodeState ds;
   memset(&ds, 0, sizeof(DecodeState));
   ds.atom_serial = 1;
-    
+
 #if defined(__AVX2__) || defined(__SSE4_1__)
   ds.accum = _mm_setzero_si128();
   ds.anchor_accum = _mm_setzero_si128();
@@ -872,12 +878,12 @@ static void write_coordinates_to_buffer(char** w_ptr, DecodeContext* ctx, Decode
     uint32_t r_a = *(uint32_t*)(ctx->buffer + offset);
     uint32_t num_residues = r_a >> 18;
     uint32_t num_atoms = r_a & 0x3FFFF;
-        
+
     if (num_residues == 0x3FFE) { offset += 8; continue; }
     if (num_residues == 0x3FFF) { break; }
 
     parse_sequence_header(ctx->buffer, &offset, num_residues, &ds, meta, UDICT);
-        
+
     const uint8_t* atom_ptr = ctx->buffer + offset;
     decode_atom_chunk(w_ptr, &atom_ptr, num_atoms, &ds, meta, UDICT);
     offset = (size_t)(atom_ptr - ctx->buffer);
@@ -992,7 +998,7 @@ void decode_bpdb(const uint8_t* buffer, size_t size, FILE* out, int is_first_mod
   char* out_data = (char*)malloc(out_size);
   memset(out_data, ' ', out_size);
   for (size_t i = 0; i < ctx.total_out_lines - (meta.af_mode ? 1 : 0); i++) out_data[i * 81 + 80] = '\n';
-    
+
   char* w_ptr = out_data;
   if (ctx.is_first_model) write_headers_to_buffer(&w_ptr, &ctx, &meta, UDICT);
   write_coordinates_to_buffer(&w_ptr, &ctx, &meta, UDICT);

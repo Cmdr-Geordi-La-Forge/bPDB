@@ -281,19 +281,19 @@ int main(int argc, char** argv) {
     if (num_files <= 0) { printf("Error: No input files specified.\n"); return 1; }
 
     const char** in_pdbs = (const char**)&argv[file_start];
-    
+
     // Benchmarking block
-    struct timespec start, end; 
+    struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
-    
+
     int iterations = 100; // Adjust depending on file size
     for (int it = 0; it < iterations; it++) {
-        encode_bpdb(num_files, in_pdbs, out_bpdb, include_hydrogens, af_mode, afdb_mode);
+      encode_bpdb(num_files, in_pdbs, out_bpdb, include_hydrogens, af_mode, afdb_mode);
     }
-    
+
     clock_gettime(CLOCK_MONOTONIC, &end);
     double t_taken = (end.tv_sec - start.tv_sec) * 1e3 + (end.tv_nsec - start.tv_nsec) / 1e6;
-    printf("[+] Encoder Benchmark took %.2f s total (%d iterations, %.3f ms/run)\n", 
+    printf("[+] Encoder Benchmark took %.2f s total (%d iterations, %.3f ms/run)\n",
            t_taken / 1000.0, iterations, t_taken / iterations);
 
     if (strcmp(out_bpdb, "-") != 0) {

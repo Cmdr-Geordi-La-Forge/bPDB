@@ -20,11 +20,11 @@ static const char* SOURCE_KEYS[] = {"", "MOL_ID", "SYNTHETIC", "FRAGMENT", "ORGA
 
 // --- StreamBuffer: Reusable 64KB dynamic buffers ---
 void stream_init(StreamBuffer* buf) {
-  buf->cap = 65536; // Start small (64KB), avoids 16MB upfront allocation
+  buf->cap = 65536; 
   buf->data = (uint8_t*)malloc(buf->cap);
   buf->len = 0;
 }
-void stream_reset(StreamBuffer* buf) { buf->len = 0; } // Zero-alloc reset
+void stream_reset(StreamBuffer* buf) { buf->len = 0; } 
 void stream_write(StreamBuffer* buf, const void* src, size_t size) {
   if (buf->len + size > buf->cap) {
     buf->cap = (buf->cap == 0) ? 65536 : (buf->cap * 2);
@@ -110,6 +110,50 @@ static inline int32_t fast_parse_f62(const char* ptr) {
   return sign * val;
 }
 
+static inline int32_t fast_parse_cif_coord(const uint8_t* ptr) {
+  int32_t val = 0;
+  if (ptr[0] == '-') {
+    int i = 1;
+    while ((unsigned)(ptr[i] - '0') <= 9) {
+      val = val * 10 + (ptr[i++] - '0');
+    }
+    val = -val;
+    val = val * 10 - (ptr[++i] - '0');
+    val = val * 10 - (ptr[++i] - '0');
+    val = val * 10 - (ptr[++i] - '0');
+  } else {
+    int i = 0;
+    while ((unsigned)(ptr[i] - '0') <= 9) {
+      val = val * 10 + (ptr[i++] - '0');
+    }
+    val = val * 10 + (ptr[++i] - '0');
+    val = val * 10 + (ptr[++i] - '0');
+    val = val * 10 + (ptr[++i] - '0');
+  }
+  return val;
+}
+
+static inline int32_t fast_parse_cif_f62(const uint8_t* ptr) {
+  int32_t val = 0;
+  if (ptr[0] == '-') {
+    int i = 1;
+    while ((unsigned)(ptr[i] - '0') <= 9) {
+      val = val * 10 + (ptr[i++] - '0');
+    }
+    val = -val;
+    val = val * 10 - (ptr[++i] - '0');
+    val = val * 10 - (ptr[++i] - '0');
+  } else {
+    int i = 0;
+    while ((unsigned)(ptr[i] - '0') <= 9) {
+      val = val * 10 + (ptr[i++] - '0');
+    }
+    val = val * 10 + (ptr[++i] - '0');
+    val = val * 10 + (ptr[++i] - '0');
+  }
+  return val;
+}
+
 // --- Lookup Table Hashing ---
 static inline uint32_t res_hash(const char* res) {
   uint32_t c0 = res[0], c1 = res[1], c2 = res[2];
@@ -188,12 +232,8 @@ static inline void encode_alt_array(ChainBuilder* cb, AltArray* arr, int force_j
   for (int a = 0; a < arr->count; a++) {
     int32_t x = arr->x[a], y = arr->y[a], z = arr->z[a], b_int = arr->b[a];
     
-    if (b_int > 4194303) {
-      b_int = 4194303;
-    }
-    if (b_int < 0) {
-      b_int = 0;
-    }
+    if (b_int > 4194303) b_int = 4194303;
+    if (b_int < 0) b_int = 0;
     
     if (cb->num_atoms == 0) { cb->current_x = x; cb->current_y = y; cb->current_z = z; cb->current_b = b_int; }
     int32_t dx = x - cb->current_x, dy = y - cb->current_y, dz = z - cb->current_z, db = b_int - cb->current_b;
@@ -233,8 +273,11 @@ static inline void encode_alt_array(ChainBuilder* cb, AltArray* arr, int force_j
   }
 }
 
-void flush_residue(ChainBuilder* cb, EncoderState* st, ResidueDict* UDICT, int is_first, int is_last, int include_hydrogens, int af_mode) {
+void flush_residue(ChainBuilder* cb, EncoderState* st, ResidueDict* UDICT, int is_first, int is_last, uint16_t format_flags) {
   if (st->type <= 0) return;
+  int include_hydrogens = (format_flags & (1 << META_HYDROGENS)) != 0;
+  int af_mode = (format_flags & (1 << META_AF_MODE)) != 0;
+
   if (cb->num_residues == 0) cb->start_resSeq = st->resSeq;
 
   if (cb->num_residues > 0) {
@@ -358,7 +401,6 @@ static void reset_gctx_for_file() {
   stream_reset(&gctx.m.helices); stream_reset(&gctx.m.sheets); stream_reset(&gctx.m.sites);
   stream_reset(&gctx.m.conects); stream_reset(&gctx.m.dbrefs); 
   
-  // Keep meta_buffer reset on the outer struct
   stream_reset(&gctx.meta_buffer);
   stream_reset(&gctx.cctx.coords);
   cb_reset(&gctx.cctx.cb);
@@ -390,7 +432,8 @@ static inline uint32_t pack_ec_number(const char* ec_str) {
   return packed;
 }
 
-void extract_tlv(char* raw_text, StreamBuffer* out_buf, int is_source, int af_mode) {
+void extract_tlv(char* raw_text, StreamBuffer* out_buf, int is_source, uint16_t format_flags) {
+  int af_mode = (format_flags & (1 << META_AF_MODE)) != 0;
   char* tok = strtok(raw_text, ";");
   StreamBuffer mol_buf; stream_init(&mol_buf);
   while (tok) {
@@ -415,20 +458,21 @@ void extract_tlv(char* raw_text, StreamBuffer* out_buf, int is_source, int af_mo
   stream_free(&mol_buf);
 }
 
-static uint64_t build_binary_headers(EncodeMetadata* m, StreamBuffer* meta_buffer, int include_hydrogens, int af_mode, int afdb_mode, ResidueDict* UDICT) {
+static uint64_t build_binary_headers(EncodeMetadata* m, StreamBuffer* meta_buffer, uint16_t format_flags, ResidueDict* UDICT) {
   StreamBuffer compnd_tlv; stream_init(&compnd_tlv);
-  if (strlen(m->raw_compnd) > 0) extract_tlv(m->raw_compnd, &compnd_tlv, 0, af_mode);
+  if (strlen(m->raw_compnd) > 0) extract_tlv(m->raw_compnd, &compnd_tlv, 0, format_flags);
 
   StreamBuffer source_tlv; stream_init(&source_tlv);
-  if (strlen(m->raw_source) > 0) extract_tlv(m->raw_source, &source_tlv, 1, af_mode);
+  if (strlen(m->raw_source) > 0) extract_tlv(m->raw_source, &source_tlv, 1, format_flags);
 
-  // Restore these required variable declarations:
   uint64_t title_len = strlen(m->title), expdta_len = strlen(m->expdta);
   int has_title = (title_len > 0), has_het = (m->custom_het_idx > 0x81), has_expdta = (expdta_len > 0);
   int has_res = (m->resolution > 0.0f), has_prog = (strlen(m->program) > 0);
 
-  uint64_t meta_mask = 0; uint64_t zero = 0;
-  if (af_mode) meta_mask |= (1ULL << META_AF_MODE);
+  uint64_t meta_mask = format_flags; 
+  uint64_t zero = 0;
+  int afdb_mode = (format_flags & (1 << META_AFDB)) != 0;
+
   if (has_res) meta_mask |= (1ULL << META_RESOLUTION);
   if (has_title) meta_mask |= (1ULL << META_TITLE);
   if (has_expdta) meta_mask |= (1ULL << META_EXPDTA);
@@ -439,11 +483,9 @@ static uint64_t build_binary_headers(EncodeMetadata* m, StreamBuffer* meta_buffe
   if (m->ssbonds.len > 0) meta_mask |= (1ULL << META_SSBOND);
   if (m->cispeps.len > 0) meta_mask |= (1ULL << META_CISPEP);
   if (m->sites.len > 0) meta_mask |= (1ULL << META_SITE);
-  if (include_hydrogens) meta_mask |= (1ULL << META_HYDROGENS);
   if (compnd_tlv.len > 0) meta_mask |= (1ULL << META_COMPND);
   if (source_tlv.len > 0) meta_mask |= (1ULL << META_SOURCE);
   if (m->dbrefs.len > 0) meta_mask |= (1ULL << META_DBREF);
-  if (afdb_mode) meta_mask |= (1ULL << META_AFDB);
   if (m->seqres_buf.len > 0 && !afdb_mode) meta_mask |= (1ULL << META_SEQRES);
 
   stream_write(meta_buffer, &meta_mask, 8);
@@ -482,16 +524,18 @@ static uint64_t build_binary_headers(EncodeMetadata* m, StreamBuffer* meta_buffe
   if (meta_mask & (1ULL << META_CISPEP)) { uint64_t L = m->cispeps.len;    stream_write(meta_buffer, &L, 8); stream_write(meta_buffer, m->cispeps.data, L);    size_t pad = (8 - (L % 8)) % 8; if (pad > 0) stream_write(meta_buffer, &zero, pad); }
 
   // Section 7: Miscellaneous Features Section (48)
-  if (meta_mask & (1ULL << META_SITE))   { uint64_t L = m->sites.len;      stream_write(meta_buffer, &L, 8); stream_write(meta_buffer, m->sites.data, L);      size_t pad = (8 - (L % 8)) % 8; if (pad > 0) stream_write(meta_buffer, &zero, pad); }stream_free(&compnd_tlv); stream_free(&source_tlv);
+  if (meta_mask & (1ULL << META_SITE))   { uint64_t L = m->sites.len;      stream_write(meta_buffer, &L, 8); stream_write(meta_buffer, m->sites.data, L);      size_t pad = (8 - (L % 8)) % 8; if (pad > 0) stream_write(meta_buffer, &zero, pad); }
+  
+  stream_free(&compnd_tlv); stream_free(&source_tlv);
   return meta_mask;
 }
 
 // --- Coordinate Handlers ---
-static void process_ter(CoordinateContext* ctx, EncodeMetadata* m, int include_hydrogens, int af_mode) {
+static void process_ter(CoordinateContext* ctx, EncodeMetadata* m, uint16_t format_flags) {
   ctx->cb.has_ter_raw = 1;
-  if (ctx->st.type > 0) flush_residue(&ctx->cb, &ctx->st, gctx.UDICT, (ctx->cb.num_residues == 0), 1, include_hydrogens, af_mode);
+  if (ctx->st.type > 0) flush_residue(&ctx->cb, &ctx->st, gctx.UDICT, (ctx->cb.num_residues == 0), 1, format_flags);
   if (ctx->cb.num_atoms > 0) {
-    unsigned char ch = ctx->cb.c1; 
+    unsigned char ch = (unsigned char)ctx->cb.c1; 
     ctx->cb.has_ter = (ctx->cb.has_ter_raw || (m->has_seqres_chain[ch] && ctx->cb.last_type < 0x60)) ? 1 : 0;
     ctx->cb.is_n_term = 1; ctx->cb.is_c_term = 1;
     flush_chain(&ctx->cb, &ctx->coords);
@@ -533,24 +577,24 @@ static void save_model_file(const char* base_out, uint16_t total_m1, uint16_t cu
   }
 }
 
-static void flush_final_to_disk(CoordinateContext* ctx, const char* out_bpdb, EncodeMetadata* m, int include_hydrogens, int af_mode, int afdb_mode) {
+static void flush_final_to_disk(CoordinateContext* ctx, const char* out_bpdb, EncodeMetadata* m, uint16_t format_flags) {
   stream_reset(&gctx.meta_buffer);
-  build_binary_headers(m, &gctx.meta_buffer, include_hydrogens, af_mode, afdb_mode, gctx.UDICT);
+  build_binary_headers(m, &gctx.meta_buffer, format_flags, gctx.UDICT);
   save_model_file(out_bpdb, ctx->total_models_minus_1, ctx->current_model_idx, 
                   m->pdbID, m->classification, m->day, m->month, m->year, 
                   &gctx.meta_buffer, &ctx->coords, &gctx.m.conects);
 }
 
-static void process_endmdl(CoordinateContext* ctx, const char* out_bpdb, EncodeMetadata* m, int include_hydrogens, int af_mode, int afdb_mode) {
-  if (ctx->st.type > 0) flush_residue(&ctx->cb, &ctx->st, gctx.UDICT, (ctx->cb.num_residues == 0), 1, include_hydrogens, af_mode);
+static void process_endmdl(CoordinateContext* ctx, const char* out_bpdb, EncodeMetadata* m, uint16_t format_flags) {
+  if (ctx->st.type > 0) flush_residue(&ctx->cb, &ctx->st, gctx.UDICT, (ctx->cb.num_residues == 0), 1, format_flags);
   if (ctx->cb.num_atoms > 0) {
-    unsigned char ch = ctx->cb.c1; 
+    unsigned char ch = (unsigned char)ctx->cb.c1; 
     ctx->cb.has_ter = (ctx->cb.has_ter_raw || (m->has_seqres_chain[ch] && ctx->cb.last_type < 0x60)) ? 1 : 0;
     ctx->cb.is_n_term = 1; ctx->cb.is_c_term = 1;
     flush_chain(&ctx->cb, &ctx->coords);
   }
   uint64_t end_stream = (0x3FFFULL << 18); stream_write(&ctx->coords, &end_stream, 8);
-  flush_final_to_disk(ctx, out_bpdb, m, include_hydrogens, af_mode, afdb_mode);
+  flush_final_to_disk(ctx, out_bpdb, m, format_flags);
     
   stream_reset(&ctx->coords);
   ctx->current_model_idx++;
@@ -559,10 +603,10 @@ static void process_endmdl(CoordinateContext* ctx, const char* out_bpdb, EncodeM
   for (int k = 0; k < 256; k++) { alt_init(&ctx->st.h_atoms[k]); alt_init(&ctx->st.hy_atoms[k]); }
 }
 
-static void process_file_boundary(CoordinateContext* ctx, EncodeMetadata* m, int include_hydrogens, int af_mode) {
-  if (ctx->st.type > 0) flush_residue(&ctx->cb, &ctx->st, gctx.UDICT, (ctx->cb.num_residues == 0), 1, include_hydrogens, af_mode);
+static void process_file_boundary(CoordinateContext* ctx, EncodeMetadata* m, uint16_t format_flags) {
+  if (ctx->st.type > 0) flush_residue(&ctx->cb, &ctx->st, gctx.UDICT, (ctx->cb.num_residues == 0), 1, format_flags);
   if (ctx->cb.num_atoms > 0) {
-    unsigned char ch = ctx->cb.c1; 
+    unsigned char ch = (unsigned char)ctx->cb.c1; 
     ctx->cb.has_ter = (ctx->cb.has_ter_raw || (m->has_seqres_chain[ch] && ctx->cb.last_type < 0x60)) ? 1 : 0;
     ctx->cb.is_n_term = 1; ctx->cb.is_c_term = 1;
     flush_chain(&ctx->cb, &ctx->coords);
@@ -573,28 +617,111 @@ static void process_file_boundary(CoordinateContext* ctx, EncodeMetadata* m, int
   for (int k = 0; k < 256; k++) { alt_init(&ctx->st.h_atoms[k]); alt_init(&ctx->st.hy_atoms[k]); }
 }
 
-static void process_eof_flush(CoordinateContext* ctx, const char* out_bpdb, EncodeMetadata* m, int include_hydrogens, int af_mode, int afdb_mode) {
-  if (ctx->st.type > 0) flush_residue(&ctx->cb, &ctx->st, gctx.UDICT, (ctx->cb.num_residues == 0), 1, include_hydrogens, af_mode);
+static void process_eof_flush(CoordinateContext* ctx, const char* out_bpdb, EncodeMetadata* m, uint16_t format_flags) {
+  if (ctx->st.type > 0) flush_residue(&ctx->cb, &ctx->st, gctx.UDICT, (ctx->cb.num_residues == 0), 1, format_flags);
   if (ctx->cb.num_atoms > 0) {
-    unsigned char ch = ctx->cb.c1; 
+    unsigned char ch = (unsigned char)ctx->cb.c1; 
     ctx->cb.has_ter = (ctx->cb.has_ter_raw || (m->has_seqres_chain[ch] && ctx->cb.last_type < 0x60)) ? 1 : 0;
     ctx->cb.is_n_term = 1; ctx->cb.is_c_term = 1;
     flush_chain(&ctx->cb, &ctx->coords);
   }
   uint64_t end_stream = (0x3FFFULL << 18); stream_write(&ctx->coords, &end_stream, 8);
-  flush_final_to_disk(ctx, out_bpdb, m, include_hydrogens, af_mode, afdb_mode);
+  flush_final_to_disk(ctx, out_bpdb, m, format_flags);
 }
 
-// --- $O(1)$ Atom Lookups in Main Stream ---
-static void process_atom(const char* line, int line_len, CoordinateContext* ctx, EncodeMetadata* m, int include_hydrogens, int af_mode) {
+// --- AF Database CIF Fixed Offsets & Parser ---
+typedef struct {
+  int atom_name_idx;
+  int res_name_idx;
+  int chain_idx;
+  int res_id_start;
+  int res_id_len;
+  int x_idx;
+  int x_len;
+  int y_idx;
+  int y_len;
+  int z_idx;
+  int z_len;
+  int b_idx;
+  int b_len;
+} CifOffsets;
+
+static void process_af_cif_atom(const char* line, int line_len, CoordinateContext* ctx, EncodeMetadata* m, uint16_t format_flags, CifOffsets* offs) {
+  // Fix chain ID column placement (c1 is space, c2 is chain)
+  char c1 = ' ', c2 = line[offs->chain_idx];
+  
+  int resSeq = 0; 
+  int r_idx = offs->res_id_start;
+  while (r_idx < line_len && (unsigned)(line[r_idx] - '0') <= 9) {
+      resSeq = resSeq * 10 + (line[r_idx] - '0');
+      r_idx++;
+  }
+
+  uint32_t res_hash_val = res_hash(line + offs->res_name_idx);
+  int type = gctx.res_lut[res_hash_val];
+  if (type == 0) return; 
+
+  char standard_atom[4] = {' ', ' ', ' ', ' '};
+  int a_idx = offs->atom_name_idx;
+  int atom_len = 0;
+  while (atom_len < 4 && a_idx + atom_len < line_len && line[a_idx + atom_len] != ' ') {
+      atom_len++;
+  }
+  
+  if (atom_len == 1) { standard_atom[1] = line[a_idx]; }
+  else if (atom_len == 2) { standard_atom[1] = line[a_idx]; standard_atom[2] = line[a_idx+1]; }
+  else if (atom_len == 3) { standard_atom[1] = line[a_idx]; standard_atom[2] = line[a_idx+1]; standard_atom[3] = line[a_idx+2]; }
+  else { memcpy(standard_atom, line + a_idx, 4); }
+
+  uint32_t raw_atom_int = *(uint32_t*)standard_atom;
+  uint32_t h = (raw_atom_int ^ (raw_atom_int >> 13) ^ (raw_atom_int >> 21)) & 0x1FFF;
+
+  int h_idx = -1;
+  int h_map_idx = gctx.h_hash[type].map[h];
+  if (h_map_idx != 0xFF && *(uint32_t*)(gctx.UDICT[type].h_atoms[h_map_idx]) == raw_atom_int) h_idx = h_map_idx;
+  if (h_idx == -1) return;
+
+  int new_chain = (c1 != ctx->current_c1 || c2 != ctx->current_c2);
+  
+  int32_t x_int = fast_parse_cif_coord((const uint8_t*)(line + offs->x_idx));
+  int32_t y_int = fast_parse_cif_coord((const uint8_t*)(line + offs->y_idx));
+  int32_t z_int = fast_parse_cif_coord((const uint8_t*)(line + offs->z_idx));
+  int32_t b_int = fast_parse_cif_f62((const uint8_t*)(line + offs->b_idx));
+
+  if (resSeq != ctx->st.resSeq || new_chain || ctx->cb.atom_bytes >= 580000 || type != ctx->st.type) {
+      int has_oxt = (ctx->st.type > 0 && gctx.UDICT[ctx->st.type].h_end_cterm > gctx.UDICT[ctx->st.type].h_end_norm) && ctx->st.h_present[gctx.UDICT[ctx->st.type].h_end_cterm - 1];
+      if (ctx->st.type > 0) flush_residue(&ctx->cb, &ctx->st, gctx.UDICT, (ctx->cb.num_residues == 0), has_oxt, format_flags);
+      
+      if (new_chain || ctx->cb.atom_bytes >= 580000 || (resSeq < ctx->cb.last_resSeq) || (resSeq - ctx->cb.last_resSeq > 100) || has_oxt) {
+          if (ctx->cb.num_atoms > 0) {
+              ctx->cb.has_ter = (ctx->cb.has_ter_raw || (m->has_seqres_chain[(unsigned char)ctx->cb.c2] && ctx->cb.last_type < 0x60) || has_oxt) ? 1 : 0;
+              ctx->cb.is_n_term = 1; ctx->cb.is_c_term = has_oxt;
+              flush_chain(&ctx->cb, &ctx->coords);
+          }
+          if (new_chain) { ctx->current_c1 = c1; ctx->current_c2 = c2; }
+          ctx->cb.c1 = c1; ctx->cb.c2 = c2;
+      }
+      ctx->st.resSeq = resSeq; ctx->st.iCode = ' '; ctx->st.type = type;
+      memset(ctx->st.h_present, 0, sizeof(ctx->st.h_present)); memset(ctx->st.hy_present, 0, sizeof(ctx->st.hy_present));
+      for (int k = 0; k < 256; k++) { alt_init(&ctx->st.h_atoms[k]); alt_init(&ctx->st.hy_atoms[k]); }
+  }
+
+  alt_push(&ctx->st.h_atoms[h_idx], b_int, x_int, y_int, z_int, 100, 0, ' ');
+  ctx->st.h_present[h_idx] = 1;
+}
+
+// --- Standard Atom Lookups in Main Stream ---
+static void process_atom(const char* line, int line_len, CoordinateContext* ctx, EncodeMetadata* m, uint16_t format_flags) {
   if (line_len < 54) return;
+  int include_hydrogens = (format_flags & (1 << META_HYDROGENS)) != 0;
+  int af_mode = (format_flags & (1 << META_AF_MODE)) != 0;
+  
   char altLoc = line[16], iCode = line[26], c1 = line[20], c2 = line[21];
   int resSeq = ext_int(line, line_len, 23, 4);
 
   uint32_t res_hash_val = res_hash(line + 17);
   int type = gctx.res_lut[res_hash_val];
     
-  // Auto-vivify Custom HETATM
   if (type == 0) {
     if (!include_hydrogens && line[13] == 'H') return;
     if (m->custom_het_idx < 192) {
@@ -648,7 +775,7 @@ static void process_atom(const char* line, int line_len, CoordinateContext* ctx,
     if (ctx->st.type > 0 && gctx.UDICT[ctx->st.type].h_end_cterm > gctx.UDICT[ctx->st.type].h_end_norm) {
       if (ctx->st.h_present[gctx.UDICT[ctx->st.type].h_end_cterm - 1]) has_oxt = 1;
     }
-    if (ctx->st.type > 0) flush_residue(&ctx->cb, &ctx->st, gctx.UDICT, (ctx->cb.num_residues == 0), has_oxt, include_hydrogens, af_mode);
+    if (ctx->st.type > 0) flush_residue(&ctx->cb, &ctx->st, gctx.UDICT, (ctx->cb.num_residues == 0), has_oxt, format_flags);
     if (new_chain || ctx->cb.atom_bytes >= 580000 || (resSeq < ctx->cb.last_resSeq) || (resSeq - ctx->cb.last_resSeq > 100) || has_oxt) {
       if (ctx->cb.num_atoms > 0) {
         unsigned char ch = ctx->cb.c1; 
@@ -667,7 +794,7 @@ static void process_atom(const char* line, int line_len, CoordinateContext* ctx,
     if (h_idx != -1 && ctx->st.h_present[h_idx]) { for (int c = 0; c < ctx->st.h_atoms[h_idx].count; c++) { if (ctx->st.h_atoms[h_idx].alt[c] == altLoc) { is_dup = 1; break; } } }
     else if (hy_idx != -1 && ctx->st.hy_present[hy_idx]) { for (int c = 0; c < ctx->st.hy_atoms[hy_idx].count; c++) { if (ctx->st.hy_atoms[hy_idx].alt[c] == altLoc) { is_dup = 1; break; } } }
     if (is_dup) {
-      flush_residue(&ctx->cb, &ctx->st, gctx.UDICT, (ctx->cb.num_residues == 0), 0, include_hydrogens, af_mode);
+      flush_residue(&ctx->cb, &ctx->st, gctx.UDICT, (ctx->cb.num_residues == 0), 0, format_flags);
       memset(ctx->st.h_present, 0, sizeof(ctx->st.h_present)); memset(ctx->st.hy_present, 0, sizeof(ctx->st.hy_present));
       for (int k = 0; k < 256; k++) { alt_init(&ctx->st.h_atoms[k]); alt_init(&ctx->st.hy_atoms[k]); }
     }
@@ -678,8 +805,8 @@ static void process_atom(const char* line, int line_len, CoordinateContext* ctx,
 }
 
 // --- Metadata Handlers (Bounds Checked) ---
-static void parse_header(const char* line, int line_len, EncodeMetadata* m, int af_mode) {
-  (void)af_mode;
+static void parse_header(const char* line, int line_len, EncodeMetadata* m, uint16_t format_flags) {
+  (void)format_flags;
   ext_str(m->classification, line, line_len, 11, 40);
   char date_str[10]; ext_str(date_str, line, line_len, 51, 9);
   if (strlen(date_str) == 9) {
@@ -691,7 +818,8 @@ static void parse_header(const char* line, int line_len, EncodeMetadata* m, int 
   if (strlen(temp_id) > 0 && strcmp(temp_id, "XXXX") != 0) { strcpy(m->pdbID, temp_id); m->id_from_header = 1; }
 }
 
-static void parse_title(const char* line, int line_len, EncodeMetadata* m, int af_mode) {
+static void parse_title(const char* line, int line_len, EncodeMetadata* m, uint16_t format_flags) {
+  int af_mode = (format_flags & (1 << META_AF_MODE)) != 0;
   char chunk[71]; ext_str_rtrim(chunk, line, line_len, 11, 70); strcat(m->title, chunk);
   if (!m->id_from_header && !af_mode) {
     const char *p1 = strchr(line, '('), *p2 = strchr(p1 ? p1 : line, ')');
@@ -699,7 +827,8 @@ static void parse_title(const char* line, int line_len, EncodeMetadata* m, int a
   }
 }
 
-static void parse_dbref(const char* line, int line_len, EncodeMetadata* m, int af_mode) {
+static void parse_dbref(const char* line, int line_len, EncodeMetadata* m, uint16_t format_flags) {
+  int af_mode = (format_flags & (1 << META_AF_MODE)) != 0;
   MetaDBRef db; memset(&db, ' ', sizeof(db));
   if (af_mode) {
     db.chain = ext_char(line, line_len, 13); db.seq_begin = ext_int(line, line_len, 15, 4);
@@ -735,14 +864,14 @@ static void parse_seqres(const char* line, int line_len, EncodeMetadata* m) {
     }
     m->current_seqres_chain = chain; m->current_seqres_count = 0;
     MetaSeqresHeader sh = {chain, 0}; 
-    stream_write(&m->seqres_buf, &sh, sizeof(MetaSeqresHeader)); // FIX
+    stream_write(&m->seqres_buf, &sh, sizeof(MetaSeqresHeader));
   }
   for (int i = 0; i < 13; i++) {
     int offset = 19 + i * 4; if (offset + 2 >= line_len) break;
     char res[4] = {0}; memcpy(res, line + offset, 3); char trimmed[4]; strcpy(trimmed, res); trim_string(trimmed);
     if (strlen(trimmed) == 0) continue;
     uint8_t type_id = gctx.res_lut[res_hash(res)];
-    stream_write(&m->seqres_buf, &type_id, 1); // FIX
+    stream_write(&m->seqres_buf, &type_id, 1);
     m->current_seqres_count++;
   }
 }
@@ -763,6 +892,14 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int 
     const char* map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (map == MAP_FAILED) { close(fd); continue; }
 
+    int is_cif = (st.st_size > 5 && strncmp(map, "data_", 5) == 0);
+
+    uint16_t format_flags = 0;
+    if (af_mode) format_flags |= (1 << META_AF_MODE);
+    if (afdb_mode) format_flags |= (1 << META_AFDB);
+    if (include_hydrogens) format_flags |= (1 << META_HYDROGENS);
+    if (is_cif) format_flags |= (1 << META_CIF);
+
     if (af_mode) {
       char temp[128]; strcpy(temp, in_pdbs[f]);
       char* base = strrchr(temp, '/'); base = base ? base + 1 : temp;
@@ -775,63 +912,118 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int 
     const char* ptr = map;
     const char* end = map + st.st_size;
 
-    while (ptr < end) {
-      const char* nl = memchr(ptr, '\n', end - ptr);
-      int line_len = nl ? (nl - ptr) : (end - ptr);
+    if (is_cif) {
+      const char* coord_start = strstr(map, "_atom_site.pdbx_sifts_xref_db_res");
+      if (!coord_start) coord_start = strstr(map, "_atom_site.pdbx_PDB_model_num");
+      if (coord_start) { ptr = strchr(coord_start, '\n'); if (ptr) ptr++; }
 
-      if (line_len >= 6) {
-        uint64_t tag = (*(uint64_t*)ptr) & 0x0000FFFFFFFFFFFFULL; // LE exactly maps to 6 characters
-        switch (tag) {
-        case 0x000020204d4f5441ULL: // "ATOM  "
-        case 0x00004d5441544548ULL: // "HETATM"
-          process_atom(ptr, line_len, &gctx.cctx, &gctx.m, include_hydrogens, af_mode); break;
-        case 0x0000202020524554ULL: // "TER   "
-          process_ter(&gctx.cctx, &gctx.m, include_hydrogens, af_mode); break;
-        case 0x00004c444d444e45ULL: // "ENDMDL"
-          process_endmdl(&gctx.cctx, out_bpdb, &gctx.m, include_hydrogens, af_mode, afdb_mode); break;
-        case 0x0000524544414548ULL: // "HEADER"
-          parse_header(ptr, line_len, &gctx.m, af_mode); break;
-        case 0x000020454c544954ULL: // "TITLE "
-          parse_title(ptr, line_len, &gctx.m, af_mode); break;
-        case 0x0000204645524244ULL: // "DBREF "
-          parse_dbref(ptr, line_len, &gctx.m, af_mode); break;
-        case 0x0000534552514553ULL: // "SEQRES"
-          parse_seqres(ptr, line_len, &gctx.m); break;
-        case 0x00004c444d4d554eULL: // "NUMMDL"
-          gctx.m.parsed_num_models = ext_int(ptr, line_len, 11, 4); break;
-        case 0x0000204c45444f4dULL: // "MODEL "
-          gctx.m.counted_models++; break;
-        case 0x0000444e504d4f43ULL: // "COMPND"
-          { char chunk[71]; ext_str(chunk, ptr, line_len, 11, 70); if (strlen(gctx.m.raw_compnd) > 0) strcat(gctx.m.raw_compnd, " "); strcat(gctx.m.raw_compnd, chunk); } break;
-        case 0x0000454352554f53ULL: // "SOURCE"
-          { char chunk[70]; ext_str(chunk, ptr, line_len, 11, 69); if (strlen(gctx.m.raw_source) > 0) strcat(gctx.m.raw_source, " "); strcat(gctx.m.raw_source, chunk); } break;
-        case 0x0000415444505845ULL: // "EXPDTA"
-          { char chunk[70]; ext_str(chunk, ptr, line_len, 11, 69); if (strlen(gctx.m.expdta) > 0) strcat(gctx.m.expdta, " "); strncat(gctx.m.expdta, chunk, 127 - strlen(gctx.m.expdta)); } break;
-        case 0x00004b52414d4552ULL: // "REMARK"
-          { 
-            int rem_num = ext_int(ptr, line_len, 8, 3);
-            if (rem_num == 2) { char t[12]; ext_str(t, ptr, line_len, 12, 11); if (strcmp(t, "RESOLUTION.") == 0) { float res = ext_float(ptr, line_len, 24, 7); if (res > 0.0f) gctx.m.resolution = res; } }
-            else if (rem_num == 3) { 
-              char full[80]; ext_str(full, ptr, line_len, 12, 69); char* prog = strstr(full, "PROGRAM"); char* ver = strstr(full, "VERSION"); char* colon = strchr(full, ':');
-              if (prog && colon && strlen(gctx.m.program) == 0) { char temp[64] = {0}; char* start = colon + 1; while (*start == ' ' || *start == '\t') start++; strcpy(temp, start); trim_string(temp); strncat(gctx.m.program, temp, 55); }
-              else if (ver && colon && strlen(gctx.m.program) > 0 && !strstr(gctx.m.program, "v")) { char temp[64] = {0}; char* start = colon + 1; while (*start == ' ' || *start == '\t') start++; strcpy(temp, start); trim_string(temp); strncat(gctx.m.program, " v", 55 - strlen(gctx.m.program)); strncat(gctx.m.program, temp, 55 - strlen(gctx.m.program)); }
+      int atom_lines_seen = 0;
+      CifOffsets cif_offs = {0};
+
+      while (ptr < end) {
+        const char* nl = memchr(ptr, '\n', end - ptr);
+        int line_len = nl ? (nl - ptr) : (end - ptr);
+
+        if (line_len > 0) {
+          if (ptr[0] == '#') {
+            process_ter(&gctx.cctx, &gctx.m, format_flags);
+            break;
+          }
+          if (strncmp(ptr, "ATOM", 4) == 0 || strncmp(ptr, "HETATM", 6) == 0) {
+            if (atom_lines_seen == 0) {
+                // Find the exact start index of the first 15 columns
+                int tok_starts[20] = {0};
+                int tcnt = 0, scan = 0;
+                while (scan < line_len && tcnt < 20) {
+                    while (scan < line_len && ptr[scan] == ' ') scan++;
+                    if (scan >= line_len) break;
+                    tok_starts[tcnt++] = scan;
+                    while (scan < line_len && ptr[scan] != ' ' && ptr[scan] != '\n' && ptr[scan] != '\r') scan++;
+                }
+
+                // Map the fixed column start indices
+                cif_offs.atom_name_idx = tok_starts[3];
+                cif_offs.res_name_idx  = tok_starts[5];
+                cif_offs.chain_idx     = tok_starts[6];
+                cif_offs.res_id_start  = tok_starts[8];
+                cif_offs.x_idx         = tok_starts[10];
+                cif_offs.y_idx         = tok_starts[11];
+                cif_offs.z_idx         = tok_starts[12];
+                cif_offs.b_idx         = tok_starts[14];
+                
+                static int printed = 0;
+                if (!printed) {
+                    printf("[DEBUG] Mapped Offsets -> atom:%d res:%d chain:%d seq:%d X:%d Y:%d Z:%d B:%d\n",
+                           cif_offs.atom_name_idx, cif_offs.res_name_idx, cif_offs.chain_idx,
+                           cif_offs.res_id_start, cif_offs.x_idx, cif_offs.y_idx, cif_offs.z_idx, cif_offs.b_idx);
+                    printed = 1;
+                }
             }
-          } break;
-        case 0x0000444e4f425353ULL: // "SSBOND"
-          { MetaSSBond b; memset(&b, 0, sizeof(b)); ext_str(b.res1.resName, ptr, line_len, 12, 3); b.res1.chain = ext_char(ptr, line_len, 16); b.res1.resSeq = ext_int(ptr, line_len, 18, 4); b.res1.iCode = ext_char(ptr, line_len, 22); ext_str(b.res2.resName, ptr, line_len, 26, 3); b.res2.chain = ext_char(ptr, line_len, 30); b.res2.resSeq = ext_int(ptr, line_len, 32, 4); b.res2.iCode = ext_char(ptr, line_len, 36); ext_str(b.sym1, ptr, line_len, 60, 6); ext_str(b.sym2, ptr, line_len, 67, 6); b.length = ext_float(ptr, line_len, 74, 5); stream_write(&gctx.m.ssbonds, &b, sizeof(MetaSSBond)); } break;
-        case 0x0000504550534943ULL: // "CISPEP"
-          { MetaCispep c; memset(&c, 0, sizeof(c)); ext_str(c.res1.resName, ptr, line_len, 12, 3); c.res1.chain = ext_char(ptr, line_len, 16); c.res1.resSeq = ext_int(ptr, line_len, 18, 4); c.res1.iCode = ext_char(ptr, line_len, 22); ext_str(c.res2.resName, ptr, line_len, 26, 3); c.res2.chain = ext_char(ptr, line_len, 30); c.res2.resSeq = ext_int(ptr, line_len, 32, 4); c.res2.iCode = ext_char(ptr, line_len, 36); c.modNum = ext_int(ptr, line_len, 44, 3); c.angle = ext_float(ptr, line_len, 54, 6); stream_write(&gctx.m.cispeps, &c, sizeof(MetaCispep)); } break;
-        case 0x00002058494c4548ULL: // "HELIX "
-          { MetaHelix h; memset(&h, 0, sizeof(h)); ext_str(h.helixID, ptr, line_len, 12, 3); ext_str(h.start.resName, ptr, line_len, 16, 3); h.start.chain = ext_char(ptr, line_len, 20); h.start.resSeq = ext_int(ptr, line_len, 22, 4); h.start.iCode = ext_char(ptr, line_len, 26); ext_str(h.end.resName, ptr, line_len, 28, 3); h.end.chain = ext_char(ptr, line_len, 32); h.end.resSeq = ext_int(ptr, line_len, 34, 4); h.end.iCode = ext_char(ptr, line_len, 38); h.helix_class = ext_int(ptr, line_len, 39, 2); ext_str(h.comment, ptr, line_len, 41, 30); h.length = ext_int(ptr, line_len, 72, 5); stream_write(&gctx.m.helices, &h, sizeof(MetaHelix)); } break;
-        case 0x0000205445454853ULL: // "SHEET "
-          { MetaSheet s; memset(&s, 0, sizeof(s)); s.strand_num = ext_int(ptr, line_len, 8, 3); ext_str(s.sheetID, ptr, line_len, 12, 3); s.num_strands = ext_int(ptr, line_len, 15, 2); ext_str(s.start.resName, ptr, line_len, 18, 3); s.start.chain = ext_char(ptr, line_len, 22); s.start.resSeq = ext_int(ptr, line_len, 23, 4); s.start.iCode = ext_char(ptr, line_len, 27); ext_str(s.end.resName, ptr, line_len, 29, 3); s.end.chain = ext_char(ptr, line_len, 33); s.end.resSeq = ext_int(ptr, line_len, 34, 4); s.end.iCode = ext_char(ptr, line_len, 38); s.sense = ext_int(ptr, line_len, 39, 2); stream_write(&gctx.m.sheets, &s, sizeof(MetaSheet)); } break;
-        case 0x0000202045544953ULL: // "SITE  "
-          { int seqNum = ext_int(ptr, line_len, 8, 3); if (seqNum == 1) { MetaSiteHeader sh; memset(&sh, 0, sizeof(sh)); ext_str(sh.siteID, ptr, line_len, 12, 3); sh.num_res = ext_int(ptr, line_len, 16, 2); stream_write(&gctx.m.sites, &sh, sizeof(MetaSiteHeader)); } for (int i = 0; i < 4; i++) { int off = 19 + i * 11; char check[4]; ext_str(check, ptr, line_len, off, 3); if (strlen(check) == 0) continue; PdbResId r; memset(&r, 0, sizeof(r)); ext_str(r.resName, ptr, line_len, off, 3); r.chain = ext_char(ptr, line_len, off + 4); r.resSeq = ext_int(ptr, line_len, off + 5, 4); r.iCode = ext_char(ptr, line_len, off + 9); stream_write(&gctx.m.sites, &r, sizeof(PdbResId)); } } break;
-        case 0x00005443454e4f43ULL: // "CONECT"
-          { int32_t vals[5] = {0}, targets = 0; for (int c = 0; c < 5; c++) { vals[c] = ext_int(ptr, line_len, 7 + c * 5, 5); if (c > 0 && vals[c] > 0) targets++; } if (vals[0] > 0 && targets > 0) { stream_write(&gctx.m.conects, &targets, 4); stream_write(&gctx.m.conects, &vals[0], 4); for (int c = 1; c <= 4; c++) { if (vals[c] > 0) stream_write(&gctx.m.conects, &vals[c], 4); } } } break;
+            atom_lines_seen++;
+            process_af_cif_atom(ptr, line_len, &gctx.cctx, &gctx.m, format_flags, &cif_offs);
+          }
         }
+        ptr = nl ? nl + 1 : end;
       }
-      ptr = nl ? nl + 1 : end;
+    } else {
+      while (ptr < end) {
+        const char* nl = memchr(ptr, '\n', end - ptr);
+        int line_len = nl ? (nl - ptr) : (end - ptr);
+
+        if (line_len >= 6) {
+          uint64_t tag = (*(uint64_t*)ptr) & 0x0000FFFFFFFFFFFFULL; 
+          switch (tag) {
+          case 0x000020204d4f5441ULL: // "ATOM  "
+          case 0x00004d5441544548ULL: // "HETATM"
+            process_atom(ptr, line_len, &gctx.cctx, &gctx.m, format_flags); break;
+          case 0x0000202020524554ULL: // "TER   "
+            process_ter(&gctx.cctx, &gctx.m, format_flags); break;
+          case 0x00004c444d444e45ULL: // "ENDMDL"
+            process_endmdl(&gctx.cctx, out_bpdb, &gctx.m, format_flags); break;
+          case 0x0000524544414548ULL: // "HEADER"
+            parse_header(ptr, line_len, &gctx.m, format_flags); break;
+          case 0x000020454c544954ULL: // "TITLE "
+            parse_title(ptr, line_len, &gctx.m, format_flags); break;
+          case 0x0000204645524244ULL: // "DBREF "
+            parse_dbref(ptr, line_len, &gctx.m, format_flags); break;
+          case 0x0000534552514553ULL: // "SEQRES"
+            parse_seqres(ptr, line_len, &gctx.m); break;
+          case 0x00004c444d4d554eULL: // "NUMMDL"
+            gctx.m.parsed_num_models = ext_int(ptr, line_len, 11, 4); break;
+          case 0x0000204c45444f4dULL: // "MODEL "
+            gctx.m.counted_models++; break;
+          case 0x0000444e504d4f43ULL: // "COMPND"
+            { char chunk[71]; ext_str(chunk, ptr, line_len, 11, 70); if (strlen(gctx.m.raw_compnd) > 0) strcat(gctx.m.raw_compnd, " "); strcat(gctx.m.raw_compnd, chunk); } break;
+          case 0x0000454352554f53ULL: // "SOURCE"
+            { char chunk[70]; ext_str(chunk, ptr, line_len, 11, 69); if (strlen(gctx.m.raw_source) > 0) strcat(gctx.m.raw_source, " "); strcat(gctx.m.raw_source, chunk); } break;
+          case 0x0000415444505845ULL: // "EXPDTA"
+            { char chunk[70]; ext_str(chunk, ptr, line_len, 11, 69); if (strlen(gctx.m.expdta) > 0) strcat(gctx.m.expdta, " "); strncat(gctx.m.expdta, chunk, 127 - strlen(gctx.m.expdta)); } break;
+          case 0x00004b52414d4552ULL: // "REMARK"
+            { 
+              int rem_num = ext_int(ptr, line_len, 8, 3);
+              if (rem_num == 2) { char t[12]; ext_str(t, ptr, line_len, 12, 11); if (strcmp(t, "RESOLUTION.") == 0) { float res = ext_float(ptr, line_len, 24, 7); if (res > 0.0f) gctx.m.resolution = res; } }
+              else if (rem_num == 3) { 
+                char full[80]; ext_str(full, ptr, line_len, 12, 69); char* prog = strstr(full, "PROGRAM"); char* ver = strstr(full, "VERSION"); char* colon = strchr(full, ':');
+                if (prog && colon && strlen(gctx.m.program) == 0) { char temp[64] = {0}; char* start = colon + 1; while (*start == ' ' || *start == '\t') start++; strcpy(temp, start); trim_string(temp); strncat(gctx.m.program, temp, 55); }
+                else if (ver && colon && strlen(gctx.m.program) > 0 && !strstr(gctx.m.program, "v")) { char temp[64] = {0}; char* start = colon + 1; while (*start == ' ' || *start == '\t') start++; strcpy(temp, start); trim_string(temp); strncat(gctx.m.program, " v", 55 - strlen(gctx.m.program)); strncat(gctx.m.program, temp, 55 - strlen(gctx.m.program)); }
+              }
+            } break;
+          case 0x0000444e4f425353ULL: // "SSBOND"
+            { MetaSSBond b; memset(&b, 0, sizeof(b)); ext_str(b.res1.resName, ptr, line_len, 12, 3); b.res1.chain = ext_char(ptr, line_len, 16); b.res1.resSeq = ext_int(ptr, line_len, 18, 4); b.res1.iCode = ext_char(ptr, line_len, 22); ext_str(b.res2.resName, ptr, line_len, 26, 3); b.res2.chain = ext_char(ptr, line_len, 30); b.res2.resSeq = ext_int(ptr, line_len, 32, 4); b.res2.iCode = ext_char(ptr, line_len, 36); ext_str(b.sym1, ptr, line_len, 60, 6); ext_str(b.sym2, ptr, line_len, 67, 6); b.length = ext_float(ptr, line_len, 74, 5); stream_write(&gctx.m.ssbonds, &b, sizeof(MetaSSBond)); } break;
+          case 0x0000504550534943ULL: // "CISPEP"
+            { MetaCispep c; memset(&c, 0, sizeof(c)); ext_str(c.res1.resName, ptr, line_len, 12, 3); c.res1.chain = ext_char(ptr, line_len, 16); c.res1.resSeq = ext_int(ptr, line_len, 18, 4); c.res1.iCode = ext_char(ptr, line_len, 22); ext_str(c.res2.resName, ptr, line_len, 26, 3); c.res2.chain = ext_char(ptr, line_len, 30); c.res2.resSeq = ext_int(ptr, line_len, 32, 4); c.res2.iCode = ext_char(ptr, line_len, 36); c.modNum = ext_int(ptr, line_len, 44, 3); c.angle = ext_float(ptr, line_len, 54, 6); stream_write(&gctx.m.cispeps, &c, sizeof(MetaCispep)); } break;
+          case 0x00002058494c4548ULL: // "HELIX "
+            { MetaHelix h; memset(&h, 0, sizeof(h)); ext_str(h.helixID, ptr, line_len, 12, 3); ext_str(h.start.resName, ptr, line_len, 16, 3); h.start.chain = ext_char(ptr, line_len, 20); h.start.resSeq = ext_int(ptr, line_len, 22, 4); h.start.iCode = ext_char(ptr, line_len, 26); ext_str(h.end.resName, ptr, line_len, 28, 3); h.end.chain = ext_char(ptr, line_len, 32); h.end.resSeq = ext_int(ptr, line_len, 34, 4); h.end.iCode = ext_char(ptr, line_len, 38); h.helix_class = ext_int(ptr, line_len, 39, 2); ext_str(h.comment, ptr, line_len, 41, 30); h.length = ext_int(ptr, line_len, 72, 5); stream_write(&gctx.m.helices, &h, sizeof(MetaHelix)); } break;
+          case 0x0000205445454853ULL: // "SHEET "
+            { MetaSheet s; memset(&s, 0, sizeof(s)); s.strand_num = ext_int(ptr, line_len, 8, 3); ext_str(s.sheetID, ptr, line_len, 12, 3); s.num_strands = ext_int(ptr, line_len, 15, 2); ext_str(s.start.resName, ptr, line_len, 18, 3); s.start.chain = ext_char(ptr, line_len, 22); s.start.resSeq = ext_int(ptr, line_len, 23, 4); s.start.iCode = ext_char(ptr, line_len, 27); ext_str(s.end.resName, ptr, line_len, 29, 3); s.end.chain = ext_char(ptr, line_len, 33); s.end.resSeq = ext_int(ptr, line_len, 34, 4); s.end.iCode = ext_char(ptr, line_len, 38); s.sense = ext_int(ptr, line_len, 39, 2); stream_write(&gctx.m.sheets, &s, sizeof(MetaSheet)); } break;
+          case 0x0000202045544953ULL: // "SITE  "
+            { int seqNum = ext_int(ptr, line_len, 8, 3); if (seqNum == 1) { MetaSiteHeader sh; memset(&sh, 0, sizeof(sh)); ext_str(sh.siteID, ptr, line_len, 12, 3); sh.num_res = ext_int(ptr, line_len, 16, 2); stream_write(&gctx.m.sites, &sh, sizeof(MetaSiteHeader)); } for (int i = 0; i < 4; i++) { int off = 19 + i * 11; char check[4]; ext_str(check, ptr, line_len, off, 3); if (strlen(check) == 0) continue; PdbResId r; memset(&r, 0, sizeof(r)); ext_str(r.resName, ptr, line_len, off, 3); r.chain = ext_char(ptr, line_len, off + 4); r.resSeq = ext_int(ptr, line_len, off + 5, 4); r.iCode = ext_char(ptr, line_len, off + 9); stream_write(&gctx.m.sites, &r, sizeof(PdbResId)); } } break;
+          case 0x00005443454e4f43ULL: // "CONECT"
+            { int32_t vals[5] = {0}, targets = 0; for (int c = 0; c < 5; c++) { vals[c] = ext_int(ptr, line_len, 7 + c * 5, 5); if (c > 0 && vals[c] > 0) targets++; } if (vals[0] > 0 && targets > 0) { stream_write(&gctx.m.conects, &targets, 4); stream_write(&gctx.m.conects, &vals[0], 4); for (int c = 1; c <= 4; c++) { if (vals[c] > 0) stream_write(&gctx.m.conects, &vals[c], 4); } } } break;
+          }
+        }
+        ptr = nl ? nl + 1 : end;
+      }
     }
 
     if (gctx.m.current_seqres_count > 0) { 
@@ -844,8 +1036,10 @@ void encode_bpdb(int num_files, const char** in_pdbs, const char* out_bpdb, int 
     gctx.cctx.total_models_minus_1 = num_models - 1;
 
     if (gctx.cctx.coords.len > 0) {
-      if (f < num_files - 1) process_file_boundary(&gctx.cctx, &gctx.m, include_hydrogens, af_mode);
-      else process_eof_flush(&gctx.cctx, out_bpdb, &gctx.m, include_hydrogens, af_mode, afdb_mode);
+      if (f < num_files - 1) process_file_boundary(&gctx.cctx, &gctx.m, format_flags);
+      else process_eof_flush(&gctx.cctx, out_bpdb, &gctx.m, format_flags);
+    } else if (gctx.cctx.cb.num_atoms > 0) {
+      process_eof_flush(&gctx.cctx, out_bpdb, &gctx.m, format_flags);
     }
 
     munmap((void*)map, st.st_size);

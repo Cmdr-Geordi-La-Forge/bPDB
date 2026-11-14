@@ -9,6 +9,7 @@
 #define META_AF_MODE    0
 #define META_AFDB       1
 #define META_HYDROGENS  2
+#define META_CIF        3
 
 // Section 2: Title Section (Bits 16-31)
 #define META_TITLE      16
@@ -189,6 +190,7 @@ typedef struct {
     uint64_t mask;
     int af_mode;
     int has_hydrogens;
+    int is_cif;
     float resolution;
 
     const char* title;      uint64_t title_len;

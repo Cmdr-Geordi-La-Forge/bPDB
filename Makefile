@@ -3,7 +3,7 @@ CFLAGS = -g -O3 -Wall -Wextra -march=native -flto -falign-loops=32
 
 .PHONY: all clean test_rcsb test_af bench
 
-all: 4cha_back.pdb AF-A0A011QK89-F1_back.pdb
+all: 4cha_back.pdb AF-A0A011QK89-F1_back.pdb AF-A0A011QK89-F1_cif_back.pdb
 
 taxdict_bin.o: taxdict.bin
 	ld -r -b binary $< -o $@
@@ -36,12 +36,25 @@ AF-A0A011QK89-F1_back.pdb: bpdb AF-A0A011QK89-F1.bpdb
 	@./bpdb decode AF-A0A011QK89-F1.bpdb AF-A0A011QK89-F1_back.pdb
 	@./bpdb bench AF-A0A011QK89-F1.bpdb
 
+# --- AlphaFold DB CIF Validation ---
+AF-A0A011QK89-F1.cif:
+	@wget -q -O AF-A0A011QK89-F1.cif "https://alphafold.ebi.ac.uk/files/AF-A0A011QK89-F1-model_v6.cif" || curl -s -o AF-A0A011QK89-F1.cif "https://alphafold.ebi.ac.uk/files/AF-A0A011QK89-F1-model_v6.cif"
+
+AF-A0A011QK89-F1_cif.bpdb: bpdb AF-A0A011QK89-F1.cif
+	@./bpdb encode --afdb AF-A0A011QK89-F1.cif AF-A0A011QK89-F1_cif.bpdb
+
+AF-A0A011QK89-F1_cif_back.pdb: bpdb AF-A0A011QK89-F1_cif.bpdb
+	@./bpdb decode AF-A0A011QK89-F1_cif.bpdb AF-A0A011QK89-F1_cif_back.pdb
+	@./bpdb bench AF-A0A011QK89-F1_cif.bpdb
+
 # --- Standalone Benchmark Target ---
-bench: 4cha.bpdb AF-A0A011QK89-F1.bpdb
+bench: 4cha.bpdb AF-A0A011QK89-F1.bpdb AF-A0A011QK89-F1_cif.bpdb
 	@echo "--- Benchmarking RCSB ---"
 	@./bpdb bench 4cha.bpdb
-	@echo "--- Benchmarking AFDB ---"
+	@echo "--- Benchmarking AFDB (PDB) ---"
 	@./bpdb bench AF-A0A011QK89-F1.bpdb
+	@echo "--- Benchmarking AFDB (CIF) ---"
+	@./bpdb bench AF-A0A011QK89-F1_cif.bpdb
 
 clean:
-	rm -f bpdb *.o *.bpdb *_back.pdb 4cha.pdb AF-A0A011QK89-F1.pdb
+	rm -f bpdb *.o *.bpdb *_back.pdb *.pdb *.cif
